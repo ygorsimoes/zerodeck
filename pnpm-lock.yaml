@@ -164,17 +164,13 @@ settings:
 
 importers:
 
+  .: {}
+
   frontend:
     devDependencies:
       '@biomejs/biome':
         specifier: ^2.6.9
         version: 2.6.9
-      '@decky/api':
-        specifier: ^1.1.3
-        version: 1.1.3
-      '@decky/ui':
-        specifier: ^5.0.2
-        version: 5.0.2
       '@types/node':
         specifier: ^26.6.6
         version: 26.6.6
@@ -267,12 +263,6 @@ packages:
     engines: {node: '>=14.21.3'}
     cpu: [x64]
     os: [win32]
-
-  '@decky/api@1.1.3':
-    resolution: {integrity: sha512-XsPCZxfxk5I1UtylIUN3qaWQI31siQbKfbLIskkI5innEatY1m4NQqBv/6hwPaO9mKMbdqYpnh5PSJDeMEOOBA==}
-
-  '@decky/ui@5.0.2':
-    resolution: {integrity: sha512-YQaOYUCgdgg1YRKRW/FDf47VKjcbhaetFQMPqyvRF8L0JSwXJDQ+RNAhTQ0v7+Tf9PlgDj5d22YesgSE4Yu7IQ==}
 
   '@emnapi/core@2.0.0-beta.2':
     resolution: {integrity: sha512-MzCVoWtcg4Pm2B3je5mMvYMvj3MmBKw+fU7vbsJc9/iT8ip6/eYIHo/Dsm/mr+wsHB6SEyJDuxB09Yy6r/8+4A==}
@@ -765,10 +755,6 @@ snapshots:
 
   '@biomejs/cli-win32-x64@2.6.9':
     optional: true
-
-  '@decky/api@1.1.3': {}
-
-  '@decky/ui@5.0.2': {}
 
   '@emnapi/core@2.0.0-beta.2':
     dependencies:

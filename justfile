@@ -19,6 +19,22 @@ test:
 py-test:
     PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v
 
+# ruff + strict pyright, as in CI. Skipped with a warning when `uv` is not installed.
+py-lint:
+    @if command -v uv >/dev/null 2>&1; then \
+        uv tool run ruff check hosts/python && uv tool run pyright --project hosts/python; \
+    else \
+        echo "warning: uv not found; skipping ruff/pyright (CI still runs them)" >&2; \
+    fi
+
+# License, advisory, and source policy from deny.toml. Skipped with a warning without cargo-deny.
+deny:
+    @if command -v cargo-deny >/dev/null 2>&1; then \
+        cargo deny check; \
+    else \
+        echo "warning: cargo-deny not found; skipping deny.toml checks (CI still runs them)" >&2; \
+    fi
+
 build-frontend:
     pnpm --dir frontend build
 
@@ -40,4 +56,4 @@ docker-up:
 docker-down:
     docker compose down
 
-check: fmt-check lint test py-test fe-check
+check: fmt-check lint test py-test py-lint deny fe-check

@@ -8,6 +8,8 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 - `GET /auth/token` returns the daemon's ephemeral CSRF token (`text/plain`).
 - Protected HTTP endpoints require header `X-Decky-Auth: <token>` (or `?auth=<token>` on `/ws` and `/fetch`).
 - CORS origin allowlist: `https://steamloopback.host` with `allow_credentials = true`.
+- `Host` allowlist (DNS-rebinding defense): every request carrying a `Host` header must name a loopback host (`localhost`, `127.0.0.0/8`, or `[::1]`, any port); anything else gets `403 Forbidden`.
+- The `?auth=` token is redacted from HTTP request trace spans.
 - Public/allowlisted paths: `/auth/token`, `/healthz`, `/ws`, `/fetch`, `/frontend/*`, `/static/*`, `/locales/*`, `/steam_resource/*`, `/plugins/load_main/*`, `/plugins/*/assets/*`, `/plugins/*/data/*`, `/plugins/*/dist/*`.
 
 ### WebSocket Router (`/ws?auth=<token>`)

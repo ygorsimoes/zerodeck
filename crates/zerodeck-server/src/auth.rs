@@ -1,7 +1,10 @@
+use std::net::IpAddr;
+
 use axum::extract::State;
-use axum::http::{Method, Request, StatusCode};
+use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use tracing::warn;
 
 use crate::AppState;
 
@@ -63,5 +66,43 @@ pub async fn csrf_middleware(
         next.run(request).await
     } else {
         (StatusCode::FORBIDDEN, "Forbidden").into_response()
+    }
+}
+
+/// Returns `true` when an HTTP `Host` value names a loopback address (`localhost`, `127.0.0.0/8`,
+/// `[::1]`), with or without a port.
+fn is_loopback_host(value: &str) -> bool {
+    let hostname = if let Some(rest) = value.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[::1]` or `[::1]:1337`.
+        match rest.split_once(']') {
+            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => inner,
+            _ => return false,
+        }
+    } else {
+        value.rsplit_once(':').map_or(value, |(host, _port)| host)
+    };
+
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Rejects requests whose `Host` is not a loopback name, blocking DNS-rebinding attacks in which a
+/// remote page re-points its own hostname at `127.0.0.1` to read `/auth/token` same-origin.
+///
+/// Requests without any host information (HTTP/1.0 clients, in-process calls) pass through, since
+/// browsers always send `Host` and a local non-browser client can already reach the loopback port.
+pub async fn host_guard(request: Request<axum::body::Body>, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .map(|value| value.to_str().unwrap_or_default().to_owned())
+        .or_else(|| request.uri().authority().map(ToString::to_string));
+
+    match host {
+        Some(host) if !is_loopback_host(&host) => {
+            warn!(host = %host, "rejected request with non-loopback Host header");
+            (StatusCode::FORBIDDEN, "Forbidden").into_response()
+        }
+        _ => next.run(request).await,
     }
 }

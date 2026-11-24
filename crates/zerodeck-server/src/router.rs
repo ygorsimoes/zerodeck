@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{debug, warn};
+use tracing::{Span, debug, debug_span, warn};
 use uuid::Uuid;
 use zerodeck_cef::CefConfig;
 use zerodeck_core::DiscoveredPlugin;
@@ -21,7 +21,7 @@ use zerodeck_plugin_host::PythonHostConfig;
 use zerodeck_protocol::{WsClientMessage, WsErrorDetail, WsServerMessage};
 
 use crate::ServerError;
-use crate::auth::csrf_middleware;
+use crate::auth::{csrf_middleware, host_guard};
 
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,8 +124,37 @@ pub fn build_router(state: AppState) -> Router {
             csrf_middleware,
         ))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(host_guard))
+        .layer(TraceLayer::new_for_http().make_span_with(make_request_span))
         .with_state(state)
+}
+
+/// Builds the per-request tracing span without leaking the `?auth=` token into logs.
+fn make_request_span<B>(request: &Request<B>) -> Span {
+    debug_span!(
+        "request",
+        method = %request.method(),
+        uri = %redacted_uri(request.uri()),
+        version = ?request.version(),
+    )
+}
+
+/// Renders `uri` as path and query with the value of any `auth` query parameter replaced.
+pub(crate) fn redacted_uri(uri: &Uri) -> String {
+    let Some(query) = uri.query() else {
+        return uri.path().to_owned();
+    };
+    let redacted: Vec<&str> = query
+        .split('&')
+        .map(|pair| {
+            if pair == "auth" || pair.starts_with("auth=") {
+                "auth=[redacted]"
+            } else {
+                pair
+            }
+        })
+        .collect();
+    format!("{}?{}", uri.path(), redacted.join("&"))
 }
 
 /// Serves the `ZeroDeck` HTTP/WebSocket router until `shutdown` resolves.

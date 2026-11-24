@@ -41,7 +41,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - run: |
@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: docker compose config --quiet
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v6
         with:
           context: .

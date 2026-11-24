@@ -110,4 +110,62 @@ mod tests {
             .expect("call traversal plugin assets");
         assert_eq!(traversal_assets.status(), StatusCode::FORBIDDEN);
     }
+
+    async fn status_for_host(host: &str) -> StatusCode {
+        let app = build_router(AppState::new(ServerConfig::default()));
+        app.oneshot(
+            Request::builder()
+                .uri("/auth/token")
+                .header("Host", host)
+                .body(Body::empty())
+                .expect("build request with Host"),
+        )
+        .await
+        .expect("call /auth/token")
+        .status()
+    }
+
+    #[tokio::test]
+    async fn host_guard_allows_loopback_hosts() {
+        for host in [
+            "127.0.0.1:1337",
+            "127.0.0.1",
+            "localhost:1337",
+            "LOCALHOST:8080",
+            "[::1]:1337",
+            "[::1]",
+        ] {
+            assert_eq!(status_for_host(host).await, StatusCode::OK, "host {host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_guard_rejects_non_loopback_hosts_to_block_dns_rebinding() {
+        for host in [
+            "attacker.example:1337",
+            "attacker.example",
+            "192.168.1.20:1337",
+            "localhost.attacker.example",
+            "127.0.0.1.nip.io:1337",
+            "",
+        ] {
+            assert_eq!(
+                status_for_host(host).await,
+                StatusCode::FORBIDDEN,
+                "host {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redacted_uri_hides_auth_token_but_keeps_other_query_params() {
+        let uri: axum::http::Uri = "/ws?foo=1&auth=secret-token&bar=2".parse().expect("uri");
+        assert_eq!(
+            crate::router::redacted_uri(&uri),
+            "/ws?foo=1&auth=[redacted]&bar=2"
+        );
+
+        let plain: axum::http::Uri = "/healthz".parse().expect("uri");
+        assert_eq!(crate::router::redacted_uri(&plain), "/healthz");
+    }
 }

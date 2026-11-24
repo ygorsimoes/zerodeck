@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v
@@ -52,14 +52,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: frontend/package.json
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "26"
           cache: pnpm
-      - run: pnpm --dir frontend install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --dir frontend exec biome check .
       - run: pnpm --dir frontend exec tsc --noEmit
       - run: pnpm --dir frontend build
@@ -71,7 +69,7 @@ jobs:
       - uses: actions/checkout@v7
       - run: docker compose config --quiet
       - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           target: runtime

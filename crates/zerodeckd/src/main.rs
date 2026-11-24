@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
         port: cli.port,
         cef: CefConfig::default(),
         python_host: PythonHostConfig::default(),
+        ..ServerConfig::default()
     };
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
         .parse()

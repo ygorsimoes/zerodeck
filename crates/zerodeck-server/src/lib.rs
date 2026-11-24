@@ -168,4 +168,143 @@ mod tests {
         let plain: axum::http::Uri = "/healthz".parse().expect("uri");
         assert_eq!(crate::router::redacted_uri(&plain), "/healthz");
     }
+
+    mod ws {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::{Value, json};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        use crate::{AppState, ServerConfig, serve};
+
+        async fn spawn_server(config: ServerConfig) -> (SocketAddr, String) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let state = AppState::new(config);
+            let token = state.csrf_token().to_owned();
+            tokio::spawn(serve(listener, state, std::future::pending()));
+            (addr, token)
+        }
+
+        async fn connect(
+            addr: SocketAddr,
+            token: &str,
+        ) -> tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        > {
+            let url = format!("ws://{addr}/ws?auth={token}");
+            tokio_tungstenite::connect_async(url)
+                .await
+                .expect("ws connect")
+                .0
+        }
+
+        /// Reads frames until the server closes the connection; panics if it stays open for 2s.
+        async fn assert_server_closes<S>(ws: &mut S)
+        where
+            S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+        {
+            let closed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    match ws.next().await {
+                        None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                        Some(Ok(_)) => {}
+                    }
+                }
+            })
+            .await;
+            assert!(closed.is_ok(), "server kept the connection open");
+        }
+
+        #[tokio::test]
+        async fn full_sync_replays_pending_calls() {
+            let (addr, token) = spawn_server(ServerConfig::default()).await;
+            let mut ws = connect(addr, &token).await;
+
+            let sync = json!({
+                "type": 4,
+                "messages": [{"type": 0, "id": 7, "route": "utilities/ping", "args": []}],
+            });
+            ws.send(Message::Text(sync.to_string().into()))
+                .await
+                .expect("send FULL_SYNC");
+
+            let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("reply to replayed call")
+                .expect("stream open")
+                .expect("frame");
+            let reply: Value = serde_json::from_str(frame.to_text().expect("text")).expect("json");
+            assert_eq!(reply, json!({"type": 1, "id": 7, "result": "pong"}));
+        }
+
+        #[tokio::test]
+        async fn oversized_message_closes_connection() {
+            let config = ServerConfig {
+                ws_max_message_bytes: 1024,
+                ..ServerConfig::default()
+            };
+            let (addr, token) = spawn_server(config).await;
+            let mut ws = connect(addr, &token).await;
+
+            let _ = ws.send(Message::Text("x".repeat(4096).into())).await;
+            assert_server_closes(&mut ws).await;
+        }
+
+        #[tokio::test]
+        async fn responsive_client_survives_many_keepalive_rounds() {
+            let config = ServerConfig {
+                ws_ping_interval: Duration::from_millis(30),
+                ..ServerConfig::default()
+            };
+            let (addr, token) = spawn_server(config).await;
+            let mut ws = connect(addr, &token).await;
+
+            // Reading lets tungstenite answer each ping with a pong, as a browser would.
+            let mut pings = 0;
+            let _ = tokio::time::timeout(Duration::from_millis(400), async {
+                while let Some(Ok(frame)) = ws.next().await {
+                    if frame.is_ping() {
+                        pings += 1;
+                    }
+                }
+            })
+            .await;
+            assert!(pings >= 5, "expected several keepalive rounds, saw {pings}");
+
+            let call = json!({"type": 0, "id": 1, "route": "utilities/ping", "args": []});
+            ws.send(Message::Text(call.to_string().into()))
+                .await
+                .expect("still connected");
+            let reply = loop {
+                let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                    .await
+                    .expect("reply")
+                    .expect("stream open")
+                    .expect("frame");
+                if frame.is_text() {
+                    break frame;
+                }
+            };
+            let reply: Value = serde_json::from_str(reply.to_text().expect("text")).expect("json");
+            assert_eq!(reply["result"], json!("pong"));
+        }
+
+        #[tokio::test]
+        async fn unresponsive_client_is_disconnected_by_keepalive() {
+            let config = ServerConfig {
+                ws_ping_interval: Duration::from_millis(50),
+                ..ServerConfig::default()
+            };
+            let (addr, token) = spawn_server(config).await;
+            let mut ws = connect(addr, &token).await;
+
+            // Not reading means no pong is sent back, so the server must give up on us.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_server_closes(&mut ws).await;
+        }
+    }
 }

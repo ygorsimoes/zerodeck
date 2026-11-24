@@ -61,7 +61,12 @@ export interface WebSocketLike {
 
 export interface WSRouterOptions {
   baseUrl?: string;
+  /** Delay before the first reconnect attempt; doubles after each attempt that never opens. */
   reconnectDelayMs?: number;
+  /** Upper bound for the exponential reconnect backoff. */
+  maxReconnectDelayMs?: number;
+  /** Timer used to schedule reconnects (injectable for tests). */
+  schedule?: (callback: () => void, delayMs: number) => void;
   createSocket?: (url: string) => WebSocketLike;
   /** Fetches a fresh auth token before each reconnect; the daemon issues a new one on restart. */
   refreshAuthToken?: () => Promise<string>;
@@ -95,12 +100,21 @@ export class WSRouter {
   private reqId = 0;
   private readonly baseUrl: string;
   private readonly reconnectDelayMs: number;
+  private readonly maxReconnectDelayMs: number;
+  private readonly schedule: (callback: () => void, delayMs: number) => void;
+  private reconnectAttempts = 0;
   private readonly createSocket: (url: string) => WebSocketLike;
   private readonly refreshAuthToken?: () => Promise<string>;
 
   constructor(options: WSRouterOptions = {}) {
     this.baseUrl = options.baseUrl ?? 'ws://127.0.0.1:1337';
-    this.reconnectDelayMs = options.reconnectDelayMs ?? 5000;
+    this.reconnectDelayMs = options.reconnectDelayMs ?? 1000;
+    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 30_000;
+    this.schedule =
+      options.schedule ??
+      ((callback, delayMs) => {
+        setTimeout(callback, delayMs);
+      });
     this.createSocket =
       options.createSocket ?? ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
     this.refreshAuthToken = options.refreshAuthToken;
@@ -112,6 +126,7 @@ export class WSRouter {
       this.ws = ws;
 
       ws.addEventListener('open', () => {
+        this.reconnectAttempts = 0;
         resolve();
         const messages = Array.from(this.runningCalls.values()).map((pending) => pending.message);
         this.write({ type: MessageType.FullSync, messages });
@@ -131,9 +146,14 @@ export class WSRouter {
   }
 
   private scheduleReconnect(lastToken: string): void {
-    setTimeout(() => {
+    const delayMs = Math.min(
+      this.reconnectDelayMs * 2 ** this.reconnectAttempts,
+      this.maxReconnectDelayMs,
+    );
+    this.reconnectAttempts += 1;
+    this.schedule(() => {
       void this.reconnect(lastToken);
-    }, this.reconnectDelayMs);
+    }, delayMs);
   }
 
   private async reconnect(lastToken: string): Promise<void> {

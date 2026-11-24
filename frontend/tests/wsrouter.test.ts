@@ -230,6 +230,45 @@ test('WSRouter fetches a fresh auth token before reconnecting', async () => {
   assert.match(urls[1], /auth=tok-new$/);
 });
 
+test('WSRouter backs off exponentially between failed reconnects and resets after open', async () => {
+  const sockets: MockWebSocket[] = [];
+  const delays: number[] = [];
+  const pending: (() => void)[] = [];
+  const router = new WSRouter({
+    reconnectDelayMs: 100,
+    maxReconnectDelayMs: 1000,
+    schedule: (callback, delayMs) => {
+      delays.push(delayMs);
+      pending.push(callback);
+    },
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const conn = router.connect('tok-6');
+  sockets[0].emit('open', {});
+  await conn;
+
+  // The daemon goes away: every reconnect attempt closes without ever opening.
+  sockets[0].emit('close', {});
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    pending.shift()?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    sockets[attempt].emit('close', {});
+  }
+  assert.deepEqual(delays, [100, 200, 400, 800, 1000, 1000]);
+
+  // Once a reconnect succeeds, the next drop starts from the base delay again.
+  pending.shift()?.();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  sockets[6].emit('open', {});
+  sockets[6].emit('close', {});
+  assert.equal(delays.at(-1), 100);
+});
+
 test('vite steamExternalsPlugin exports named JSX and React bindings', async () => {
   const { renderSteamGlobalModule } = await import('../vite.config.ts');
   const jsxShim = renderSteamGlobalModule('react/jsx-runtime', 'SP_JSX');

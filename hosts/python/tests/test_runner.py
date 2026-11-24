@@ -290,7 +290,7 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
                 "utf-8"
             )
 
-            async def write_all() -> None:
+            def send_and_close() -> None:
                 right.setblocking(True)
                 right.sendall(payload)
                 right.shutdown(socket.SHUT_WR)
@@ -302,7 +302,7 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             await asyncio.gather(
-                asyncio.to_thread(lambda: (right.setblocking(True), right.sendall(payload), right.shutdown(socket.SHUT_WR))),
+                asyncio.to_thread(send_and_close),
                 transport.serve(on_msg),
             )
             await transport.close()

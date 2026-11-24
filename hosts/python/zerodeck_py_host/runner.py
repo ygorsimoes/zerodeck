@@ -10,7 +10,7 @@ import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .decky_api import EmitCallback, build_decky_module
 from .ipc import JsonLineTransport
@@ -50,7 +50,7 @@ class PluginRunner:
 
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        plugin_cls = getattr(module, "Plugin")
+        plugin_cls = cast(Any, module).Plugin
         self.plugin = plugin_cls() if self.api_version > 0 else plugin_cls
 
     async def start_lifecycle(self) -> None:

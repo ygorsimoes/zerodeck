@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.100"
 license = "MIT"
 repository = "https://github.com/ygorsimoes/zerodeck"
 authors = ["ZeroDeck Contributors"]
@@ -23,12 +23,12 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
 [workspace.dependencies]
-zerodeck-protocol = { path = "crates/zerodeck-protocol" }
-zerodeck-platform = { path = "crates/zerodeck-platform" }
-zerodeck-core = { path = "crates/zerodeck-core" }
-zerodeck-plugin-host = { path = "crates/zerodeck-plugin-host" }
-zerodeck-cef = { path = "crates/zerodeck-cef" }
-zerodeck-server = { path = "crates/zerodeck-server" }
+zerodeck-protocol = { version = "0.1.0", path = "crates/zerodeck-protocol" }
+zerodeck-platform = { version = "0.1.0", path = "crates/zerodeck-platform" }
+zerodeck-core = { version = "0.1.0", path = "crates/zerodeck-core" }
+zerodeck-plugin-host = { version = "0.1.0", path = "crates/zerodeck-plugin-host" }
+zerodeck-cef = { version = "0.1.0", path = "crates/zerodeck-cef" }
+zerodeck-server = { version = "0.1.0", path = "crates/zerodeck-server" }
 
 tokio = { version = "1.54.1", features = ["full"] }
 axum = { version = "0.8.9", features = ["ws"] }

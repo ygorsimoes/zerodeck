@@ -2,8 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: [main]
   pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,9 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - uses: dtolnay/rust-toolchain@master
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -36,6 +39,8 @@ jobs:
           python-version: "3.12"
       - run: PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
       - run: |
           uv tool run ruff check hosts/python
           uv tool run pyright --project hosts/python
@@ -70,4 +75,4 @@ jobs:
           push: false
           load: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true

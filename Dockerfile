@@ -10,15 +10,30 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
 COPY frontend/ frontend/
 RUN pnpm --dir frontend build
 
-FROM rust:1-slim-bookworm AS chef
+FROM rust:1.100.0-slim-bookworm AS chef
+ARG TARGETARCH
+ARG CARGO_CHEF_VERSION=0.1.78
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
+        ca-certificates \
         cmake \
+        curl \
         pkg-config \
-        python3 \
+        xz-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && cargo install --locked cargo-chef
+    && case "${TARGETARCH:-amd64}" in \
+        amd64) CHEF_TARGET="x86_64-unknown-linux-musl" ;; \
+        arm64) CHEF_TARGET="aarch64-unknown-linux-musl" ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && CHEF_ARCHIVE="cargo-chef-${CHEF_TARGET}.tar.xz" \
+    && CHEF_URL="https://github.com/LukeMathWalker/cargo-chef/releases/download/v${CARGO_CHEF_VERSION}" \
+    && curl -fsSL "${CHEF_URL}/${CHEF_ARCHIVE}" -o "/tmp/${CHEF_ARCHIVE}" \
+    && curl -fsSL "${CHEF_URL}/${CHEF_ARCHIVE}.sha256" -o "/tmp/${CHEF_ARCHIVE}.sha256" \
+    && (cd /tmp && sha256sum -c "${CHEF_ARCHIVE}.sha256") \
+    && tar -xJf "/tmp/${CHEF_ARCHIVE}" -C /usr/local/cargo/bin \
+    && rm -f "/tmp/${CHEF_ARCHIVE}" "/tmp/${CHEF_ARCHIVE}.sha256"
 
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
@@ -37,6 +52,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bin zerodeckd
 
 FROM rust-builder AS linux-test
+RUN apt-get update && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY hosts/python/ hosts/python/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

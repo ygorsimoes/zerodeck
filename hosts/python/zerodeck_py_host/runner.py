@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import sys
+from collections.abc import Awaitable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
@@ -68,8 +69,15 @@ class PluginRunner:
                 if self.api_version > 0
                 else self.plugin._main(self.plugin)
             )
-            if inspect.isawaitable(coro):
+            if inspect.iscoroutine(coro):
                 self.main_task = asyncio.create_task(coro)
+                await asyncio.sleep(0)
+            elif inspect.isawaitable(coro):
+
+                async def _await_task(awaitable: Awaitable[Any]) -> Any:
+                    return await awaitable
+
+                self.main_task = asyncio.create_task(_await_task(coro))
                 await asyncio.sleep(0)
 
     async def stop_lifecycle(self) -> None:
@@ -105,9 +113,10 @@ class PluginRunner:
             "res": None,
         }
         try:
-            data = json.loads(raw)
-            if not isinstance(data, dict):
+            raw_data: Any = json.loads(raw)
+            if not isinstance(raw_data, dict):
                 raise ValueError("IPC payload must be a JSON object")
+            data = cast(dict[str, Any], raw_data)
 
             if "uninstall" in data:
                 self.uninstalling = bool(data.get("uninstall"))
@@ -120,15 +129,26 @@ class PluginRunner:
                 raise PermissionError(f"cannot call private method {method_name}")
             method = getattr(self.plugin, method_name)
 
+            raw_args = data.get("args")
             if data.get("legacy"):
                 if self.api_version > 0:
                     raise RuntimeError("legacy kwargs call is disallowed on api_version > 0")
-                kwargs = data.get("args") or {}
+                if raw_args is None:
+                    kwargs: dict[str, Any] = {}
+                elif isinstance(raw_args, dict):
+                    kwargs = cast(dict[str, Any], raw_args)
+                else:
+                    raise ValueError("legacy args must be a JSON object")
                 result = method(self.plugin, **kwargs)
             else:
                 if self.api_version < 1:
                     raise RuntimeError("api_version >= 1 required for positional calls")
-                args = data.get("args") or []
+                if raw_args is None:
+                    args: list[Any] = []
+                elif isinstance(raw_args, list):
+                    args = cast(list[Any], raw_args)
+                else:
+                    raise ValueError("args must be a JSON array")
                 result = method(*args)
 
             if inspect.isawaitable(result):

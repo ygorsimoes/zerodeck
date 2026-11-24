@@ -32,7 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL "${CHEF_URL}/${CHEF_ARCHIVE}" -o "/tmp/${CHEF_ARCHIVE}" \
     && curl -fsSL "${CHEF_URL}/${CHEF_ARCHIVE}.sha256" -o "/tmp/${CHEF_ARCHIVE}.sha256" \
     && (cd /tmp && sha256sum -c "${CHEF_ARCHIVE}.sha256") \
-    && tar -xJf "/tmp/${CHEF_ARCHIVE}" -C /usr/local/cargo/bin \
+    && tar --strip-components=1 -xJf "/tmp/${CHEF_ARCHIVE}" \
+        -C /usr/local/cargo/bin "${CHEF_ARCHIVE%.tar.xz}/cargo-chef" \
     && rm -f "/tmp/${CHEF_ARCHIVE}" "/tmp/${CHEF_ARCHIVE}.sha256"
 
 FROM chef AS planner

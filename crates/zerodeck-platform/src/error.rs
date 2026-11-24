@@ -13,6 +13,10 @@ pub enum PlatformError {
     #[error("no valid root paths configured")]
     EmptyRootSet,
 
+    /// No eligible non-root host user could be resolved while running as `root`.
+    #[error("could not resolve non-root host user: {0}")]
+    HostUserNotFound(String),
+
     /// Underlying filesystem I/O failure.
     #[error("filesystem error at `{path}`: {source}")]
     Io {

@@ -6,7 +6,8 @@ mod error;
 mod settings;
 
 pub use archive::{
-    DEFAULT_MAX_ARCHIVE_BYTES, InstallSource, extract_zip_safely, extract_zip_safely_with_limit,
+    DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES, ExtractLimits, InstallSource,
+    extract_zip_safely, extract_zip_safely_with_limit, extract_zip_safely_with_limits,
     verify_sha256_policy,
 };
 pub use discovery::{DiscoveredPlugin, discover_plugins};
@@ -160,6 +161,24 @@ mod tests {
     }
 
     #[test]
+    fn discover_plugins_ignores_hidden_staging_directories() {
+        let dir = TestDir::new("discover-hidden");
+        for name in ["visible", ".visible.staging-1234"] {
+            let plugin = dir.0.join(name);
+            fs::create_dir_all(&plugin).expect("create plugin dir");
+            fs::write(
+                plugin.join("plugin.json"),
+                format!(r#"{{"name": "{name}", "author": "Alice"}}"#),
+            )
+            .expect("write plugin.json");
+        }
+
+        let plugins = discover_plugins(&dir.0).expect("discover plugins");
+        let dirs: Vec<&str> = plugins.iter().map(|p| p.directory.as_str()).collect();
+        assert_eq!(dirs, vec!["visible"]);
+    }
+
+    #[test]
     fn extract_zip_safely_rejects_zip_slip_traversal() {
         let dir = TestDir::new("zip-slip");
         let dest = dir.0.join("out");
@@ -283,5 +302,105 @@ mod tests {
         let err_limit = crate::extract_zip_safely_with_limit(big_buf.get_ref(), &dest, 512)
             .expect_err("must reject entry exceeding byte limit");
         assert!(matches!(err_limit, CoreError::ArchiveSizeExceeded { .. }));
+    }
+
+    fn zip_with_files(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut buf);
+            let stored =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in files {
+                writer.start_file(*name, stored).expect("start entry");
+                writer.write_all(data).expect("write entry");
+            }
+            writer.finish().expect("finish zip");
+        }
+        buf.into_inner()
+    }
+
+    fn sorted_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn extract_zip_failure_mid_write_leaves_existing_install_untouched() {
+        let dir = TestDir::new("zip-staging-fail");
+        let dest = dir.0.join("plugin");
+        fs::create_dir_all(&dest).expect("create dest");
+        fs::write(dest.join("old.txt"), b"previous install").expect("seed old install");
+
+        // `b.txt` is stored uncompressed, so flipping one payload byte breaks its CRC. Pre-validation
+        // passes and the failure only surfaces while `b.txt` is being written, after `a.txt`.
+        let mut bytes = zip_with_files(&[("a.txt", b"fine"), ("b.txt", b"CORRUPTME")]);
+        let pos = bytes
+            .windows(9)
+            .position(|w| w == b"CORRUPTME")
+            .expect("find stored payload");
+        bytes[pos] ^= 0xFF;
+
+        extract_zip_safely(&bytes, &dest).expect_err("corrupt entry must fail extraction");
+
+        assert_eq!(sorted_names(&dest), vec!["old.txt".to_owned()]);
+        assert_eq!(
+            fs::read(dest.join("old.txt")).expect("read old"),
+            b"previous install"
+        );
+        assert_eq!(sorted_names(&dir.0), vec!["plugin".to_owned()]);
+    }
+
+    #[test]
+    fn extract_zip_success_replaces_destination_without_leftovers() {
+        let dir = TestDir::new("zip-staging-ok");
+        let dest = dir.0.join("plugin");
+        fs::create_dir_all(&dest).expect("create dest");
+        fs::write(dest.join("old.txt"), b"previous install").expect("seed old install");
+
+        let bytes = zip_with_files(&[("main.py", b"class Plugin: pass"), ("dist/index.js", b"x")]);
+        let extracted = extract_zip_safely(&bytes, &dest).expect("extract");
+
+        assert_eq!(
+            sorted_names(&dest),
+            vec!["dist".to_owned(), "main.py".to_owned()]
+        );
+        assert!(
+            extracted
+                .iter()
+                .all(|p| p.starts_with(fs::canonicalize(&dest).expect("canon")))
+        );
+        assert!(extracted.iter().all(|p| p.is_file()));
+        assert_eq!(sorted_names(&dir.0), vec!["plugin".to_owned()]);
+    }
+
+    #[test]
+    fn extract_zip_rejects_archives_with_too_many_entries() {
+        let dir = TestDir::new("zip-entries");
+        let dest = dir.0.join("plugin");
+        let bytes = zip_with_files(&[("1", b""), ("2", b""), ("3", b""), ("4", b"")]);
+
+        let limits = crate::ExtractLimits {
+            max_entries: 3,
+            ..crate::ExtractLimits::default()
+        };
+        let err = crate::extract_zip_safely_with_limits(&bytes, &dest, &limits)
+            .expect_err("must reject entry count above limit");
+        assert!(matches!(
+            err,
+            CoreError::ArchiveTooManyEntries {
+                count: 4,
+                max_entries: 3
+            }
+        ));
+        assert!(!dest.exists());
     }
 }

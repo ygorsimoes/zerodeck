@@ -17,7 +17,7 @@ pub struct DiscoveredPlugin {
     pub has_entrypoint: bool,
 }
 
-/// Scans `plugins_dir` for subdirectories containing a valid `plugin.json`.
+/// Scans `plugins_dir` for non-hidden subdirectories containing a valid `plugin.json`.
 ///
 /// A plugin whose `plugin.json` or `package.json` cannot be read or parsed is logged and skipped,
 /// so one broken plugin never prevents the remaining plugins (or the daemon) from loading.
@@ -37,12 +37,16 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
             path: plugins_dir.to_path_buf(),
             source,
         })?;
+        let directory = entry.file_name().to_string_lossy().into_owned();
+        // Hidden entries include in-progress install staging and parked previous installs.
+        if directory.starts_with('.') {
+            continue;
+        }
         let dir_path = entry.path();
         if !dir_path.is_dir() || !dir_path.join("plugin.json").is_file() {
             continue;
         }
 
-        let directory = entry.file_name().to_string_lossy().into_owned();
         match load_plugin(&dir_path, directory) {
             Ok(plugin) => plugins.push(plugin),
             Err(err) => {

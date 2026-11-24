@@ -53,7 +53,7 @@
 **Files:** Modify `justfile`
 
 - [ ] `run` variable dispatches into `docker compose run --rm dev` unless `ZERODECK_NATIVE=1` or `ZERODECK_IN_CONTAINER=1`.
-- [ ] Public: `setup check fmt lint test dev shell up down logs smoke fuzz dist clean` plus CI groups `ci-rust ci-deny ci-python ci-frontend ci-infra py-test-on`.
+- [ ] Public: `setup check ci fmt lint test dev shell up down logs smoke fuzz fuzz-all dist clean` plus CI groups `check-rust deny check-python check-frontend lint-infra py-test-on py-matrix`.
 - [ ] Verify: `just check` passes in Docker; `ZERODECK_NATIVE=1 just --dry-run check` shows no docker call.
 
 ### Task 4: CI

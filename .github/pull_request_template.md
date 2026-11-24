@@ -32,17 +32,17 @@
 - [ ] 🐍 **Python Plugin Host** (`hosts/python`)
 - [ ] 🎮 **Frontend / TypeScript** (`frontend`)
 - [ ] 🐳 **Docker / Compose** (`Dockerfile`, `compose.yaml`)
-- [ ] ⚙️ **CI / Automation** (`.github/*`, `justfile`, `deny.toml`)
+- [ ] ⚙️ **CI / Automation** (`.github/*`, `justfile`, `deny.toml`, `.devcontainer/`)
 
 ## 🧪 Verification & Quality Checklist
 
 > [!TIP]
-> Run `just check` before pushing: it validates Rust, Python, cargo-deny and the frontend inside the same Docker image CI uses.
+> Run `just check` before pushing: it validates Rust, Python, cargo-deny and the frontend inside the same Docker image CI uses. Run `just ci` for the full CI set (Python matrix, infra lint, runtime smoke test).
 
 - [ ] 🦀 **Rust:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` pass (Rust `1.100.0`)
 - [ ] 🐍 **Python:** `unittest`, `ruff check hosts/python`, and `pyright --project hosts/python` (strict) pass
 - [ ] 🎮 **Frontend:** `pnpm --dir frontend exec biome check .`, `tsc --noEmit`, `build`, and `node --test` pass
-- [ ] 🐳 **Docker / CI:** `just lint-infra` and `just smoke` pass (when `Dockerfile`, `compose.yaml`, `justfile` or `.github/**` changed)
+- [ ] 🐳 **Docker / CI:** `just ci` passes (when `Dockerfile`, `compose.yaml`, `justfile`, `.devcontainer/` or `.github/**` changed)
 - [ ] 🛡️ **Safety & Licensing:** Any `unsafe` code is minimized and documented with `// SAFETY:` invariants; clean-room **MIT** boundaries are strictly respected (no GPL code copied)
 
 ## 📸 Screenshots, Logs, or Benchmarks (Optional)

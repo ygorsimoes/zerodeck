@@ -31,7 +31,7 @@ zerodeckd
   - Workspace lints (`Cargo.toml`) enable `unsafe_code = "warn"`, `missing_debug_implementations = "warn"`, `rust_2018_idioms`, `clippy::all`, and `clippy::pedantic`. CI runs `clippy` with `-D warnings`.
   - Minimize `unsafe`; any unavoidable `unsafe` block MUST include a clear `// SAFETY:` invariant comment.
 - **Python (`hosts/python`):** Target `>=3.10`, line length `100`, `ruff` (`E`, `F`, `I`, `UP`, `B`), and `pyright` in `"strict"` mode.
-- **Frontend (`frontend/`):** Use **`pnpm` exclusively** (`pnpm@12.16.1` via `pnpm-workspace.yaml`; never create `package-lock.json` or `yarn.lock`). TypeScript `^7.0.2` strict mode + `@biomejs/biome` (`biome.json`: 2-space indent, single quotes in JS/TS, line width `100`).
+- **Frontend (`frontend/`):** Use **`pnpm` exclusively** (`pnpm@12.16.1`, pinned by `packageManager` in the root `package.json`; workspace in `pnpm-workspace.yaml`; never create `package-lock.json` or `yarn.lock`). TypeScript `^7.0.2` strict mode + `@biomejs/biome` (`biome.json`: 2-space indent, single quotes in JS/TS, line width `100`).
 - **Editor defaults:** Follow `.editorconfig` (LF, UTF-8, trailing newline, 4 spaces for `.rs`/`.py`/`.toml`/`justfile`, 2 spaces for `.ts`/`.json`/`.yml`/`.md`).
 
 ## 4. Non-Negotiable Security Invariants
@@ -55,7 +55,9 @@ Never weaken or bypass these invariants:
 - The pinned `dev` image (`Dockerfile` stage `dev`, `compose.yaml` service `dev`) is the canonical environment. `just <recipe>` runs inside it by default; `ZERODECK_NATIVE=1` opts into the host toolchain, and recipes run natively automatically inside the container (`ZERODECK_IN_CONTAINER=1`).
 - Add new tasks as a public recipe that forwards to a private `_recipe` (see `justfile`), so the logic exists once and works in Docker, natively, and in CI.
 - CI jobs must call `just` recipes rather than inline tool commands. Keep the required check job ids `rust`, `deny`, `python`, `frontend`, `docker` stable.
-- Pin new tools in the `Dockerfile` with a version `ARG` and, for downloaded binaries, a SHA-256 digest (fail closed). Pin GitHub Actions by full commit SHA.
+- Pin new tools in the `Dockerfile` with a version `ARG` and, for downloaded binaries, a SHA-256 digest (fail closed). Pin GitHub Actions by full commit SHA (version in a trailing comment), declare `permissions` per job (workflow level stays read-only or `{}`), and check out with `persist-credentials: false`.
+- Versions duplicated across files must move together: Rust (`rust-toolchain.toml`, every `rust:` image in the `Dockerfile`, `rust-version` in `Cargo.toml`), pnpm (`package.json` `packageManager`, `Dockerfile`), just (`JUST_VERSION`, `just@` pins in `.github/`). `just lint-infra` enforces this.
+- Keep the dev services unprivileged (`cap_drop: ALL`, `no-new-privileges`) and keep the host's `target/`/`node_modules/` out of containers (named volumes). `.devcontainer/` reuses the compose `dev` service; do not fork a second environment.
 
 ## 7. Required Verification Before Finishing
 
@@ -65,9 +67,8 @@ Always run after your final edit and verify all pass:
 just check
 ```
 
-If you modify `Dockerfile`, `compose.yaml`, `justfile`, or `.github/**`, also verify:
+If you modify `Dockerfile`, `compose.yaml`, `justfile`, `.devcontainer/`, or `.github/**`, run the full CI set instead (it includes `just check`, the Python version matrix, `just lint-infra` and `just smoke`):
 
 ```bash
-just lint-infra
-just smoke
+just ci
 ```

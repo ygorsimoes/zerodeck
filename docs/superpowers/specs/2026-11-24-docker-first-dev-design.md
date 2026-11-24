@@ -12,12 +12,13 @@ to what ships to the Steam Deck. Running natively stays possible as an opt-in.
 
 - One pinned toolchain image (`dev` stage) with every tool `just check` needs: Rust 1.100 (+rustfmt,
   clippy), cargo-deny, Node 26 + pnpm 12.16.1, Python 3 + ruff + pyright, just.
-- Short `just` commands (`setup`, `check`, `fmt`, `lint`, `test`, `dev`, `shell`, `up`, `down`,
+- Short `just` commands (`setup`, `check`, `ci`, `fmt`, `lint`, `test`, `dev`, `shell`, `up`, `down`,
   `logs`, `smoke`, `fuzz`, `dist`) that run in the dev container by default and natively with
   `ZERODECK_NATIVE=1`. Each task's logic is written once.
 - CI jobs run the same `just` recipes in the same image; required check names stay
   `rust`, `deny`, `python`, `frontend`, `docker`.
-- Lint the infrastructure itself (actionlint, hadolint, `docker compose config`).
+- Lint the infrastructure itself (actionlint, zizmor, hadolint, `docker compose config`, and a check
+  that versions duplicated across files agree).
 - Smoke-test the runtime image (container must become healthy) on every PR.
 - Release tarball produced by a `just dist` recipe instead of inline workflow shell.
 
@@ -52,14 +53,21 @@ to what ships to the Steam Deck. Running natively stays possible as an opt-in.
   tools + cargo-deny + just), `dev` stage (non-root user with build-arg UID/GID, writable
   `CARGO_HOME`), `fuzz` stage (nightly + cargo-fuzz). Existing `frontend-builder`, `chef`,
   `rust-builder`, `runtime` stay; `linux-test` is removed (its job is done by `dev`).
-- `compose.yaml`: `dev` service (profile `dev`) and `dev-fuzz`; `daemon` service that runs
+- `compose.yaml`: `dev` service (profile `dev`) and `fuzz`; `daemon` service that runs
   `zerodeckd` from source on port 1337; the hardened `zerodeckd` runtime service unchanged. Cache
   volumes are overridable via env so CI can map them to host paths cached by `actions/cache`.
-- `justfile`: public recipes call `{{run}} just _<task>`, where `run` is
+- `justfile`: public recipes call `{{ dev }} just _<task>`, where `dev` is
   `docker compose run --rm dev` or empty when native / already inside the container
   (`ZERODECK_IN_CONTAINER=1`).
 - CI: a local composite action builds the dev image with the GHA build cache; jobs call
-  `just ci-<area>`; Python version matrix runs the suite in `python:3.x-slim` containers.
+  `just check-rust`, `just deny`, `just check-python`, `just check-frontend`, `just lint-infra`,
+  `just smoke` and `just fuzz-all`; the Python version matrix runs `just py-test-on <version>` in
+  `python:3.x-slim-bookworm` containers. `just ci` runs the same set locally (minus fuzzing).
+- Dev services run unprivileged (`cap_drop: ALL`, `no-new-privileges`); `.devcontainer/` reuses the
+  compose `dev` service for editors and Codespaces.
+- Supply chain: Dependabot covers `.github/actions/*` and waits 7 days before proposing a release;
+  the `rust` base image is excluded because it must move together with `rust-toolchain.toml`;
+  release workflow permissions are granted per job.
 
 ## Left to the builder
 

@@ -63,6 +63,8 @@ export interface WSRouterOptions {
   baseUrl?: string;
   reconnectDelayMs?: number;
   createSocket?: (url: string) => WebSocketLike;
+  /** Fetches a fresh auth token before each reconnect; the daemon issues a new one on restart. */
+  refreshAuthToken?: () => Promise<string>;
 }
 
 export class PyError extends Error {
@@ -94,12 +96,14 @@ export class WSRouter {
   private readonly baseUrl: string;
   private readonly reconnectDelayMs: number;
   private readonly createSocket: (url: string) => WebSocketLike;
+  private readonly refreshAuthToken?: () => Promise<string>;
 
   constructor(options: WSRouterOptions = {}) {
     this.baseUrl = options.baseUrl ?? 'ws://127.0.0.1:1337';
     this.reconnectDelayMs = options.reconnectDelayMs ?? 5000;
     this.createSocket =
       options.createSocket ?? ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
+    this.refreshAuthToken = options.refreshAuthToken;
   }
 
   connect(authToken: string): Promise<void> {
@@ -121,11 +125,29 @@ export class WSRouter {
       });
 
       ws.addEventListener('close', () => {
-        setTimeout(() => {
-          void this.connect(authToken);
-        }, this.reconnectDelayMs);
+        this.scheduleReconnect(authToken);
       });
     });
+  }
+
+  private scheduleReconnect(lastToken: string): void {
+    setTimeout(() => {
+      void this.reconnect(lastToken);
+    }, this.reconnectDelayMs);
+  }
+
+  private async reconnect(lastToken: string): Promise<void> {
+    let token = lastToken;
+    if (this.refreshAuthToken) {
+      try {
+        token = await this.refreshAuthToken();
+      } catch (err: unknown) {
+        console.warn('[ZeroDeck] failed to refresh auth token, retrying', err);
+        this.scheduleReconnect(lastToken);
+        return;
+      }
+    }
+    await this.connect(token);
   }
 
   call<Args extends unknown[] = [], Return = void>(route: string, ...args: Args): Promise<Return> {
@@ -211,10 +233,16 @@ export class WSRouter {
       case MessageType.Event: {
         const listeners = this.eventListeners.get(data.event);
         if (!listeners) return;
+        const event = data.event;
+        const report = (err: unknown) => {
+          console.error(`[ZeroDeck] error in event listener ${event}`, err);
+        };
         for (const listener of listeners) {
-          void Promise.resolve(listener(...data.args)).catch((err: unknown) => {
-            console.error(`[ZeroDeck] error in event listener ${data.event}`, err);
-          });
+          try {
+            void Promise.resolve(listener(...data.args)).catch(report);
+          } catch (err: unknown) {
+            report(err);
+          }
         }
         break;
       }

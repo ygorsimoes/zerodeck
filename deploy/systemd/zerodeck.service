@@ -2,6 +2,10 @@
 Description=ZeroDeck Plugin Loader Daemon
 After=network.target
 
+# Paths default to the stock Steam Deck layout (`/home/deck/homebrew`). systemd does not expand
+# shell-style variables in WorkingDirectory=, so to use another location create a drop-in with
+# `systemctl edit zerodeck.service` and override WorkingDirectory= and both Environment= paths.
+
 [Service]
 Type=simple
 User=root
@@ -10,9 +14,10 @@ RestartSec=2
 KillMode=process
 TimeoutStopSec=15
 ExecStart=/usr/local/bin/zerodeckd
-WorkingDirectory=${HOMEBREW_FOLDER}/services
-Environment=UNPRIVILEGED_PATH=${HOMEBREW_FOLDER}
-Environment=PRIVILEGED_PATH=${HOMEBREW_FOLDER}
+# The leading `-` keeps the unit starting if the directory does not exist yet.
+WorkingDirectory=-/home/deck/homebrew/services
+Environment=UNPRIVILEGED_PATH=/home/deck/homebrew
+Environment=PRIVILEGED_PATH=/home/deck/homebrew
 Environment=RUST_LOG=info
 
 [Install]

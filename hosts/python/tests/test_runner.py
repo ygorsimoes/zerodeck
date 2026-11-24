@@ -279,6 +279,80 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
                 await runner.stop_lifecycle()
                 self.assertTrue(runner.plugin.cancelled)
 
+    async def test_non_json_serializable_result_returns_error_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "set_plugin"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "class Plugin:",
+                        "    async def returns_set(self):",
+                        "        return {1, 2}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(
+                    entrypoint=entrypoint,
+                    plugin_name="SetDemo",
+                    api_version=1,
+                    emit_sink=emit_sink,
+                )
+                runner.load()
+                raw_reply = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "set-1", "method": "returns_set", "args": []})
+                )
+
+            assert raw_reply is not None
+            reply = json.loads(raw_reply)
+            self.assertEqual(reply["id"], "set-1")
+            self.assertFalse(reply["success"])
+            self.assertIn("JSON", reply["res"])
+
+    async def test_json_line_transport_dispatches_messages_concurrently(self) -> None:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            transport = await JsonLineTransport.from_fd(left.fileno())
+            left.close()
+
+            fast_seen = asyncio.Event()
+
+            async def on_msg(line: str) -> str | None:
+                if json.loads(line)["id"] == "slow":
+                    # Only completes if the "fast" call is dispatched while this one is pending.
+                    await asyncio.wait_for(fast_seen.wait(), timeout=2)
+                    return json.dumps({"id": "slow"})
+                fast_seen.set()
+                return json.dumps({"id": "fast"})
+
+            def send_and_close() -> None:
+                right.setblocking(True)
+                right.sendall(b'{"id": "slow"}\n{"id": "fast"}\n')
+                right.shutdown(socket.SHUT_WR)
+
+            await asyncio.gather(asyncio.to_thread(send_and_close), transport.serve(on_msg))
+            await transport.close()
+
+            right.setblocking(True)
+            replies = right.recv(4096).decode("utf-8").splitlines()
+            self.assertEqual([json.loads(r)["id"] for r in replies], ["fast", "slow"])
+        finally:
+            right.close()
+
     async def test_json_line_transport_handles_payloads_above_64kib(self) -> None:
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:

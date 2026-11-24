@@ -3,10 +3,10 @@
 FROM node:26-bookworm-slim AS frontend-builder
 WORKDIR /app
 RUN npm install -g pnpm@12.16.1
-COPY pnpm-workspace.yaml pnpm-lock.yaml biome.json ./
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml biome.json ./
 COPY frontend/package.json frontend/
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
-    pnpm --dir frontend install --frozen-lockfile
+    pnpm install --frozen-lockfile
 COPY frontend/ frontend/
 RUN pnpm --dir frontend build
 

@@ -1,0 +1,19 @@
+[Unit]
+Description=ZeroDeck Plugin Loader Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=2
+KillMode=process
+TimeoutStopSec=15
+ExecStart=/usr/local/bin/zerodeckd
+WorkingDirectory=${HOMEBREW_FOLDER}/services
+Environment=UNPRIVILEGED_PATH=${HOMEBREW_FOLDER}
+Environment=PRIVILEGED_PATH=${HOMEBREW_FOLDER}
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,65 @@
+name: "🔌 Decky Plugin Compatibility"
+description: "Report compatibility issues when running an existing Decky plugin on ZeroDeck."
+title: "[Plugin Compat]: "
+labels:
+  - bug
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 🔌 Decky Plugin Compatibility Report
+        ZeroDeck aims for full clean-room compatibility with existing Decky Loader plugins (`api_version` 0 and 1, legacy and ESModule).
+        Share the details below to help us close compatibility gaps!
+
+  - type: input
+    id: plugin_name
+    attributes:
+      label: "🧩 Plugin Name & Version"
+      description: "Name and release version from `plugin.json`."
+      placeholder: "e.g. CSS Loader v2.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: plugin_source
+    attributes:
+      label: "🔗 Plugin Repository or Store Link"
+      description: "Link to the upstream repository or Decky Plugin Database entry."
+      placeholder: "https://github.com/..."
+
+  - type: dropdown
+    id: api_version
+    attributes:
+      label: "📡 Plugin API / Load Type"
+      description: "From the plugin manifest (`plugin.json`), if known."
+      options:
+        - "api_version: 1 (ESModule / Type 1)"
+        - "api_version: 0 (Legacy kwargs / Type 0)"
+        - "Passive / Frontend-only"
+        - "Unknown"
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: "⚠️ Failure Details vs Expected Behavior"
+      description: "Describe which lifecycle hook, IPC call, `decky` module API, or UI view fails."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "📋 Daemon / Python Host Logs"
+      description: "Include stderr/stdout lines from `zerodeckd` and `zerodeck_py_host`."
+      render: bash
+
+  - type: checkboxes
+    id: clean_room_ack
+    attributes:
+      label: "⚖️ Clean-Room Policy"
+      options:
+        - label: "📜 I understand ZeroDeck is clean-room MIT and does not accept copied GPL code from decky-loader."
+          required: true

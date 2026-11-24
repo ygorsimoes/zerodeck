@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Frontend / pnpm
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local dev & OS
+.dev-homebrew/
+.DS_Store
+*.log
+.superpowers/
+.worktrees/

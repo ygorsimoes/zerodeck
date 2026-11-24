@@ -1,0 +1,60 @@
+name: "✨ Feature Request"
+description: "Propose a new capability, performance improvement, or developer experience upgrade."
+title: "[Feat]: "
+labels:
+  - enhancement
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## ✨ Feature Request
+        Have an idea to improve **ZeroDeck**? Tell us the problem you're solving and how you envision it working!
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "🎯 Target Area"
+      description: "Where does this enhancement fit best?"
+      options:
+        - "🦀 Rust Daemon & Core Architecture"
+        - "🔌 Plugin Host / Sandbox / Security"
+        - "🎮 Frontend / CEF Integration"
+        - "📡 WebSocket & IPC Protocol"
+        - "🐳 Docker / Deployment / SteamOS"
+        - "⚙️ Developer Experience / CI / CLI"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "💡 Problem Statement"
+      description: "What limitation, friction, or missing capability prompted this request?"
+      placeholder: "It is currently difficult / slow / impossible to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "🚀 Proposed Solution"
+      description: "Describe the ideal API, UX, CLI flag, or architectural behavior."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "🔄 Alternatives Considered (Optional)"
+      description: "Any workarounds or alternative designs you evaluated?"
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "🤝 Contribution"
+      options:
+        - label: "🔍 I checked existing issues and confirmed this idea is not already tracked."
+          required: true
+        - label: "🛠️ I would be interested in submitting a Pull Request for this feature."
+          required: false

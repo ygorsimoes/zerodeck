@@ -1,0 +1,95 @@
+name: "🐛 Bug Report"
+description: "Report a daemon crash, protocol bug, frontend issue, or Docker/CI failure."
+title: "[Bug]: "
+labels:
+  - bug
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 🐛 Bug Report
+        Thanks for helping make **ZeroDeck** faster and more reliable!
+        Please fill out the details below so maintainers can reproduce and fix the issue quickly.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: "🧩 Affected Component"
+      description: "Which part of the monorepo is affected?"
+      options:
+        - "🦀 Rust Daemon (zerodeckd / core / server / platform)"
+        - "🔌 Plugin Host & IPC (zerodeck-plugin-host / zerodeck_py_host)"
+        - "🎮 Frontend & CEF Bridge (frontend / zerodeck-cef)"
+        - "📡 WebSocket Protocol (zerodeck-protocol / WSRouter)"
+        - "🐳 Docker / Compose"
+        - "⚙️ CI / Build / Tooling"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: "🖥️ Target Environment"
+      description: "Where did the issue occur?"
+      options:
+        - "🎮 SteamOS / Steam Deck (Native)"
+        - "🐧 Linux Desktop / Server"
+        - "🐳 Docker Container"
+        - "🍎 macOS (Local Development)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "📝 What Happened?"
+      description: "Describe the bug clearly, including what you expected to happen instead."
+      placeholder: |
+        Expected behavior:
+        Actual behavior:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "🔁 Steps to Reproduce"
+      description: "Share minimal, concrete steps so we can reproduce the behavior locally."
+      placeholder: |
+        1. Start zerodeckd with ...
+        2. Trigger action ...
+        3. Observe error ...
+    validations:
+      required: true
+
+  - type: input
+    id: zerodeck_version
+    attributes:
+      label: "🏷️ ZeroDeck Version or Commit SHA"
+      description: "Tag, branch, or short commit hash where you observed the issue."
+      placeholder: "e.g. v0.1.0 or 9363d11"
+
+  - type: input
+    id: toolchain_versions
+    attributes:
+      label: "🛠️ Runtime / Toolchain Versions (if relevant)"
+      description: "Specify versions of Rust, Python, Node.js, pnpm, or Docker."
+      placeholder: "e.g. Rust 1.100.0, Python 3.12, Node 26, pnpm 12.16.1"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "📋 Relevant Logs or Stack Trace"
+      description: "Paste relevant daemon, worker, browser console, or CI output."
+      render: bash
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "✅ Pre-submission Checklist"
+      options:
+        - label: "🔍 I searched existing issues to confirm this is not a duplicate."
+          required: true
+        - label: "🔐 I removed any tokens, auth secrets, or sensitive paths from the logs."
+          required: true

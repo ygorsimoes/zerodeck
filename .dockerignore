@@ -1,0 +1,15 @@
+.git
+.gitignore
+.superpowers
+.worktrees
+target
+**/node_modules
+frontend/dist
+frontend/.vite
+docs
+.github
+.venv
+**/__pycache__
+.dev-homebrew
+*.log
+.DS_Store

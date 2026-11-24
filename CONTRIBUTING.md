@@ -13,42 +13,81 @@ Thank you for helping build **ZeroDeck**! This guide covers everything you need 
 
 ## 🛠 Development Setup
 
+**Docker is the default way to develop ZeroDeck.** Every `just` recipe runs inside a pinned dev
+container (the `dev` stage of the [`Dockerfile`](Dockerfile)): Rust `1.100.0`, cargo-deny, Node
+`26` + pnpm `12.16.1`, Python 3 + ruff + pyright, and `just`. CI runs the **same recipes in the
+same image**, so a green `just check` on your machine means a green CI. The toolchain is fixed in
+the repository, so results don't depend on what is installed on your machine.
+
 ### Prerequisites
 
-| Tool | Required Version / Notes |
+| Tool | Notes |
 |---|---|
-| **Rust** | `1.100.0` (managed automatically via [`rust-toolchain.toml`](rust-toolchain.toml) with `rustfmt` & `clippy`) |
-| **`just`** | Task runner for unified checks (`just --list`) |
-| **Node.js & pnpm** | Node `26+` and **`pnpm@12.16.1`** (do not use `npm` or `yarn`) |
-| **Python & `uv`** | Python `>=3.10` + [`uv`](https://docs.astral.sh/uv/) for `ruff` and `pyright` |
-| **`cargo-deny`** | `cargo install --locked cargo-deny` for license & advisory checks |
-| **Docker** *(optional)* | For `just docker-test` and `just docker-up` |
+| **Docker** | Docker Engine or Docker Desktop with Compose v2 (`docker compose`) |
+| **[`just`](https://just.systems)** | Task runner (`brew install just`, `cargo install just`, or your package manager) |
 
-### Useful Commands
+That's all. Run `just` to list every recipe.
+
+### Everyday commands
 
 ```bash
-# Install frontend workspace dependencies
-pnpm install --frozen-lockfile
-
-# Format Rust + Frontend code
-just fmt
-
-# Run ALL checks (Rust fmt/clippy/test, Python tests + ruff/pyright, cargo-deny,
-# Frontend biome/tsc/build/tests). Without `uv` or `cargo-deny` installed, those
-# steps print a warning and are skipped locally; CI always runs them.
-just check
-
-# Run a single group on its own
-just py-lint   # ruff + strict pyright
-just deny      # cargo deny check
-
-# Fuzz an untrusted-input parser (nightly + `cargo install cargo-fuzz`)
-just fuzz zip_extract 120
-
-# Validate Compose & run tests inside a Linux container
-docker compose config --quiet
-just docker-test
+just setup          # once (and after toolchain changes): build the dev image, install frontend deps
+just check          # everything CI checks: fmt, clippy, tests, Python lint/tests, cargo-deny, frontend
+just fmt            # format Rust + frontend code
+just lint           # lints only (no tests)
+just test           # tests only (Rust, Python worker host, frontend)
+just dev            # run zerodeckd from source on 127.0.0.1:1337 (home: ./.dev-homebrew)
+just shell          # shell inside the dev container; `just <recipe>` works there too
+just clean          # drop the dev containers and their cache volumes
 ```
+
+Focused checks (each is one CI job):
+
+```bash
+just check-rust     # rustfmt, clippy -D warnings, cargo test
+just deny           # deny.toml: licenses, advisories, sources
+just check-python   # ruff, strict pyright, unittest
+just py-matrix      # Python worker host tests on Python 3.10, 3.11, 3.12 and 3.13 (official images)
+just check-frontend # biome, tsc, vite build, node tests
+just lint-infra     # actionlint (workflows), hadolint (Dockerfile), compose config
+just fuzz zip_extract 120   # fuzz one untrusted-input parser (nightly, in its own image)
+```
+
+The shipped runtime image:
+
+```bash
+just up / just down / just logs   # hardened container on 127.0.0.1:1337
+just smoke                        # build, wait until healthy, probe /healthz, stop
+just dist v0.0.0-local            # release tarball + SHA256SUMS into dist/ (as the release job does)
+```
+
+### How it works
+
+- Your checkout is bind-mounted at `/workspace`; `target/`, `node_modules/` and the cargo/pnpm
+  caches live in named Docker volumes, so host builds (e.g. macOS binaries) never mix with the
+  container's Linux ones and rebuilds stay incremental.
+- The container user takes your UID/GID, so files it writes (formatting, `frontend/dist`) stay
+  yours.
+- Containers use your machine's native architecture for speed. The Steam Deck is `x86_64`; to
+  check on exactly that architecture (slower under emulation on Apple Silicon), run
+  `DOCKER_DEFAULT_PLATFORM=linux/amd64 just check`. CI always runs on `x86_64`.
+- Rust is built on Debian bookworm on purpose: a binary linked against its older glibc runs on
+  SteamOS's newer one, but not the other way around.
+- Tool versions are pinned in the `Dockerfile` (`ARG …_VERSION`, with SHA-256 digests for
+  downloaded binaries). Bump them there; CI picks them up automatically.
+
+### Running natively (optional)
+
+You can run the same recipes on your own toolchain by setting `ZERODECK_NATIVE=1`:
+
+```bash
+ZERODECK_NATIVE=1 just check
+```
+
+Then you need Rust (via `rustup`; [`rust-toolchain.toml`](rust-toolchain.toml) selects the
+version), Node `26+` with `pnpm@12.16.1` (never `npm` or `yarn`), Python `>=3.10`, and optionally
+[`uv`](https://docs.astral.sh/uv/) (ruff/pyright) and `cargo-deny`. Without `uv` or `cargo-deny`
+those steps print a warning and are skipped, which is one reason Docker is the recommended path.
 
 ---
 
@@ -75,7 +114,7 @@ Common types:
 ### Before Opening a PR
 
 1. Search [existing issues](https://github.com/ygorsimoes/zerodeck/issues) and review [`docs/architecture/wire-protocol.md`](docs/architecture/wire-protocol.md) if touching wire/IPC contracts.
-2. Run `just check` locally and confirm all checks pass.
+2. Run `just check` (in Docker, the default) and confirm all checks pass.
 3. Fill out the [Pull Request template](.github/pull_request_template.md) accurately.
 4. Keep PRs focused and small enough to review clearly.
 

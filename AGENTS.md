@@ -50,7 +50,14 @@ Never weaken or bypass these invariants:
   - Do **not** manually bump versions in `Cargo.toml`, `.release-please-manifest.json`, `hosts/python/pyproject.toml`, `frontend/package.json`, or `Dockerfile` unless fixing release automation itself.
   - Preserve `# x-release-please-version`, `# x-release-please-start-version`, and `# x-release-please-end` markers in `Cargo.toml` and `Dockerfile`.
 
-## 6. Required Verification Before Finishing
+## 6. Docker-First Workflow
+
+- The pinned `dev` image (`Dockerfile` stage `dev`, `compose.yaml` service `dev`) is the canonical environment. `just <recipe>` runs inside it by default; `ZERODECK_NATIVE=1` opts into the host toolchain, and recipes run natively automatically inside the container (`ZERODECK_IN_CONTAINER=1`).
+- Add new tasks as a public recipe that forwards to a private `_recipe` (see `justfile`), so the logic exists once and works in Docker, natively, and in CI.
+- CI jobs must call `just` recipes rather than inline tool commands. Keep the required check job ids `rust`, `deny`, `python`, `frontend`, `docker` stable.
+- Pin new tools in the `Dockerfile` with a version `ARG` and, for downloaded binaries, a SHA-256 digest (fail closed). Pin GitHub Actions by full commit SHA.
+
+## 7. Required Verification Before Finishing
 
 Always run after your final edit and verify all pass:
 
@@ -58,8 +65,9 @@ Always run after your final edit and verify all pass:
 just check
 ```
 
-If you modify `Dockerfile`, `compose.yaml`, or `.github/workflows/*`, also verify:
+If you modify `Dockerfile`, `compose.yaml`, `justfile`, or `.github/**`, also verify:
 
 ```bash
-docker compose config --quiet
+just lint-infra
+just smoke
 ```

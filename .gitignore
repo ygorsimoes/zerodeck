@@ -21,3 +21,7 @@ __pycache__/
 *.log
 .superpowers/
 .worktrees/
+
+# CI caches (see .github/workflows/ci.yml) and release packaging
+.ci-cache/
+dist/

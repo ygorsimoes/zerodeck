@@ -1,0 +1,62 @@
+name: Dev image
+description: >-
+  Builds a ZeroDeck toolchain image (Dockerfile `dev` or `fuzz` stage) into the local Docker daemon
+  with the GitHub Actions layer cache, installs `just`, and restores the cargo caches the compose
+  `dev` service mounts, so a job can run `just <recipe>` exactly as a developer would.
+
+inputs:
+  target:
+    description: Dockerfile stage to build (`dev` or `fuzz`).
+    default: dev
+  cargo-cache:
+    description: Cache key suffix for cargo home + target dirs; empty disables the cargo cache.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install just
+      uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+      with:
+        tool: just@1.59.0
+
+    - name: Prepare cache directories
+      id: prep
+      shell: bash
+      run: |
+        # Created here (owned by the runner user) before compose bind-mounts them; Docker would
+        # otherwise create them as root and the unprivileged dev user could not write.
+        mkdir -p "${ZERODECK_CARGO_HOME}" "${ZERODECK_CARGO_TARGET}" "${ZERODECK_FUZZ_TARGET}"
+        echo "uid=$(id -u)" >> "${GITHUB_OUTPUT}"
+        echo "gid=$(id -g)" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore cargo caches
+      if: inputs.cargo-cache != ''
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ env.ZERODECK_CARGO_HOME }}
+          ${{ env.ZERODECK_CARGO_TARGET }}
+          ${{ env.ZERODECK_FUZZ_TARGET }}
+        key: cargo-${{ inputs.cargo-cache }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock', 'rust-toolchain.toml', 'Dockerfile') }}
+        restore-keys: |
+          cargo-${{ inputs.cargo-cache }}-${{ runner.arch }}-
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+    - name: Build ${{ inputs.target }} image
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+      with:
+        context: .
+        target: ${{ inputs.target }}
+        load: true
+        push: false
+        tags: zerodeck-${{ inputs.target }}:local
+        build-args: |
+          DEV_UID=${{ steps.prep.outputs.uid }}
+          DEV_GID=${{ steps.prep.outputs.gid }}
+        cache-from: |
+          type=gha,scope=toolchain-dev
+          type=gha,scope=toolchain-${{ inputs.target }}
+        cache-to: type=gha,mode=max,scope=toolchain-${{ inputs.target }},ignore-error=true

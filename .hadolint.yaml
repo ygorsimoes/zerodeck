@@ -1,0 +1,6 @@
+# Dockerfile lint policy (`just lint-infra`).
+failure-threshold: warning
+ignored:
+  # Debian package versions are not pinned: the base images are pinned and refreshed by Dependabot,
+  # and bookworm only ships security fixes, which we want.
+  - DL3008

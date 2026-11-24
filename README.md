@@ -90,27 +90,35 @@ dropped, unprivileged user).
 ```bash
 git clone https://github.com/ygorsimoes/zerodeck.git
 cd zerodeck
-docker compose up -d --build
+docker compose up -d --build            # or: just up
 curl http://127.0.0.1:1337/healthz      # {"status":"ok"}
 ```
 
 - **Update:** `git pull && docker compose up -d --build`
-- **Stop:** `docker compose down`
+- **Stop:** `docker compose down` (or `just down`)
 
 Plugins go in `.dev-homebrew/plugins/` next to the repository.
 
 ### From source
 
-You need Rust (the toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) installs itself
-through `rustup`).
+With Docker and [`just`](https://just.systems) installed, `just dev` builds and runs `zerodeckd`
+from your checkout inside the pinned dev container, the same toolchain CI uses. Nothing else
+needs to be installed.
 
 ```bash
 git clone https://github.com/ygorsimoes/zerodeck.git
 cd zerodeck
+just dev                                # listens on 127.0.0.1:1337, home in ./.dev-homebrew
+```
+
+Prefer your own toolchain? You need Rust (the toolchain in
+[`rust-toolchain.toml`](rust-toolchain.toml) installs itself through `rustup`):
+
+```bash
 cargo run --release --bin zerodeckd     # listens on 127.0.0.1:1337
 ```
 
-- **Update:** `git pull && cargo build --release`
+- **Update:** `git pull`, then `just dev` again (or `cargo build --release`)
 
 ### See it discover a plugin
 
@@ -223,9 +231,11 @@ interesting work is still ahead. Rust, Python and TypeScript are all welcome.
 2. Pick something from
    [`good first issue`](https://github.com/ygorsimoes/zerodeck/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
    or a 🚧 row in the table above.
-3. Make sure everything passes before opening a pull request:
+3. Make sure everything passes before opening a pull request. With Docker and `just` installed,
+   this runs every CI check inside the same pinned container CI uses:
 
 ```bash
+just setup   # once: builds the dev image and installs frontend dependencies
 just check
 ```
 

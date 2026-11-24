@@ -1,10 +1,15 @@
 name: CI
 
+# Every job runs the same `just` recipe a developer runs locally, inside the same pinned toolchain
+# image (Dockerfile `dev` stage, built by .github/actions/dev-image). Branch protection requires the
+# `rust`, `deny`, `python`, `frontend` and `docker` checks, so keep those job ids stable.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,32 +18,62 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Host directories (cached by actions/cache) that compose mounts instead of its named volumes.
+  ZERODECK_CARGO_HOME: ./.ci-cache/cargo-home
+  ZERODECK_CARGO_TARGET: ./.ci-cache/target
+  ZERODECK_FUZZ_TARGET: ./.ci-cache/fuzz-target
 
 jobs:
-  rust:
+  infra:
+    name: infra
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: "1.100.0"
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: just@1.59.0
+      - name: actionlint, hadolint, compose config
+        run: just lint-infra
+
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+        with:
+          cargo-cache: rust
+      - name: rustfmt, clippy, tests
+        run: just check-rust
 
   deny:
+    name: deny
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: cargo deny check
+        run: just deny
 
   python-tests:
     name: python-tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -46,86 +81,81 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: ${{ matrix.python-version }}
-      - run: PYTHONPATH=hosts/python python -m unittest discover -s hosts/python/tests -v
-
-  # Kept as `python` because branch protection requires that check name; it only passes when
-  # every matrix version above passed and lint/type checks succeed.
-  python:
-    needs: python-tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
-      - run: |
-          uv tool run ruff check hosts/python
-          uv tool run pyright --project hosts/python
-
-  # Smoke-fuzzes every target for 30s on each PR (not a required check). Run longer locally with
-  # `just fuzz <target> <seconds>`.
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
-        with:
-          toolchain: nightly
+          persist-credentials: false
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
-          tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+          tool: just@1.59.0
+      - name: unittest in python:${{ matrix.python-version }}-slim
+        run: just py-test-on "${{ matrix.python-version }}"
+
+  # Kept as `python` because branch protection requires that check name; it only passes when every
+  # interpreter above passed and lint/type checks succeed.
+  python:
+    name: python
+    needs: python-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          workspaces: fuzz
-      - name: Fuzz each target for 30 seconds
-        # The prebuilt cargo-fuzz is a musl binary and would default `--target` to musl, which the
-        # sanitizer cannot link; build for the toolchain's own (glibc) host triple instead.
-        run: |
-          host="$(rustc +nightly -vV | sed -n 's/^host: //p')"
-          for target in $(cargo +nightly fuzz list); do
-            echo "::group::fuzz ${target}"
-            cargo +nightly fuzz run --target "${host}" "${target}" -- -max_total_time=30
-            echo "::endgroup::"
-          done
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: ruff, pyright (strict), unittest
+        run: just check-python
 
   frontend:
+    name: frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "26"
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir frontend exec biome check .
-      - run: pnpm --dir frontend exec tsc --noEmit
-      - run: pnpm --dir frontend build
-      - run: node --test frontend/tests/wsrouter.test.ts
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: biome, tsc, build, tests
+        run: just check-frontend
 
   docker:
+    name: docker
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: docker compose config --quiet
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: just@1.59.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+      - name: Build runtime image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           target: runtime
+          load: true
           push: false
-          load: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max,ignore-error=true
-      # Builds the `linux-test` stage, whose RUN step executes the Rust and Python suites inside the
-      # Debian image the runtime ships on.
-      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+          tags: zerodeck:runtime
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime,ignore-error=true
+      - name: Smoke test (hardened compose service must become healthy)
+        run: just smoke --no-build
+      - name: Package release tarball (dry run)
+        run: just dist ci-${{ github.run_number }}
+
+  # Smoke-fuzzes every target for 30s (not a required check). Run longer locally with
+  # `just fuzz <target> <seconds>`.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          context: .
-          target: linux-test
-          push: false
-          load: false
-          cache-from: type=gha
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+        with:
+          target: fuzz
+          cargo-cache: fuzz
+      - name: Fuzz each target for 30 seconds
+        run: just fuzz-all 30

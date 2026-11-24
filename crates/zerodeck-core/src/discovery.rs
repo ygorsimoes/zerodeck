@@ -17,7 +17,8 @@ pub struct DiscoveredPlugin {
     pub has_entrypoint: bool,
 }
 
-/// Scans `plugins_dir` for non-hidden subdirectories containing a valid `plugin.json`.
+/// Scans `plugins_dir` for non-hidden subdirectories containing a valid `plugin.json`, sorted by
+/// directory name.
 ///
 /// A plugin whose `plugin.json` or `package.json` cannot be read or parsed is logged and skipped,
 /// so one broken plugin never prevents the remaining plugins (or the daemon) from loading.
@@ -55,6 +56,8 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
         }
     }
 
+    // `read_dir` order is filesystem-dependent; sort so load order and listings are stable.
+    plugins.sort_by(|a, b| a.directory.cmp(&b.directory));
     Ok(plugins)
 }
 

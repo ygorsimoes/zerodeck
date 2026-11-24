@@ -161,6 +161,29 @@ mod tests {
     }
 
     #[test]
+    fn discover_plugins_returns_plugins_sorted_by_directory() {
+        let dir = TestDir::new("discover-order");
+        let names = [
+            "zeta", "alpha", "Mid", "beta-2", "beta-10", "omega", "kappa", "delta",
+        ];
+        for name in names {
+            let plugin = dir.0.join(name);
+            fs::create_dir_all(&plugin).expect("create plugin dir");
+            fs::write(
+                plugin.join("plugin.json"),
+                format!(r#"{{"name": "{name}", "author": "Alice"}}"#),
+            )
+            .expect("write plugin.json");
+        }
+
+        let plugins = discover_plugins(&dir.0).expect("discover plugins");
+        let found: Vec<&str> = plugins.iter().map(|p| p.directory.as_str()).collect();
+        let mut expected = names.to_vec();
+        expected.sort_unstable();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
     fn discover_plugins_ignores_hidden_staging_directories() {
         let dir = TestDir::new("discover-hidden");
         for name in ["visible", ".visible.staging-1234"] {

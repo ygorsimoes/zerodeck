@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 use zerodeck_cef::CefConfig;
 use zerodeck_core::{SettingsManager, discover_plugins};
 use zerodeck_platform::PlatformPaths;
-use zerodeck_plugin_host::{PluginRuntime, PythonHostConfig};
+use zerodeck_plugin_host::PythonHostConfig;
 use zerodeck_protocol::WsMessageType;
 use zerodeck_server::{AppState, ServerConfig, serve};
 
@@ -19,11 +19,11 @@ struct Cli {
     #[arg(long)]
     check_config: bool,
 
-    /// Probe the running daemon's /healthz endpoint and exit with status 0/1.
+    /// Probe the running daemon's /healthz endpoint (on --host/--port) and exit with status 0/1.
     #[arg(long)]
     healthcheck: bool,
 
-    /// Bind host address for HTTP/WebSocket server.
+    /// Bind host for the HTTP/WebSocket server: an IPv4/IPv6 address or a hostname.
     #[arg(long, env = "SERVER_HOST", default_value = "127.0.0.1")]
     host: String,
 
@@ -40,21 +40,65 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_healthcheck(port: u16) -> Result<()> {
-    let url = format!("http://127.0.0.1:{port}/healthz");
+/// Resolves `host:port` (IP literal or hostname) to socket addresses.
+async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve listen address {host}:{port}"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("listen address {host}:{port} resolved to no addresses");
+    }
+    Ok(addrs)
+}
+
+/// Maps a wildcard bind address (`0.0.0.0` / `::`) to the matching loopback address to probe.
+fn probe_target(addr: SocketAddr) -> SocketAddr {
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+        }
+        IpAddr::V6(ip) if ip.is_unspecified() => {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), addr.port())
+        }
+        _ => addr,
+    }
+}
+
+/// Binds the first address that accepts a listener (e.g. `localhost` may resolve to `::1` on a host
+/// without IPv6, in which case `127.0.0.1` is used instead).
+async fn bind_first(addrs: &[SocketAddr]) -> Result<TcpListener> {
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) => last_error = Some(anyhow::Error::new(err).context(format!("bind {addr}"))),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no address to bind")))
+}
+
+async fn run_healthcheck(host: &str, port: u16) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .context("build healthcheck HTTP client")?;
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("probe {url}"))?;
-    if !response.status().is_success() {
-        bail!("healthcheck returned status {}", response.status());
+
+    let mut last_error = None;
+    for addr in resolve(host, port).await? {
+        let url = format!("http://{}/healthz", probe_target(addr));
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) => {
+                last_error = Some(anyhow::anyhow!(
+                    "{url} returned status {}",
+                    response.status()
+                ));
+            }
+            Err(err) => last_error = Some(anyhow::Error::new(err).context(format!("probe {url}"))),
+        }
     }
-    Ok(())
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no address to probe")))
 }
 
 async fn shutdown_signal() {
@@ -87,7 +131,7 @@ async fn main() -> Result<()> {
     init_tracing();
 
     if cli.healthcheck {
-        return run_healthcheck(cli.port).await;
+        return run_healthcheck(&cli.host, cli.port).await;
     }
 
     let paths = PlatformPaths::from_env();
@@ -105,8 +149,6 @@ async fn main() -> Result<()> {
     );
 
     if cli.check_config {
-        // Ensure trait symbol stays linked as the daemon foundation contract.
-        let _: Option<&dyn PluginRuntime> = None;
         return Ok(());
     }
 
@@ -117,14 +159,9 @@ async fn main() -> Result<()> {
         python_host: PythonHostConfig::default(),
         ..ServerConfig::default()
     };
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .context("parse server listen address")?;
-
+    let listener = bind_first(&resolve(&config.host, config.port).await?).await?;
+    let addr = listener.local_addr().context("read bound address")?;
     let state = AppState::with_plugins(config, plugins);
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind {addr}"))?;
 
     info!(listen = %addr, "ZeroDeck daemon listening");
     serve(listener, state, shutdown_signal())

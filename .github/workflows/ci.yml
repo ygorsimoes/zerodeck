@@ -36,14 +36,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@81891abc19297b21343b15ef67dc61e4aea74fda # v2
 
-  python:
+  python-tests:
+    name: python-tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor (`requires-python`); the rest cover SteamOS and newer hosts.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: "3.12"
-      - run: PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v
+          python-version: ${{ matrix.python-version }}
+      - run: PYTHONPATH=hosts/python python -m unittest discover -s hosts/python/tests -v
+
+  # Kept as `python` because branch protection requires that check name; it only passes when
+  # every matrix version above passed and lint/type checks succeed.
+  python:
+    needs: python-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
@@ -80,3 +94,12 @@ jobs:
           load: false
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
+      # Builds the `linux-test` stage, whose RUN step executes the Rust and Python suites inside the
+      # Debian image the runtime ships on.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          target: linux-test
+          push: false
+          load: false
+          cache-from: type=gha

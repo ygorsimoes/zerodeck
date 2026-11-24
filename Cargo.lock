@@ -2387,9 +2387,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
  "zerodeck-platform",
+ "zerodeck-plugin-host",
  "zerodeck-protocol",
  "zip",
 ]

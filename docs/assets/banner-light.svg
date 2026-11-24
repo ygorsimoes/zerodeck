@@ -25,7 +25,7 @@
   <rect width="880" height="220" rx="18" fill="url(#grid-light)" />
   <rect x="0.75" y="0.75" width="878.5" height="218.5" rx="17.25" fill="none" stroke="#CBD5E1" stroke-width="1.5" />
 
-  <circle cx="155" cy="110" r="110" fill="#0284C7" opacity="0.06" />
+  <circle cx="155" cy="110" r="115" fill="#0284C7" opacity="0.06" />
   <circle cx="740" cy="70" r="130" fill="#EA580C" opacity="0.05" />
 
   <g transform="translate(64, 52)">
@@ -38,23 +38,23 @@
     <path d="M 55 41 L 81 41 L 61 61 L 82 61 L 57 77 L 65 61 L 54 61 Z" fill="url(#accent-grad-light)" />
   </g>
 
-  <g transform="translate(232, 82)">
+  <g transform="translate(232, 84)">
     <text x="0" y="0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif" font-size="48" font-weight="800" letter-spacing="-1.2" fill="#0F172A">
       Zero<tspan fill="url(#accent-grad-light)">Deck</tspan>
     </text>
-    <text x="2" y="34" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="400" fill="#475569">
+    <text x="2" y="33" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Roboto, Helvetica, Arial, sans-serif" font-size="16.5" font-weight="400" fill="#475569">
       Performance-first, security-hardened Steam Deck plugin loader daemon
     </text>
 
     <g transform="translate(2, 54)">
-      <rect x="0" y="0" width="96" height="24" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1" />
-      <text x="48" y="16" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="600" fill="#C2410C">Rust 2024</text>
+      <rect x="0" y="0" width="108" height="24" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1" />
+      <text x="54" y="16" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="600" fill="#C2410C">Rust 1.100+</text>
 
-      <rect x="106" y="0" width="120" height="24" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1" />
-      <text x="166" y="16" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="600" fill="#0369A1">Decky Compatible</text>
+      <rect x="118" y="0" width="134" height="24" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1" />
+      <text x="185" y="16" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="600" fill="#0369A1">Decky Compatible</text>
 
-      <rect x="236" y="0" width="116" height="24" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1" />
-      <text x="294" y="16" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="600" fill="#4338CA">Clean-Room MIT</text>
+      <rect x="262" y="0" width="106" height="24" rx="6" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1" />
+      <text x="315" y="16" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11.5" font-weight="600" fill="#4338CA">MIT License</text>
     </g>
   </g>
 

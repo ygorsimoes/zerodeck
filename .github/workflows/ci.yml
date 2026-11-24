@@ -65,6 +65,29 @@ jobs:
           uv tool run ruff check hosts/python
           uv tool run pyright --project hosts/python
 
+  # Smoke-fuzzes every target for 30s on each PR (not a required check). Run longer locally with
+  # `just fuzz <target> <seconds>`.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz
+      - name: Fuzz each target for 30 seconds
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::fuzz ${target}"
+            cargo +nightly fuzz run "${target}" -- -max_total_time=30
+            echo "::endgroup::"
+          done
+
   frontend:
     runs-on: ubuntu-latest
     steps:

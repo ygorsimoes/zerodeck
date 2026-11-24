@@ -1,0 +1,48 @@
+# Fuzz targets for ZeroDeck's untrusted-input parsers. This is its own workspace (it needs nightly
+# and libFuzzer), so it is not part of the shipped crates. Run with: just fuzz <target> [seconds]
+[package]
+name = "zerodeck-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+zerodeck-core = { path = "../crates/zerodeck-core" }
+zerodeck-protocol = { path = "../crates/zerodeck-protocol" }
+
+[[bin]]
+name = "ws_client_message"
+path = "fuzz_targets/ws_client_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_from_worker"
+path = "fuzz_targets/ipc_from_worker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifests"
+path = "fuzz_targets/manifests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip_extract"
+path = "fuzz_targets/zip_extract.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

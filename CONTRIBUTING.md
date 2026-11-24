@@ -42,6 +42,9 @@ just check
 just py-lint   # ruff + strict pyright
 just deny      # cargo deny check
 
+# Fuzz an untrusted-input parser (nightly + `cargo install cargo-fuzz`)
+just fuzz zip_extract 120
+
 # Validate Compose & run tests inside a Linux container
 docker compose config --quiet
 just docker-test

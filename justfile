@@ -35,6 +35,10 @@ deny:
         echo "warning: cargo-deny not found; skipping deny.toml checks (CI still runs them)" >&2; \
     fi
 
+# Fuzz one target (see `cargo +nightly fuzz list`); needs nightly and cargo-fuzz.
+fuzz target seconds="60":
+    cargo +nightly fuzz run {{target}} -- -max_total_time={{seconds}}
+
 build-frontend:
     pnpm --dir frontend build
 

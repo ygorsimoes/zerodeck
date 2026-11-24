@@ -54,6 +54,10 @@ pub enum CoreError {
     #[error("archive `{entry}` exceeded maximum uncompressed limit of {max_bytes} bytes")]
     ArchiveSizeExceeded { entry: String, max_bytes: u64 },
 
+    /// Archive declares more entries than the configured maximum.
+    #[error("archive has {count} entries, exceeding the maximum of {max_entries}")]
+    ArchiveTooManyEntries { count: usize, max_entries: usize },
+
     /// Remote install requires a SHA-256 digest unless `allow_unverified_installs` is enabled.
     #[error("missing required SHA-256 digest for remote installation")]
     MissingSha256,

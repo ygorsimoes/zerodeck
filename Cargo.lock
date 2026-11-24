@@ -2430,9 +2430,11 @@ name = "zerodeck-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tower",
  "tower-http 0.7.1",
  "tracing",

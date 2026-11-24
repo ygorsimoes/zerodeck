@@ -23,3 +23,7 @@ zerodeck-cef.workspace = true
 zerodeck-core.workspace = true
 zerodeck-plugin-host.workspace = true
 zerodeck-protocol.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+tokio-tungstenite.workspace = true

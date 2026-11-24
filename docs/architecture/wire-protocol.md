@@ -25,7 +25,12 @@ Messages are JSON objects keyed by integer `type`:
 | `4` | `FULL_SYNC` | Client -> Server | `messages: CallMessage[]` |
 | `5` | `EVENT` | Server -> Client | `event`, `args` |
 
-`FULL_SYNC` replays in-flight `CALL` messages upon WebSocket reconnection so pending calls recover seamlessly or receive cached replies.
+`FULL_SYNC` replays in-flight `CALL` messages upon WebSocket reconnection so pending calls recover seamlessly. The server dispatches each replayed call again and answers it with a normal `REPLY`/`ERROR` (there is no cross-connection reply cache yet, so replayed calls must be safe to repeat).
+
+Connection limits:
+- Inbound messages and frames above 16 MiB (`ServerConfig::ws_max_message_bytes`) close the connection.
+- The server sends a WebSocket `ping` every 30 s (`ServerConfig::ws_ping_interval`); a client that has not answered the previous ping with a `pong` by the next one is disconnected. Browsers answer pings automatically.
+- Clients reconnect with exponential backoff (1 s doubling up to 30 s, reset after a successful open) and fetch a fresh token from `/auth/token` before each attempt.
 
 ## 2. Plugin Backend IPC (JSON Lines over Unix Domain Socket / Inherited FD)
 

@@ -31,10 +31,18 @@ Please include as much of the following as possible:
 
 ## Security Design Scope
 
-ZeroDeck enforces defense-in-depth across:
-- Path-jail canonicalization (`SafePath`) on plugin static/asset/data routes and filepicker roots
-- Fail-closed SHA-256 verification for remote Store installs and `remote_binary` downloads
-- Zip-Slip (`enclosed_name()`) and symlink rejection during archive extraction
-- Ephemeral CSRF token auth (`X-Decky-Auth` / `?auth=`) and strict `https://steamloopback.host` CORS allowlisting
-- Out-of-process plugin workers with explicit `uid`/`gid` privilege dropping and `socketpair()` / `0700` runtime directory isolation
-- Automated dependency license & advisory auditing via `cargo-deny` (`deny.toml`)
+ZeroDeck enforces defense-in-depth across the following areas.
+
+**In place today** (covered by tests and CI):
+- Path-jail canonicalization (`SafePath`): canonicalized paths that cannot escape their root, symlinks included
+- Atomic settings writes (temp file + `fsync` + rename)
+- Zip-Slip (`enclosed_name()`), symlink and size checks during archive extraction, with all-or-nothing installs
+- Fail-closed SHA-256 verification for downloads
+- Ephemeral auth token (`X-Decky-Auth` / `?auth=`) on mutating, IPC, `/ws` and `/fetch` endpoints, compared in constant time, plus strict `https://steamloopback.host` CORS and DNS-rebinding protection
+- Fuzzing of the untrusted-input parsers (WebSocket frames, worker IPC, manifests, ZIP extraction) on every pull request
+- Supply chain: `cargo-deny` license, advisory and source policy (`deny.toml`); GitHub Actions pinned by commit SHA and audited with `zizmor`; toolchain binaries pinned by SHA-256; release images and tarballs ship with signed build-provenance attestations and an SBOM
+
+**Planned** (see the [roadmap](README.md#roadmap)):
+- Out-of-process plugin workers with explicit `uid`/`gid` privilege dropping for plugins without the `"root"` flag
+- Private plugin IPC over inherited `socketpair()` FDs or per-plugin `0700` runtime directories (never predictable `/tmp` socket paths)
+- Path-jailed plugin static, asset and data routes and file-picker roots

@@ -1,0 +1,6 @@
+# GitHub Actions security audit policy (`just lint-infra`, https://docs.zizmor.sh).
+rules:
+  # Suggests the `$/` self-repository syntax for local actions; `./.github/actions/*` is resolved
+  # from the already checked-out commit, and the plain form keeps actionlint support.
+  self-repository:
+    disable: true

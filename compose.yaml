@@ -1,3 +1,48 @@
+# ZeroDeck containers. Prefer the `just` recipes over calling these directly (`just --list`).
+#
+#   zerodeckd  hardened runtime image, as shipped        just up / just down / just logs / just smoke
+#   dev        pinned toolchain, checkout bind-mounted   just check / just shell / just fmt ...
+#   daemon     zerodeckd built and run from source       just dev
+#   fuzz       dev + nightly + cargo-fuzz                just fuzz <target>
+#
+# Optional host variables (also read from a `.env` file): ZERODECK_PORT (default 1337), RUST_LOG.
+name: zerodeck
+
+x-dev: &dev
+  build:
+    context: .
+    target: dev
+    args:
+      # Match the host user so files written into the checkout are not owned by root.
+      DEV_UID: ${DEV_UID:-1000}
+      DEV_GID: ${DEV_GID:-1000}
+  image: zerodeck-dev:local
+  profiles: ["dev"]
+  init: true
+  # Unprivileged user, no capabilities, no setuid escalation: nothing in the dev loop needs more.
+  user: dev
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  working_dir: /workspace
+  volumes:
+    - .:/workspace
+    # Build outputs and dependencies live in volumes, never in the host checkout: the host's own
+    # `target/` and `node_modules/` (e.g. macOS binaries) must not leak into the Linux container.
+    # CI points the first three at host directories it caches between runs.
+    - ${ZERODECK_CARGO_TARGET:-cargo-target}:/workspace/target
+    - ${ZERODECK_CARGO_HOME:-cargo-home}:/home/dev/.cargo
+    - ${ZERODECK_FUZZ_TARGET:-fuzz-target}:/workspace/fuzz/target
+    - node-modules:/workspace/node_modules
+    - frontend-node-modules:/workspace/frontend/node_modules
+    - pnpm-store:/home/dev/.local/share/pnpm
+  environment:
+    # Passed through only when set on the host (CI sets them).
+    - CI
+    - CARGO_INCREMENTAL
+    - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+
 services:
   zerodeckd:
     build:
@@ -20,14 +65,43 @@ services:
       PRIVILEGED_PATH: /homebrew
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: "1337"
-      RUST_LOG: info
+      RUST_LOG: ${RUST_LOG:-info}
     ports:
-      - "127.0.0.1:1337:1337"
+      - "127.0.0.1:${ZERODECK_PORT:-1337}:1337"
     restart: unless-stopped
 
-  linux-test:
-    profiles: ["test"]
+  dev:
+    <<: *dev
+
+  daemon:
+    <<: *dev
+    command: ["cargo", "run", "--bin", "zerodeckd"]
+    environment:
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+      - RUST_LOG=${RUST_LOG:-info}
+      - UNPRIVILEGED_PATH=/workspace/.dev-homebrew
+      - PRIVILEGED_PATH=/workspace/.dev-homebrew
+      - PYTHONPATH=/workspace/hosts/python
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=1337
+    ports:
+      - "127.0.0.1:${ZERODECK_PORT:-1337}:1337"
+
+  fuzz:
+    <<: *dev
     build:
       context: .
-      target: linux-test
-    image: zerodeck:test
+      target: fuzz
+      args:
+        DEV_UID: ${DEV_UID:-1000}
+        DEV_GID: ${DEV_GID:-1000}
+    image: zerodeck-fuzz:local
+    profiles: ["fuzz"]
+
+volumes:
+  cargo-target:
+  cargo-home:
+  fuzz-target:
+  node-modules:
+  frontend-node-modules:
+  pnpm-store:

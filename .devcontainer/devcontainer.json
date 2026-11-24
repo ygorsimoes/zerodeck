@@ -1,0 +1,36 @@
+// VS Code / GitHub Codespaces / any Dev Containers client: opens the repository inside the same
+// pinned `dev` container that `just` and CI use (compose.yaml service `dev`).
+{
+  "name": "ZeroDeck",
+  "dockerComposeFile": ["../compose.yaml"],
+  "service": "dev",
+  "runServices": ["dev"],
+  "workspaceFolder": "/workspace",
+  "overrideCommand": true,
+  "remoteUser": "dev",
+  "updateRemoteUserUID": true,
+  "shutdownAction": "stopCompose",
+  "forwardPorts": [1337],
+  "postCreateCommand": "just setup",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "biomejs.biome",
+        "charliermarsh.ruff",
+        "ms-python.python",
+        "ms-pyright.pyright",
+        "nefrob.vscode-just-syntax",
+        "editorconfig.editorconfig"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "python.analysis.extraPaths": ["hosts/python"],
+        "[rust]": { "editor.formatOnSave": true },
+        "[typescript]": { "editor.defaultFormatter": "biomejs.biome" },
+        "[python]": { "editor.defaultFormatter": "charliermarsh.ruff" }
+      }
+    }
+  }
+}

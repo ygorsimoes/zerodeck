@@ -35,8 +35,9 @@ body:
       options:
         - "🎮 SteamOS / Steam Deck (Native)"
         - "🐧 Linux Desktop / Server"
-        - "🐳 Docker Container"
-        - "🍎 macOS (Local Development)"
+        - "🐳 Docker Container (runtime image / `just up`)"
+        - "🧰 Dev Container (`just dev` / `just check`)"
+        - "🍎 macOS (native, `ZERODECK_NATIVE=1`)"
     validations:
       required: true
 
@@ -74,8 +75,8 @@ body:
     id: toolchain_versions
     attributes:
       label: "🛠️ Runtime / Toolchain Versions (if relevant)"
-      description: "Specify versions of Rust, Python, Node.js, pnpm, or Docker."
-      placeholder: "e.g. Rust 1.100.0, Python 3.12, Node 26, pnpm 12.16.1"
+      description: "Docker and `just` versions (`docker version`, `just --version`); for native runs, also Rust, Python, Node.js and pnpm."
+      placeholder: "e.g. Docker 29.9.3, Compose v5.7.1, just 1.59.0 (native: Rust 1.100.0, Python 3.12, Node 26, pnpm 12.16.1)"
 
   - type: textarea
     id: logs

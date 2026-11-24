@@ -69,7 +69,8 @@ Measured on an Apple M4 (macOS, arm64) with a release build and an empty plugin 
 median of five runs. Steam Deck numbers and a side-by-side with Decky Loader on the same device
 are coming with [Phase 4](#roadmap).
 
-Reproduce it yourself:
+Reproduce it yourself with a native release build (outside Docker, so no VM or container overhead
+is measured):
 
 ```bash
 cargo build --release
@@ -90,35 +91,51 @@ dropped, unprivileged user).
 ```bash
 git clone https://github.com/ygorsimoes/zerodeck.git
 cd zerodeck
-docker compose up -d --build
+docker compose up -d --build            # or: just up
 curl http://127.0.0.1:1337/healthz      # {"status":"ok"}
 ```
 
 - **Update:** `git pull && docker compose up -d --build`
-- **Stop:** `docker compose down`
+- **Stop:** `docker compose down` (or `just down`)
+- **Logs:** `docker compose logs -f zerodeckd` (or `just logs`)
 
-Plugins go in `.dev-homebrew/plugins/` next to the repository.
+Plugins go in `.dev-homebrew/plugins/` next to the repository. To use another host port, set
+`ZERODECK_PORT` (for example `ZERODECK_PORT=1338 just up`).
 
 ### From source
 
-You need Rust (the toolchain in [`rust-toolchain.toml`](rust-toolchain.toml) installs itself
-through `rustup`).
+With Docker and [`just`](https://just.systems) installed, `just dev` builds and runs `zerodeckd`
+from your checkout inside the pinned dev container, the same toolchain CI uses. Nothing else
+needs to be installed.
 
 ```bash
 git clone https://github.com/ygorsimoes/zerodeck.git
 cd zerodeck
+just dev                                # listens on 127.0.0.1:1337, home in ./.dev-homebrew
+```
+
+Prefer your own toolchain? You need Rust (the toolchain in
+[`rust-toolchain.toml`](rust-toolchain.toml) installs itself through `rustup`):
+
+```bash
 cargo run --release --bin zerodeckd     # listens on 127.0.0.1:1337
 ```
 
-- **Update:** `git pull && cargo build --release`
+- **Update:** `git pull`, then `just dev` again (or `cargo build --release`)
 
 ### See it discover a plugin
 
+`just dev`, `just up` and `docker compose up` all use `.dev-homebrew/` in the repository as the
+daemon's home, so drop a plugin there and start the daemon:
+
 ```bash
-mkdir -p ~/zerodeck-test/plugins/hello
-echo '{"name": "Hello", "author": "you"}' > ~/zerodeck-test/plugins/hello/plugin.json
-UNPRIVILEGED_PATH=~/zerodeck-test cargo run --release --bin zerodeckd
+mkdir -p .dev-homebrew/plugins/hello
+echo '{"name": "Hello", "author": "you"}' > .dev-homebrew/plugins/hello/plugin.json
+just dev
 ```
+
+On your own toolchain, point `UNPRIVILEGED_PATH` at it instead:
+`UNPRIVILEGED_PATH=.dev-homebrew cargo run --release --bin zerodeckd`.
 
 In another terminal:
 
@@ -150,7 +167,8 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | `--port` | `SERVER_PORT` | `1337` | Port to listen on |
 | `--check-config` | | | Validate paths, settings and plugin manifests, then exit |
 | `--healthcheck` | | | Probe `/healthz` on a running daemon and exit `0` or `1` |
-| | `UNPRIVILEGED_PATH` | `~/homebrew` | Root for `settings/`, `data/` and `logs/` |
+| | `UNPRIVILEGED_PATH` (or `DECKY_HOME`) | `<user home>/homebrew` | Root for `settings/`, `data/` and `logs/` |
+| | `DECKY_USER_HOME` | `$HOME` | User home used for the default paths |
 | | `PRIVILEGED_PATH` | `UNPRIVILEGED_PATH` | Root for `plugins/` and `services/` |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
@@ -200,6 +218,11 @@ frames, IPC messages, manifests and environment variables) is documented in
 | [`hosts/python`](hosts/python) | `zerodeck-py-host`, the stdlib-only Python plugin worker |
 | [`frontend`](frontend) | `@zerodeck/frontend`, the TypeScript bundle injected into Steam |
 | [`deploy/systemd`](deploy/systemd) | `zerodeck.service` unit template |
+| [`fuzz`](fuzz) | cargo-fuzz targets for the untrusted-input parsers (separate workspace) |
+| [`Dockerfile`](Dockerfile) · [`compose.yaml`](compose.yaml) | Pinned dev/CI toolchain image, fuzz image, and the hardened runtime image |
+| [`justfile`](justfile) | Every development, CI and release task (`just --list`) |
+| [`.devcontainer`](.devcontainer) | Dev Containers / Codespaces setup on top of the `dev` image |
+| [`docs`](docs) | Wire protocol reference and design records |
 
 </details>
 
@@ -223,10 +246,13 @@ interesting work is still ahead. Rust, Python and TypeScript are all welcome.
 2. Pick something from
    [`good first issue`](https://github.com/ygorsimoes/zerodeck/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
    or a 🚧 row in the table above.
-3. Make sure everything passes before opening a pull request:
+3. Make sure everything passes before opening a pull request. With Docker and `just` installed,
+   this runs the checks inside the same pinned container CI uses:
 
 ```bash
-just check
+just setup   # once: builds the dev image and installs frontend dependencies
+just check   # formatting, lints, tests and licenses
+just ci      # optional: everything CI runs (adds the Python matrix, infra lint, smoke test)
 ```
 
 Found a vulnerability? Report it privately as described in [`SECURITY.md`](SECURITY.md). Everyone

@@ -201,6 +201,8 @@ zerodeckd
 4. **`frontend` Foundation:** `package.json`, `tsconfig.json`, `vite.config.ts`, minimal `@zerodeck/frontend` entry + `WSRouter` TypeScript client skeleton passing `pnpm exec biome check`, `pnpm exec tsc --noEmit`, and `pnpm build`.
 5. **Dockerization & Linux Parity:** `.dockerignore`, multi-stage `Dockerfile` (`frontend-builder`, `rust-builder` with `cargo-chef`, `linux-test`, `runtime`), hardened `compose.yaml`, `justfile` Docker targets, and CI image build validation.
 
+   > **Update (2026-11-24):** the `linux-test` stage was replaced by the pinned `dev` toolchain stage, which runs every suite in CI and locally through `just`; see [`2026-11-24-docker-first-dev-design.md`](2026-11-24-docker-first-dev-design.md).
+
 ### Subsequent Phases (Out of Scope for Phase 1 Plan, Informed by This Design)
 - **Phase 2:** Full `zerodeck-plugin-host` process supervisor & `zerodeck-py-host` parity (tested against real Decky Python plugins).
 - **Phase 3:** Full `zerodeck-server` (Axum HTTP/WS, `FULL_SYNC`, `/fetch` streaming proxy, plugin static/data routes, FilePicker) & `zerodeck-core` ZIP/Store installer.

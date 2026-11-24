@@ -19,14 +19,8 @@ async function fetchAuthToken(): Promise<string> {
   return token;
 }
 
-async function bootstrap(): Promise<void> {
-  const token = await fetchAuthToken();
-
-  const router = new WSRouter({ refreshAuthToken: fetchAuthToken });
-  window.DeckyBackend = router;
-  await router.connect(token);
-
-  console.info('[ZeroDeck:Boot] WebSocket router connected');
-}
-
-void bootstrap();
+// `start()` retries with backoff until zerodeckd is reachable, so the UI recovers even when Steam
+// loads before the daemon is listening.
+const router = new WSRouter({ refreshAuthToken: fetchAuthToken });
+window.DeckyBackend = router;
+router.start();

@@ -36,6 +36,8 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout released tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -63,17 +65,27 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(needs.release-please.outputs.version, '-') }}
 
       - name: Build and push runtime container image
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           target: runtime
           push: true
+          provenance: mode=max
+          sbom: true
           build-args: |
             VERSION=${{ needs.release-please.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Attest container image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Package Linux release tarball and checksums
         env:
@@ -99,6 +111,11 @@ jobs:
 
           tar -C dist -czf "dist/${ARCHIVE}" "zerodeck-${TAG}-linux-x86_64"
           (cd dist && sha256sum "${ARCHIVE}" > SHA256SUMS.txt)
+
+      - name: Attest release tarball provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: dist/zerodeck-${{ needs.release-please.outputs.tag_name }}-linux-x86_64.tar.gz
 
       - name: Upload release assets
         env:

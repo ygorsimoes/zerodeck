@@ -16,11 +16,20 @@ const ALLOWED_PUBLIC_PREFIXES: &[&str] = &[
     "/plugins/load_main/",
 ];
 
-const ALLOWED_EXACT_PATHS: &[&str] = &["/auth/token", "/healthz", "/ws", "/fetch"];
+const ALLOWED_EXACT_PATHS: &[&str] = &["/auth/token", "/healthz"];
+
+/// Paths whose clients cannot set custom headers (WebSocket upgrades, `fetch` proxying from the
+/// Steam UI), so they may authenticate with `?auth=<token>` instead of `X-Decky-Auth`.
+const QUERY_AUTH_PATHS: &[&str] = &["/ws", "/fetch"];
+
+/// Returns `true` for a `..` path segment, including percent-encoded forms such as `%2e%2e`.
+fn is_parent_segment(segment: &str) -> bool {
+    segment.to_ascii_lowercase().replace("%2e", ".") == ".."
+}
 
 /// Returns `true` when the request path does not require the `X-Decky-Auth` header.
 fn is_csrf_exempt(method: &Method, path: &str) -> bool {
-    if path.split('/').any(|seg| seg == "..") {
+    if path.split('/').any(is_parent_segment) {
         return false;
     }
 
@@ -57,12 +66,16 @@ pub async fn csrf_middleware(
         return next.run(request).await;
     }
 
-    let provided = request
+    let header_ok = request
         .headers()
         .get("X-Decky-Auth")
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|provided| tokens_match(provided, state.csrf_token()));
+    let query_ok = QUERY_AUTH_PATHS.contains(&request.uri().path())
+        && query_auth_token(request.uri().query())
+            .is_some_and(|provided| tokens_match(provided, state.csrf_token()));
 
-    if provided == Some(state.csrf_token()) {
+    if header_ok || query_ok {
         next.run(request).await
     } else {
         (StatusCode::FORBIDDEN, "Forbidden").into_response()
@@ -105,4 +118,25 @@ pub async fn host_guard(request: Request<axum::body::Body>, next: Next) -> Respo
         }
         _ => next.run(request).await,
     }
+}
+
+/// Extracts the raw `auth` value from a query string.
+fn query_auth_token(query: Option<&str>) -> Option<&str> {
+    query?
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("auth="))
+}
+
+/// Compares tokens in time independent of where they first differ, so response timing does not
+/// leak how much of a guessed token was correct. Only the length comparison returns early.
+pub(crate) fn tokens_match(provided: &str, expected: &str) -> bool {
+    let (provided, expected) = (provided.as_bytes(), expected.as_bytes());
+    if provided.len() != expected.len() {
+        return false;
+    }
+    provided
+        .iter()
+        .zip(expected)
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }

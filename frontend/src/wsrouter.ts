@@ -70,6 +70,11 @@ export interface WSRouterOptions {
   createSocket?: (url: string) => WebSocketLike;
   /** Fetches a fresh auth token before each reconnect; the daemon issues a new one on restart. */
   refreshAuthToken?: () => Promise<string>;
+  /**
+   * Rejects a call that has not been answered within this many milliseconds. Unset by default,
+   * because plugin methods may legitimately run for a long time.
+   */
+  callTimeoutMs?: number;
 }
 
 export class PyError extends Error {
@@ -89,6 +94,7 @@ interface PendingCall<T> {
   resolve: (value: T) => void;
   reject: (error: Error) => void;
   message: CallMessage;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
 const WS_OPEN = 1;
@@ -105,6 +111,7 @@ export class WSRouter {
   private reconnectAttempts = 0;
   private readonly createSocket: (url: string) => WebSocketLike;
   private readonly refreshAuthToken?: () => Promise<string>;
+  private readonly callTimeoutMs?: number;
 
   constructor(options: WSRouterOptions = {}) {
     this.baseUrl = options.baseUrl ?? 'ws://127.0.0.1:1337';
@@ -118,6 +125,18 @@ export class WSRouter {
     this.createSocket =
       options.createSocket ?? ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
     this.refreshAuthToken = options.refreshAuthToken;
+    this.callTimeoutMs = options.callTimeoutMs;
+  }
+
+  /**
+   * Fetches a token and connects, retrying with backoff while the daemon is unreachable (e.g. when
+   * Steam's UI loads before `zerodeckd` is listening). Requires `refreshAuthToken`.
+   */
+  start(): void {
+    if (!this.refreshAuthToken) {
+      throw new Error('WSRouter.start() requires the refreshAuthToken option');
+    }
+    void this.reconnect('');
   }
 
   connect(authToken: string): Promise<void> {
@@ -180,11 +199,20 @@ export class WSRouter {
     };
 
     return new Promise<Return>((resolve, reject) => {
-      this.runningCalls.set(id, {
+      const pending: PendingCall<unknown> = {
         resolve: resolve as (value: unknown) => void,
         reject,
         message,
-      });
+      };
+      if (this.callTimeoutMs !== undefined) {
+        const timeoutMs = this.callTimeoutMs;
+        pending.timer = setTimeout(() => {
+          if (this.runningCalls.delete(id)) {
+            reject(new Error(`Call ${route} (#${id}) timed out after ${timeoutMs}ms`));
+          }
+        }, timeoutMs);
+      }
+      this.runningCalls.set(id, pending);
       this.write(message);
     });
   }
@@ -214,6 +242,16 @@ export class WSRouter {
     }
   }
 
+  /** Removes a pending call and cancels its timeout, returning it if it was still pending. */
+  private settle(id: number): PendingCall<unknown> | undefined {
+    const pending = this.runningCalls.get(id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.runningCalls.delete(id);
+    }
+    return pending;
+  }
+
   private handleRawMessage(raw: string): void {
     let data: MessageFromBackend;
     try {
@@ -224,29 +262,19 @@ export class WSRouter {
     }
     switch (data.type) {
       case MessageType.Reply: {
-        const pending = this.runningCalls.get(data.id);
-        if (pending) {
-          pending.resolve(data.result);
-          this.runningCalls.delete(data.id);
-        }
+        this.settle(data.id)?.resolve(data.result);
         this.write({ type: MessageType.ReceivedResponse, id: data.id });
         break;
       }
       case MessageType.Error: {
-        const pending = this.runningCalls.get(data.id);
-        if (pending) {
-          pending.reject(new PyError(data.error.name, data.error.error, data.error.traceback));
-          this.runningCalls.delete(data.id);
-        }
+        this.settle(data.id)?.reject(
+          new PyError(data.error.name, data.error.error, data.error.traceback),
+        );
         this.write({ type: MessageType.ReceivedResponse, id: data.id });
         break;
       }
       case MessageType.Discard: {
-        const pending = this.runningCalls.get(data.id);
-        if (pending) {
-          pending.reject(new Error(`Call ${data.id} discarded by backend`));
-          this.runningCalls.delete(data.id);
-        }
+        this.settle(data.id)?.reject(new Error(`Call ${data.id} discarded by backend`));
         this.write({ type: MessageType.ReceivedResponse, id: data.id });
         break;
       }

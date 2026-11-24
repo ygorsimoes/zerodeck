@@ -133,7 +133,12 @@ curl -s -X POST -H "X-Decky-Auth: $TOKEN" http://127.0.0.1:1337/methods/get_plug
 Starting with the first release, every
 [GitHub release](https://github.com/ygorsimoes/zerodeck/releases) ships a `linux-x86_64` tarball
 (binary, Python worker, frontend bundle and systemd unit) with `SHA256SUMS.txt`, plus a container
-image at `ghcr.io/ygorsimoes/zerodeck`.
+image at `ghcr.io/ygorsimoes/zerodeck`. Both carry signed build-provenance attestations, and the
+image also ships an SBOM. Verify them with the GitHub CLI:
+
+```bash
+gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
+```
 
 <details>
 <summary><strong>Configuration</strong></summary>

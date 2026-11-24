@@ -225,7 +225,10 @@ async fn handle_ws_upgrade(
     Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if query.get("auth").map(String::as_str) != Some(state.csrf_token()) {
+    let authorized = query
+        .get("auth")
+        .is_some_and(|provided| crate::auth::tokens_match(provided, state.csrf_token()));
+    if !authorized {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
     let max_bytes = state.config().ws_max_message_bytes;

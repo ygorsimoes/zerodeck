@@ -323,11 +323,63 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(reply["success"])
             self.assertIn("JSON", reply["res"])
 
+    async def test_failed_call_reports_exception_type_and_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "raising_plugin"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "class Plugin:",
+                        "    async def explode(self):",
+                        "        raise ValueError('bad input')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(
+                    entrypoint=entrypoint,
+                    plugin_name="RaisingDemo",
+                    api_version=1,
+                    emit_sink=emit_sink,
+                )
+                runner.load()
+                raw_reply = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "boom-1", "method": "explode", "args": []})
+                )
+                raw_private = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "boom-2", "method": "_main", "args": []})
+                )
+
+            assert raw_reply is not None and raw_private is not None
+            reply = json.loads(raw_reply)
+            self.assertEqual(reply["id"], "boom-1")
+            self.assertFalse(reply["success"])
+            self.assertEqual(reply["res"], "bad input")
+            self.assertEqual(reply["error"]["name"], "ValueError")
+            self.assertIn("Traceback", reply["error"]["traceback"])
+            self.assertIn("explode", reply["error"]["traceback"])
+
+            private = json.loads(raw_private)
+            self.assertEqual(private["error"]["name"], "PermissionError")
+
     async def test_json_line_transport_dispatches_messages_concurrently(self) -> None:
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            transport = await JsonLineTransport.from_fd(left.fileno())
-            left.close()
+            transport = await JsonLineTransport.from_fd(left.detach())
 
             fast_seen = asyncio.Event()
 
@@ -353,11 +405,23 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
         finally:
             right.close()
 
+    async def test_json_line_transport_closes_the_inherited_fd(self) -> None:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            inherited_fd = left.detach()
+            transport = await JsonLineTransport.from_fd(inherited_fd)
+            await transport.close()
+
+            # The transport owns the inherited descriptor, so closing it must not leave it open.
+            with self.assertRaises(OSError):
+                os.fstat(inherited_fd)
+        finally:
+            right.close()
+
     async def test_json_line_transport_handles_payloads_above_64kib(self) -> None:
         left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            transport = await JsonLineTransport.from_fd(left.fileno())
-            left.close()
+            transport = await JsonLineTransport.from_fd(left.detach())
 
             large_text = "x" * 100_000
             payload = (json.dumps({"type": 0, "id": "big", "data": large_text}) + "\n").encode(

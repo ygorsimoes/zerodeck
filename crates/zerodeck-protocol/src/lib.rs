@@ -6,7 +6,7 @@ mod manifest;
 mod ws;
 
 pub use error::ProtocolError;
-pub use ipc::{PluginIpcFromWorker, PluginIpcToWorker, PluginIpcType};
+pub use ipc::{PluginIpcError, PluginIpcFromWorker, PluginIpcToWorker, PluginIpcType};
 pub use manifest::{PackageManifest, PluginLoadType, PluginManifest, RemoteBinarySpec};
 pub use ws::{WsCallPayload, WsClientMessage, WsErrorDetail, WsMessageType, WsServerMessage};
 
@@ -15,9 +15,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{
-        PackageManifest, PluginIpcFromWorker, PluginIpcToWorker, PluginLoadType, PluginManifest,
-        ProtocolError, WsCallPayload, WsClientMessage, WsErrorDetail, WsMessageType,
-        WsServerMessage,
+        PackageManifest, PluginIpcError, PluginIpcFromWorker, PluginIpcToWorker, PluginLoadType,
+        PluginManifest, ProtocolError, WsCallPayload, WsClientMessage, WsErrorDetail,
+        WsMessageType, WsServerMessage,
     };
 
     #[test]
@@ -75,8 +75,36 @@ mod tests {
                 id: "req-1".to_owned(),
                 success: true,
                 res: json!({"ok": true}),
+                error: None,
             }
         );
+    }
+
+    #[test]
+    fn ipc_failed_response_carries_error_name_and_traceback() {
+        let raw = r#"{"type": 1, "id": "req-2", "success": false, "res": "bad input",
+            "error": {"name": "ValueError", "traceback": "Traceback (most recent call last):\n"}}"#;
+        let resp = PluginIpcFromWorker::from_json_str(raw).expect("parse failed response");
+        assert_eq!(
+            resp,
+            PluginIpcFromWorker::Response {
+                id: "req-2".to_owned(),
+                success: false,
+                res: json!("bad input"),
+                error: Some(PluginIpcError {
+                    name: "ValueError".to_owned(),
+                    traceback: Some("Traceback (most recent call last):\n".to_owned()),
+                }),
+            }
+        );
+
+        // A malformed `error` from an older or buggy worker must not reject the whole response.
+        let malformed = r#"{"type": 1, "id": "req-3", "success": false, "res": "x", "error": 5}"#;
+        let resp = PluginIpcFromWorker::from_json_str(malformed).expect("parse");
+        assert!(matches!(
+            resp,
+            PluginIpcFromWorker::Response { error: None, .. }
+        ));
     }
 
     #[test]

@@ -2408,9 +2408,12 @@ dependencies = [
 name = "zerodeck-plugin-host"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
+ "uuid",
  "zerodeck-platform",
  "zerodeck-protocol",
 ]

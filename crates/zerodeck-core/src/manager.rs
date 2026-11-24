@@ -185,6 +185,7 @@ impl PluginManager {
             manifest: plugin.manifest.clone(),
             version: plugin.package.as_ref().and_then(|pkg| pkg.version.clone()),
             host_user: self.supervisor.host_username().to_owned(),
+            host_user_home: self.supervisor.host_home_dir().to_path_buf(),
             loader_version: self.loader_version.clone(),
             entrypoint: self
                 .paths

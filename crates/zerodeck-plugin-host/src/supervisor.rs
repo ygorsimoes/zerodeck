@@ -1,11 +1,16 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
+#[cfg(any(not(unix), test))]
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use zerodeck_platform::{PlatformPaths, PrivilegeTarget};
 use zerodeck_protocol::{PluginIpcFromWorker, PluginIpcToWorker};
@@ -75,8 +80,12 @@ pub struct PluginSupervisor {
     config: SupervisorConfig,
     #[cfg(unix)]
     host_user: HostUserIdentity,
+    #[cfg(not(unix))]
+    fallback_home: PathBuf,
     events_tx: broadcast::Sender<PluginEvent>,
     plugins: Mutex<HashMap<String, Arc<ManagedPlugin>>>,
+    lifecycle_lock: tokio::sync::Mutex<()>,
+    shutting_down: AtomicBool,
 }
 
 impl PluginSupervisor {
@@ -84,14 +93,20 @@ impl PluginSupervisor {
     pub fn new(paths: PlatformPaths, config: SupervisorConfig) -> Result<Self, HostError> {
         #[cfg(unix)]
         let host_user = HostUserIdentity::resolve(&paths)?;
+        #[cfg(not(unix))]
+        let fallback_home = paths.user_home().to_path_buf();
         let (events_tx, _) = broadcast::channel(256);
         Ok(Self {
             paths,
             config,
             #[cfg(unix)]
             host_user,
+            #[cfg(not(unix))]
+            fallback_home,
             events_tx,
             plugins: Mutex::new(HashMap::new()),
+            lifecycle_lock: tokio::sync::Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -114,18 +129,47 @@ impl PluginSupervisor {
         }
     }
 
+    /// Returns the resolved unprivileged host home directory (`DECKY_USER_HOME`).
+    #[must_use]
+    pub fn host_home_dir(&self) -> &Path {
+        #[cfg(unix)]
+        {
+            &self.host_user.home_dir
+        }
+        #[cfg(not(unix))]
+        {
+            &self.fallback_home
+        }
+    }
+
     /// Spawns and begins supervising an active plugin worker, replacing any prior worker with the
     /// same manifest name.
     pub async fn spawn_plugin(
         &self,
         spec: PluginSpawnSpec,
     ) -> Result<Arc<ManagedPlugin>, HostError> {
+        let _guard = self.lifecycle_lock.lock().await;
+        self.spawn_plugin_locked(spec).await
+    }
+
+    async fn spawn_plugin_locked(
+        &self,
+        spec: PluginSpawnSpec,
+    ) -> Result<Arc<ManagedPlugin>, HostError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(HostError::WorkerStopped);
+        }
+
         let existing = {
-            let guard = lock_unpoisoned(&self.plugins);
-            guard.get(&spec.manifest.name).cloned()
+            let mut guard = lock_unpoisoned(&self.plugins);
+            guard.remove(&spec.manifest.name)
         };
         if let Some(old) = existing {
             let _ = old.shutdown(false).await;
+        }
+
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(HostError::WorkerStopped);
         }
 
         let managed = ManagedPlugin::start(
@@ -176,6 +220,7 @@ impl PluginSupervisor {
         plugin_name: &str,
         uninstall: bool,
     ) -> Result<(), HostError> {
+        let _guard = self.lifecycle_lock.lock().await;
         let managed = {
             let mut guard = lock_unpoisoned(&self.plugins);
             guard.remove(plugin_name)
@@ -186,6 +231,7 @@ impl PluginSupervisor {
 
     /// Restarts a supervised plugin cleanly.
     pub async fn reload_plugin(&self, plugin_name: &str) -> Result<Arc<ManagedPlugin>, HostError> {
+        let _guard = self.lifecycle_lock.lock().await;
         let spec = {
             let guard = lock_unpoisoned(&self.plugins);
             guard
@@ -193,29 +239,42 @@ impl PluginSupervisor {
                 .map(|m| m.spec.clone())
                 .ok_or_else(|| HostError::PluginNotFound(plugin_name.to_owned()))?
         };
-        self.spawn_plugin(spec).await
+        self.spawn_plugin_locked(spec).await
     }
 
     /// Gracefully shuts down all supervised plugin workers concurrently.
     pub async fn shutdown_all(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let _guard = self.lifecycle_lock.lock().await;
         let all: Vec<Arc<ManagedPlugin>> = {
             let mut guard = lock_unpoisoned(&self.plugins);
             guard.drain().map(|(_, v)| v).collect()
         };
+
+        let mut set = JoinSet::new();
         for plugin in all {
-            if let Err(err) = plugin.shutdown(false).await {
-                warn!(plugin = %plugin.spec.manifest.name, error = %err, "error shutting down plugin");
-            }
+            set.spawn(async move {
+                if let Err(err) = plugin.shutdown(false).await {
+                    warn!(plugin = %plugin.spec.manifest.name, error = %err, "error shutting down plugin");
+                }
+            });
         }
+        while set.join_next().await.is_some() {}
     }
 }
 
-type PendingCalls = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, HostError>>>>>;
+#[derive(Debug, Default)]
+struct PendingCalls {
+    closed: bool,
+    waiters: HashMap<String, oneshot::Sender<Result<Value, HostError>>>,
+}
+
+type SharedPendingCalls = Arc<Mutex<PendingCalls>>;
 
 #[derive(Debug)]
 struct ActiveWorker {
     write_tx: mpsc::Sender<String>,
-    pending: PendingCalls,
+    pending: SharedPendingCalls,
 }
 
 enum SupervisorCmd {
@@ -229,8 +288,7 @@ enum SupervisorCmd {
 #[derive(Debug)]
 pub struct ManagedPlugin {
     spec: PluginSpawnSpec,
-    state: Arc<Mutex<PluginState>>,
-    state_notify: Arc<Notify>,
+    state_rx: watch::Receiver<PluginState>,
     active: Arc<Mutex<Option<ActiveWorker>>>,
     cmd_tx: mpsc::Sender<SupervisorCmd>,
     startup_timeout: Duration,
@@ -244,16 +302,14 @@ impl ManagedPlugin {
         #[cfg(unix)] host_user: HostUserIdentity,
         events_tx: broadcast::Sender<PluginEvent>,
     ) -> Result<Arc<Self>, HostError> {
-        let state = Arc::new(Mutex::new(PluginState::Starting));
-        let state_notify = Arc::new(Notify::new());
+        let (state_tx, state_rx) = watch::channel(PluginState::Starting);
         let active = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let managed = Arc::new(Self {
             spec: spec.clone(),
-            state: Arc::clone(&state),
-            state_notify: Arc::clone(&state_notify),
+            state_rx,
             active: Arc::clone(&active),
             cmd_tx,
             startup_timeout: config.startup_timeout,
@@ -266,8 +322,7 @@ impl ManagedPlugin {
             #[cfg(unix)]
             host_user,
             events_tx,
-            state,
-            state_notify,
+            state_tx,
             active,
             cmd_rx,
         };
@@ -280,13 +335,14 @@ impl ManagedPlugin {
     /// Current lifecycle state of this plugin worker.
     #[must_use]
     pub fn state(&self) -> PluginState {
-        *lock_unpoisoned(&self.state)
+        *self.state_rx.borrow()
     }
 
     async fn wait_for_active_worker(&self) -> Result<ActiveWorkerHandle, HostError> {
+        let mut rx = self.state_rx.clone();
         let deadline = tokio::time::Instant::now() + self.startup_timeout;
         loop {
-            let current = self.state();
+            let current = *rx.borrow_and_update();
             match current {
                 PluginState::Running => {
                     let guard = lock_unpoisoned(&self.active);
@@ -299,13 +355,14 @@ impl ManagedPlugin {
                     return Err(HostError::WorkerStopped);
                 }
                 PluginState::Starting => {
-                    let notified = self.state_notify.notified();
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         return Err(HostError::StartupTimeout);
                     }
-                    if tokio::time::timeout(remaining, notified).await.is_err() {
-                        return Err(HostError::StartupTimeout);
+                    match tokio::time::timeout(remaining, rx.changed()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return Err(HostError::WorkerStopped),
+                        Err(_) => return Err(HostError::StartupTimeout),
                     }
                 }
                 PluginState::Failed => {
@@ -321,7 +378,7 @@ impl ManagedPlugin {
 
 struct ActiveWorkerHandle {
     write_tx: mpsc::Sender<String>,
-    pending: PendingCalls,
+    pending: SharedPendingCalls,
 }
 
 impl PluginRuntime for ManagedPlugin {
@@ -347,13 +404,16 @@ impl PluginRuntime for ManagedPlugin {
 
             let (tx, rx) = oneshot::channel();
             {
-                let mut map = lock_unpoisoned(&worker.pending);
-                map.insert(call_id.clone(), tx);
+                let mut pending = lock_unpoisoned(&worker.pending);
+                if pending.closed {
+                    return Err(HostError::WorkerStopped);
+                }
+                pending.waiters.insert(call_id.clone(), tx);
             }
 
             if worker.write_tx.send(encoded).await.is_err() {
-                let mut map = lock_unpoisoned(&worker.pending);
-                map.remove(&call_id);
+                let mut pending = lock_unpoisoned(&worker.pending);
+                pending.waiters.remove(&call_id);
                 return Err(HostError::WorkerStopped);
             }
 
@@ -390,16 +450,14 @@ struct SupervisorTaskCtx {
     #[cfg(unix)]
     host_user: HostUserIdentity,
     events_tx: broadcast::Sender<PluginEvent>,
-    state: Arc<Mutex<PluginState>>,
-    state_notify: Arc<Notify>,
+    state_tx: watch::Sender<PluginState>,
     active: Arc<Mutex<Option<ActiveWorker>>>,
     cmd_rx: mpsc::Receiver<SupervisorCmd>,
 }
 
 impl SupervisorTaskCtx {
     fn set_state(&self, next: PluginState) {
-        *lock_unpoisoned(&self.state) = next;
-        self.state_notify.notify_waiters();
+        let _ = self.state_tx.send(next);
     }
 }
 
@@ -451,36 +509,62 @@ async fn run_supervisor_loop(mut ctx: SupervisorTaskCtx, initial_ready: oneshot:
                 let _ = done.send(res);
                 return;
             }
+            WorkerExit::IpcClosed => {
+                warn!(
+                    plugin = %ctx.spec.manifest.name,
+                    "plugin IPC reader terminated; terminating worker for restart"
+                );
+                let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
+                if handle_unexpected_exit(&mut ctx, spawned_at, &mut recent_crashes, &mut backoff)
+                    .await
+                {
+                    return;
+                }
+            }
             WorkerExit::Crashed(status_msg) => {
                 warn!(
                     plugin = %ctx.spec.manifest.name,
                     reason = %status_msg,
                     "plugin worker exited unexpectedly"
                 );
-                if spawned_at.elapsed() >= ctx.config.stability_window {
-                    backoff = ctx.config.initial_backoff;
-                    recent_crashes.clear();
-                }
-                if record_crash_and_check_trip(&mut recent_crashes, &ctx.config) {
-                    error!(
-                        plugin = %ctx.spec.manifest.name,
-                        window_secs = ctx.config.crash_window.as_secs(),
-                        max_crashes = ctx.config.max_crashes_in_window,
-                        "plugin tripped crash-loop circuit breaker"
-                    );
-                    ctx.set_state(PluginState::Failed);
-                    wait_for_shutdown_only(&mut ctx).await;
+                if handle_unexpected_exit(&mut ctx, spawned_at, &mut recent_crashes, &mut backoff)
+                    .await
+                {
                     return;
                 }
-                ctx.set_state(PluginState::BackingOff);
-                if wait_backoff_or_shutdown(&mut ctx, backoff).await {
-                    ctx.set_state(PluginState::Stopped);
-                    return;
-                }
-                backoff = next_backoff(backoff, ctx.config.max_backoff);
             }
         }
     }
+}
+
+async fn handle_unexpected_exit(
+    ctx: &mut SupervisorTaskCtx,
+    spawned_at: Instant,
+    recent_crashes: &mut VecDeque<Instant>,
+    backoff: &mut Duration,
+) -> bool {
+    if spawned_at.elapsed() >= ctx.config.stability_window {
+        *backoff = ctx.config.initial_backoff;
+        recent_crashes.clear();
+    }
+    if record_crash_and_check_trip(recent_crashes, &ctx.config) {
+        error!(
+            plugin = %ctx.spec.manifest.name,
+            window_secs = ctx.config.crash_window.as_secs(),
+            max_crashes = ctx.config.max_crashes_in_window,
+            "plugin tripped crash-loop circuit breaker"
+        );
+        ctx.set_state(PluginState::Failed);
+        wait_for_shutdown_only(ctx).await;
+        return true;
+    }
+    ctx.set_state(PluginState::BackingOff);
+    if wait_backoff_or_shutdown(ctx, *backoff).await {
+        ctx.set_state(PluginState::Stopped);
+        return true;
+    }
+    *backoff = next_backoff(*backoff, ctx.config.max_backoff);
+    false
 }
 
 fn record_crash_and_check_trip(
@@ -527,6 +611,7 @@ enum WorkerExit {
         uninstall: bool,
         done: oneshot::Sender<Result<(), HostError>>,
     },
+    IpcClosed,
     Crashed(String),
 }
 
@@ -536,7 +621,7 @@ struct RunningWorkerProcess {
     write_tx: mpsc::Sender<String>,
     write_task: tokio::task::JoinHandle<()>,
     read_task: tokio::task::JoinHandle<()>,
-    pending: PendingCalls,
+    pending: SharedPendingCalls,
 }
 
 async fn wait_worker_or_command(
@@ -551,6 +636,7 @@ async fn wait_worker_or_command(
             };
             WorkerExit::Crashed(msg)
         }
+        _ = &mut running.read_task => WorkerExit::IpcClosed,
         cmd = ctx.cmd_rx.recv() => match cmd {
             Some(SupervisorCmd::Shutdown { uninstall, done }) => WorkerExit::Shutdown { uninstall, done },
             None => {
@@ -566,13 +652,11 @@ async fn terminate_worker(
     uninstall: bool,
     grace: Duration,
 ) -> Result<(), HostError> {
-    if uninstall
-        && let Ok(encoded) = serde_json::to_string(&PluginIpcToWorker::Control { uninstall: true })
-    {
+    if let Ok(encoded) = serde_json::to_string(&PluginIpcToWorker::Control { uninstall }) {
         let _ = running.write_tx.send(encoded).await;
     }
 
-    // Dropping the sender signals the writer task to flush any queued Control frame and shut down
+    // Dropping the sender signals the writer task to flush the Control frame and shut down
     // the socket write half, delivering clean EOF to `zerodeck-py-host`.
     drop(running.write_tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), &mut running.write_task).await;
@@ -666,23 +750,34 @@ fn build_isolated_command(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let drop_privs = spec.privilege_target() == PrivilegeTarget::HostUser
         && current_process_identity().euid == 0;
-    let user_id = rustix::thread::Uid::from_raw(ctx.host_user.uid);
-    let group_id = rustix::thread::Gid::from_raw(ctx.host_user.gid);
+
     #[cfg(target_os = "linux")]
-    let target_groups: Vec<rustix::thread::Gid> = ctx
-        .host_user
-        .supplemental_gids
-        .iter()
-        .copied()
-        .map(rustix::thread::Gid::from_raw)
-        .collect();
+    let (user_id, group_id, target_groups) = {
+        let uid = rustix::thread::Uid::from_raw(ctx.host_user.uid);
+        let gid = rustix::thread::Gid::from_raw(ctx.host_user.gid);
+        let groups: Vec<rustix::thread::Gid> = ctx
+            .host_user
+            .supplemental_gids
+            .iter()
+            .copied()
+            .map(rustix::thread::Gid::from_raw)
+            .collect();
+        (uid, gid, groups)
+    };
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if drop_privs {
+        cmd.uid(ctx.host_user.uid);
+        cmd.gid(ctx.host_user.gid);
+    }
 
     // SAFETY: `pre_exec` runs after `fork` and before `execve` in a single-threaded child process.
-    // All values (`child_fd`, `user_id`, `group_id`, `target_groups`) are pre-computed before
-    // `fork`, and the closure invokes only async-signal-safe syscalls without allocating or locking.
+    // All captured descriptors and IDs are pre-computed before `fork`, and the closure invokes
+    // only async-signal-safe syscalls without allocating or locking.
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
@@ -696,16 +791,14 @@ fn build_isolated_command(
                 let _ = rustix::process::set_parent_process_death_signal(Some(
                     rustix::process::Signal::TERM,
                 ));
-            }
-
-            if drop_privs {
-                #[cfg(target_os = "linux")]
-                rustix::thread::set_thread_groups(&target_groups)
-                    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
-                rustix::thread::set_thread_res_gid(group_id, group_id, group_id)
-                    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
-                rustix::thread::set_thread_res_uid(user_id, user_id, user_id)
-                    .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
+                if drop_privs {
+                    rustix::thread::set_thread_groups(&target_groups)
+                        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
+                    rustix::thread::set_thread_res_gid(group_id, group_id, group_id)
+                        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
+                    rustix::thread::set_thread_res_uid(user_id, user_id, user_id)
+                        .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
+                }
             }
             Ok(())
         });
@@ -736,7 +829,7 @@ fn wire_worker_io(
     let (read_half, mut write_half) = tokio_stream.into_split();
 
     let (write_tx, mut write_rx) = mpsc::channel::<String>(128);
-    let pending: PendingCalls = Arc::new(Mutex::new(HashMap::new()));
+    let pending: SharedPendingCalls = Arc::new(Mutex::new(PendingCalls::default()));
 
     let write_plugin = plugin_name.clone();
     let write_task = tokio::spawn(async move {
@@ -786,7 +879,7 @@ fn spawn_worker_process(ctx: &SupervisorTaskCtx) -> Result<RunningWorkerProcess,
 async fn run_ipc_reader<R: AsyncRead + Unpin>(
     plugin_name: String,
     reader: R,
-    pending: PendingCalls,
+    pending: SharedPendingCalls,
     events_tx: broadcast::Sender<PluginEvent>,
 ) {
     let mut buf = BufReader::new(reader);
@@ -805,8 +898,8 @@ async fn run_ipc_reader<R: AsyncRead + Unpin>(
                         error,
                     }) => {
                         let waiter = {
-                            let mut map = lock_unpoisoned(&pending);
-                            map.remove(&id)
+                            let mut guard = lock_unpoisoned(&pending);
+                            guard.waiters.remove(&id)
                         };
                         if let Some(tx) = waiter {
                             let outcome = if success {
@@ -886,6 +979,49 @@ async fn read_bounded_line<R: AsyncRead + Unpin>(
     }
 }
 
+async fn read_truncated_log_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    max_bytes: usize,
+) -> std::io::Result<Option<(String, bool)>> {
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if bytes.is_empty() && !truncated {
+                return Ok(None);
+            }
+            return Ok(Some((
+                String::from_utf8_lossy(&bytes).into_owned(),
+                truncated,
+            )));
+        }
+
+        if let Some(pos) = available.iter().position(|b| *b == b'\n') {
+            let room = max_bytes.saturating_sub(bytes.len());
+            let take = pos.min(room);
+            bytes.extend_from_slice(&available[..take]);
+            if pos > room {
+                truncated = true;
+            }
+            reader.consume(pos + 1);
+            return Ok(Some((
+                String::from_utf8_lossy(&bytes).into_owned(),
+                truncated,
+            )));
+        }
+
+        let room = max_bytes.saturating_sub(bytes.len());
+        let take = available.len().min(room);
+        bytes.extend_from_slice(&available[..take]);
+        if available.len() > room {
+            truncated = true;
+        }
+        let len = available.len();
+        reader.consume(len);
+    }
+}
+
 fn spawn_log_reader<R: AsyncRead + Unpin + Send + 'static>(
     plugin: String,
     stream: &'static str,
@@ -893,23 +1029,27 @@ fn spawn_log_reader<R: AsyncRead + Unpin + Send + 'static>(
 ) {
     tokio::spawn(async move {
         let mut buf = BufReader::new(reader);
-        while let Ok(Some(line)) = read_bounded_line(&mut buf, MAX_LOG_LINE_BYTES).await {
+        while let Ok(Some((line, truncated))) =
+            read_truncated_log_line(&mut buf, MAX_LOG_LINE_BYTES).await
+        {
             let trimmed = line.trim_end_matches('\r');
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() || truncated {
+                let suffix = if truncated { " ... [truncated]" } else { "" };
                 if stream == "stderr" {
-                    warn!(target: "zerodeck_plugin_host::worker", plugin = %plugin, stream, "{trimmed}");
+                    warn!(target: "zerodeck_plugin_host::worker", plugin = %plugin, stream, "{trimmed}{suffix}");
                 } else {
-                    info!(target: "zerodeck_plugin_host::worker", plugin = %plugin, stream, "{trimmed}");
+                    info!(target: "zerodeck_plugin_host::worker", plugin = %plugin, stream, "{trimmed}{suffix}");
                 }
             }
         }
     });
 }
 
-fn fail_pending_calls(pending: &PendingCalls) {
+fn fail_pending_calls(pending: &SharedPendingCalls) {
     let waiters: Vec<_> = {
-        let mut map = lock_unpoisoned(pending);
-        map.drain().map(|(_, tx)| tx).collect()
+        let mut guard = lock_unpoisoned(pending);
+        guard.closed = true;
+        guard.waiters.drain().map(|(_, tx)| tx).collect()
     };
     for tx in waiters {
         let _ = tx.send(Err(HostError::WorkerStopped));
@@ -920,4 +1060,61 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_calls_rejects_new_waiters_after_fail_pending_calls_closes() {
+        let pending: SharedPendingCalls = Arc::new(Mutex::new(PendingCalls::default()));
+        fail_pending_calls(&pending);
+
+        let guard = lock_unpoisoned(&pending);
+        assert!(guard.closed);
+        assert!(guard.waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_active_worker_observes_transition_without_lost_wakeup() {
+        let (state_tx, state_rx) = watch::channel(PluginState::Starting);
+        let active = Arc::new(Mutex::new(None));
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (write_tx, _write_rx) = mpsc::channel(1);
+
+        let managed = ManagedPlugin {
+            spec: PluginSpawnSpec {
+                directory: "demo".to_owned(),
+                manifest: zerodeck_protocol::PluginManifest {
+                    name: "Demo".to_owned(),
+                    author: "Alice".to_owned(),
+                    flags: vec![],
+                    api_version: 1,
+                },
+                version: None,
+                host_user: "deck".to_owned(),
+                host_user_home: PathBuf::from("/home/deck"),
+                loader_version: "0.1.0".to_owned(),
+                entrypoint: PathBuf::from("/tmp/main.py"),
+            },
+            state_rx,
+            active: Arc::clone(&active),
+            cmd_tx,
+            startup_timeout: Duration::from_millis(500),
+        };
+
+        // Transition happens before `wait_for_active_worker()` is polled.
+        *lock_unpoisoned(&active) = Some(ActiveWorker {
+            write_tx,
+            pending: Arc::new(Mutex::new(PendingCalls::default())),
+        });
+        let _ = state_tx.send(PluginState::Running);
+
+        let handle = managed
+            .wait_for_active_worker()
+            .await
+            .expect("must observe Running without lost wakeup");
+        assert!(!lock_unpoisoned(&handle.pending).closed);
+    }
 }

@@ -3,7 +3,7 @@ use zerodeck_protocol::PluginManifest;
 #[cfg(unix)]
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 
@@ -104,6 +104,7 @@ impl HostUserIdentity {
             .filter(|v| !v.is_empty())
             .and_then(|dir| fs::metadata(dir).ok())
             .map(|meta| meta.uid())
+            .filter(|uid| *uid != 0)
             .or_else(|| {
                 fs::metadata("/home/deck")
                     .ok()
@@ -238,36 +239,70 @@ fn parse_supplemental_groups(contents: &str, username: &str, primary_gid: u32) -
     gids
 }
 
-/// Ensures `path` exists with optional POSIX permissions and ownership (applied only when `euid == 0`).
+/// Ensures `path` exists with optional POSIX permissions and ownership (applied only when `euid == 0`),
+/// refusing to follow symlinks at the target or newly created components.
 #[cfg(unix)]
 pub fn ensure_owned_dir(
     path: &Path,
     owner: Option<(u32, u32)>,
     mode: Option<u32>,
 ) -> Result<(), PlatformError> {
-    fs::create_dir_all(path).map_err(|source| PlatformError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    use rustix::fs::{Gid, Mode, OFlags, Uid, fchmod, fchown, open};
 
-    if let Some(perms) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(perms)).map_err(|source| {
-            PlatformError::Io {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
+    let io_err = |p: &Path, source: std::io::Error| PlatformError::Io {
+        path: p.to_path_buf(),
+        source,
+    };
+    let errno_err = |p: &Path, err: rustix::io::Errno| {
+        io_err(p, std::io::Error::from_raw_os_error(err.raw_os_error()))
+    };
+
+    // Walk missing components from the deepest existing ancestor so newly created parent dirs
+    // (such as `settings/`, `data/`, `logs/` under a root UMask=0077 daemon) are also chowned.
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while fs::symlink_metadata(cursor).is_err() {
+        missing.push(cursor.to_path_buf());
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+            _ => break,
+        }
     }
 
-    if let Some((uid, gid)) = owner
-        && current_process_identity().euid == 0
-    {
-        let uid = rustix::fs::Uid::from_raw(uid);
-        let gid = rustix::fs::Gid::from_raw(gid);
-        rustix::fs::chown(path, Some(uid), Some(gid)).map_err(|err| PlatformError::Io {
-            path: path.to_path_buf(),
-            source: std::io::Error::from_raw_os_error(err.raw_os_error()),
-        })?;
+    let is_root = current_process_identity().euid == 0;
+    for dir_to_create in missing.iter().rev() {
+        match fs::create_dir(dir_to_create) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(io_err(dir_to_create, err)),
+        }
+        let fd = open(
+            dir_to_create,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| errno_err(dir_to_create, err))?;
+        if is_root && let Some((uid, gid)) = owner {
+            fchown(&fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+                .map_err(|err| errno_err(dir_to_create, err))?;
+        }
+    }
+
+    // Open the final target directory with O_NOFOLLOW so symlinks are never chmod'd or chown'd.
+    let leaf_fd = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| errno_err(path, err))?;
+
+    if let Some(perms) = mode {
+        fchmod(&leaf_fd, Mode::from_raw_mode(perms as _)).map_err(|err| errno_err(path, err))?;
+    }
+
+    if is_root && let Some((uid, gid)) = owner {
+        fchown(&leaf_fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .map_err(|err| errno_err(path, err))?;
     }
 
     Ok(())

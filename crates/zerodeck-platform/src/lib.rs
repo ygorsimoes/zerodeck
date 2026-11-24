@@ -262,4 +262,46 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o700);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_owned_dir_rejects_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("owned-dir-symlink");
+        let outside = dir.0.join("outside");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).expect("chmod outside");
+
+        let link = dir.0.join("evil-link");
+        std::os::unix::fs::symlink(&outside, &link).expect("create symlink");
+
+        let err = crate::ensure_owned_dir(&link, None, Some(0o700))
+            .expect_err("must reject symlink directory target");
+        assert!(matches!(err, PlatformError::Io { .. }));
+        let mode = fs::metadata(&outside)
+            .expect("stat outside")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "symlink target permissions must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_user_identity_skips_uid_zero_decky_user_home_even_if_passwd_has_non_deck_user() {
+        let env = HashMap::from([("HOME", "/root")]);
+        let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      deck:x:1000:1000:Steam Deck User:/home/deck:/bin/bash\n";
+
+        // Verify resolve() also filters uid == 0 on DECKY_USER_HOME before falling back.
+        let resolved = crate::HostUserIdentity::resolve_from(&paths, 0, passwd, "", None, Some(0))
+            .expect("must skip uid 0 and fall back to deck");
+        assert_eq!(resolved.username, "deck");
+        assert_eq!(resolved.home_dir, PathBuf::from("/home/deck"));
+    }
 }

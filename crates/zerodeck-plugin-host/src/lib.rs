@@ -96,6 +96,7 @@ mod tests {
             manifest: manifest.clone(),
             version: Some("1.0.0".to_owned()),
             host_user: "deck".to_owned(),
+            host_user_home: paths.user_home().to_path_buf(),
             loader_version: "0.1.0".to_owned(),
             entrypoint,
         }
@@ -120,6 +121,7 @@ mod tests {
             },
             version: Some("1.5.0".to_owned()),
             host_user: "deck".to_owned(),
+            host_user_home: PathBuf::from("/home/deck"),
             loader_version: "0.1.0".to_owned(),
             entrypoint: PathBuf::from("/home/deck/homebrew/plugins/powertools/main.py"),
         };
@@ -155,6 +157,51 @@ mod tests {
         assert_eq!(
             env.get("DECKY_PLUGIN_VERSION").map(String::as_str),
             Some("1.5.0")
+        );
+    }
+
+    #[test]
+    fn build_plugin_env_uses_host_user_home_even_when_paths_user_home_is_root() {
+        let lookup = HashMap::from([
+            ("UNPRIVILEGED_PATH", "/home/deck/homebrew"),
+            ("PRIVILEGED_PATH", "/home/deck/homebrew"),
+            ("HOME", "/root"),
+        ]);
+        let paths = PlatformPaths::from_lookup(|k| lookup.get(k).map(|v| (*v).to_owned()));
+
+        let non_root_spec = PluginSpawnSpec {
+            directory: "myplug".to_owned(),
+            manifest: PluginManifest {
+                name: "MyPlug".to_owned(),
+                author: "Alice".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            version: None,
+            host_user: "deck".to_owned(),
+            host_user_home: PathBuf::from("/home/deck"),
+            loader_version: "0.1.0".to_owned(),
+            entrypoint: PathBuf::from("/home/deck/homebrew/plugins/myplug/main.py"),
+        };
+        let env = build_plugin_env(&non_root_spec, &paths);
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/deck"));
+        assert_eq!(
+            env.get("DECKY_USER_HOME").map(String::as_str),
+            Some("/home/deck")
+        );
+
+        let root_spec = PluginSpawnSpec {
+            manifest: PluginManifest {
+                flags: vec!["root".to_owned()],
+                ..non_root_spec.manifest.clone()
+            },
+            ..non_root_spec
+        };
+        let root_env = build_plugin_env(&root_spec, &paths);
+        assert_eq!(root_env.get("HOME").map(String::as_str), Some("/root"));
+        assert_eq!(
+            root_env.get("DECKY_USER_HOME").map(String::as_str),
+            Some("/home/deck")
         );
     }
 
@@ -433,5 +480,209 @@ class Plugin:
         );
 
         supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_restarts_worker_after_oversized_ipc_frame() {
+        let dir = TestDir::new("sup-oversized-ipc");
+        let paths = test_paths(&dir.0);
+        let supervisor = PluginSupervisor::new(paths.clone(), fast_supervisor_config())
+            .expect("init supervisor");
+
+        let spec = write_plugin(
+            &paths,
+            "huge_ipc",
+            &PluginManifest {
+                name: "HugeIpc".to_owned(),
+                author: "Alice".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            r#"class Plugin:
+    async def huge(self):
+        return "x" * (5 * 1024 * 1024)
+    async def ping(self):
+        return "ok"
+"#,
+        );
+
+        let handle = supervisor.spawn_plugin(spec).await.expect("spawn");
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            handle.call_method("huge", json!([]), false),
+        )
+        .await
+        .expect("oversized frame must not hang caller")
+        .expect_err("oversized frame must error");
+        assert!(matches!(err, HostError::WorkerStopped));
+
+        let mut recovered = false;
+        for _ in 0..40 {
+            if supervisor.plugin_state("HugeIpc") == Some(PluginState::Running)
+                && supervisor
+                    .call_method("HugeIpc", "ping", json!([]), false)
+                    .await
+                    .ok()
+                    == Some(json!("ok"))
+            {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            recovered,
+            "worker was not restarted after oversized IPC frame"
+        );
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_drains_oversized_stdout_lines_without_breaking_pipe() {
+        let dir = TestDir::new("sup-big-stdout");
+        let paths = test_paths(&dir.0);
+        let supervisor = PluginSupervisor::new(paths.clone(), fast_supervisor_config())
+            .expect("init supervisor");
+
+        let spec = write_plugin(
+            &paths,
+            "noisy_plug",
+            &PluginManifest {
+                name: "NoisyPlug".to_owned(),
+                author: "Alice".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            r#"class Plugin:
+    async def shout(self):
+        print("A" * 32768, flush=True)
+        print("still alive", flush=True)
+        return "ok"
+"#,
+        );
+
+        let handle = supervisor.spawn_plugin(spec).await.expect("spawn");
+        assert_eq!(
+            handle
+                .call_method("shout", json!([]), false)
+                .await
+                .expect("first shout"),
+            json!("ok")
+        );
+        // Second call verifies stdout pipe did not break with BrokenPipeError.
+        assert_eq!(
+            handle
+                .call_method("shout", json!([]), false)
+                .await
+                .expect("second shout"),
+            json!("ok")
+        );
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_shutdown_all_terminates_multiple_hung_workers_concurrently() {
+        let dir = TestDir::new("sup-concurrent-shutdown");
+        let paths = test_paths(&dir.0);
+        let mut cfg = fast_supervisor_config();
+        cfg.shutdown_timeout = Duration::from_millis(300);
+        let supervisor = PluginSupervisor::new(paths.clone(), cfg).expect("init supervisor");
+
+        for idx in 0..3 {
+            let name = format!("Hung{idx}");
+            let folder = format!("hung_{idx}");
+            let spec = write_plugin(
+                &paths,
+                &folder,
+                &PluginManifest {
+                    name: name.clone(),
+                    author: "Bob".to_owned(),
+                    flags: vec![],
+                    api_version: 1,
+                },
+                r#"import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+class Plugin:
+    async def _unload(self):
+        time.sleep(10)
+    async def ping(self):
+        return "ok"
+"#,
+            );
+            let h = supervisor.spawn_plugin(spec).await.expect("spawn hung");
+            assert_eq!(
+                h.call_method("ping", json!([]), false).await.expect("ping"),
+                json!("ok")
+            );
+        }
+
+        let start = std::time::Instant::now();
+        supervisor.shutdown_all().await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "shutdown_all took {elapsed:?}; expected concurrent shutdown (< 750ms)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_concurrent_reloads_and_shutdown_do_not_leak_workers() {
+        let dir = TestDir::new("sup-reload-race");
+        let paths = test_paths(&dir.0);
+        let supervisor = std::sync::Arc::new(
+            PluginSupervisor::new(paths.clone(), fast_supervisor_config())
+                .expect("init supervisor"),
+        );
+
+        let pid_log = dir.0.join("pids.txt");
+        let spec = write_plugin(
+            &paths,
+            "race_plug",
+            &PluginManifest {
+                name: "RacePlug".to_owned(),
+                author: "Alice".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            &format!(
+                r#"import os
+from pathlib import Path
+class Plugin:
+    async def _main(self):
+        with open({:?}, "a", encoding="utf-8") as f:
+            f.write(f"{{os.getpid()}}\n")
+    async def ping(self):
+        return "ok"
+"#,
+                pid_log.display().to_string()
+            ),
+        );
+
+        supervisor.spawn_plugin(spec).await.expect("initial spawn");
+        let s1 = supervisor.clone();
+        let s2 = supervisor.clone();
+        let t1 = tokio::spawn(async move { s1.reload_plugin("RacePlug").await });
+        let t2 = tokio::spawn(async move { s2.reload_plugin("RacePlug").await });
+        let _ = tokio::join!(t1, t2);
+        supervisor.shutdown_all().await;
+
+        assert_eq!(supervisor.plugin_state("RacePlug"), None);
+        // Any spawned PIDs should exit cleanly; verify after brief settle none remain alive.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(contents) = fs::read_to_string(&pid_log) {
+            for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+                let pid: i32 = line.trim().parse().expect("pid int");
+                if let Some(p) = rustix::process::Pid::from_raw(pid) {
+                    assert!(
+                        rustix::process::test_kill_process(p).is_err(),
+                        "leaked live worker PID {pid}"
+                    );
+                }
+            }
+        }
     }
 }

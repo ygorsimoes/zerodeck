@@ -773,6 +773,142 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
                     sys.path.remove(str(other_dir))
                 sys.modules.pop("shared_dep", None)
 
+    async def test_migration_and_main_failures_are_logged_to_decky_logger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "fail_lifecycle"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "class Plugin:",
+                        "    async def _migration(self):",
+                        "        raise RuntimeError('migration boom')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            with patch.dict(
+                os.environ,
+                {"DECKY_PLUGIN_DIR": str(plugin_dir), "DECKY_PLUGIN_LOG_DIR": str(log_dir)},
+                clear=False,
+            ):
+                runner = PluginRunner(entrypoint, "FailLifecycle", 1, emit_sink)
+                runner.load()
+                with self.assertRaises(RuntimeError):
+                    await runner.start_lifecycle()
+
+                log_files = list(log_dir.glob("*.log"))
+                self.assertTrue(log_files, "expected plugin log file")
+                log_text = log_files[0].read_text(encoding="utf-8")
+                self.assertIn("migration boom", log_text)
+
+                # Now test _main background task exception logging.
+                entrypoint.write_text(
+                    "\n".join(
+                        [
+                            "class Plugin:",
+                            "    async def _main(self):",
+                            "        raise ValueError('main boom')",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                runner2 = PluginRunner(entrypoint, "FailMain", 1, emit_sink)
+                runner2.load()
+                await runner2.start_lifecycle()
+                await asyncio.sleep(0.05)
+
+                all_logs = "\n".join(p.read_text(encoding="utf-8") for p in log_dir.glob("*.log"))
+                self.assertIn("main boom", all_logs)
+
+    async def test_control_shutdown_does_not_wait_for_blocked_rpc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "blocked_rpc_plugin"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            flag_file = root / "unloaded.txt"
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "import asyncio",
+                        "from pathlib import Path",
+                        "",
+                        "class Plugin:",
+                        "    async def stuck(self):",
+                        "        await asyncio.sleep(60)",
+                        "        return 'never'",
+                        "",
+                        "    async def _unload(self):",
+                        f"        Path({str(flag_file)!r}).write_text(",
+                        "            'unloaded', encoding='utf-8'",
+                        "        )",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            proc: subprocess.Popen[bytes] | None = None
+            try:
+                env = dict(os.environ)
+                env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+                env["DECKY_PLUGIN_DIR"] = str(plugin_dir)
+                env["DECKY_PLUGIN_LOG_DIR"] = str(log_dir)
+                os.set_inheritable(left.fileno(), True)
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "zerodeck_py_host",
+                        "--entrypoint",
+                        str(entrypoint),
+                        "--plugin-name",
+                        "BlockedRpc",
+                        "--api-version",
+                        "1",
+                        "--fd",
+                        str(left.fileno()),
+                    ],
+                    pass_fds=(left.fileno(),),
+                    env=env,
+                )
+                left.close()
+
+                right.setblocking(True)
+                call_line = json.dumps(
+                    {
+                        "type": 0,
+                        "id": "stuck-1",
+                        "method": "stuck",
+                        "args": [],
+                        "legacy": False,
+                    }
+                ).encode("utf-8") + b"\n"
+                right.sendall(call_line)
+                await asyncio.sleep(0.1)
+                right.sendall(b'{"uninstall": false}\n')
+                right.shutdown(socket.SHUT_WR)
+
+                rc = await asyncio.wait_for(asyncio.to_thread(proc.wait), timeout=2.0)
+                self.assertEqual(rc, 0)
+                self.assertEqual(flag_file.read_text(encoding="utf-8"), "unloaded")
+            finally:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                right.close()
+
 
 if __name__ == "__main__":
     unittest.main()

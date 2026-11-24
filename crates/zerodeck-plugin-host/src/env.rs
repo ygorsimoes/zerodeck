@@ -11,6 +11,7 @@ pub struct PluginSpawnSpec {
     pub manifest: PluginManifest,
     pub version: Option<String>,
     pub host_user: String,
+    pub host_user_home: PathBuf,
     pub loader_version: String,
     pub entrypoint: PathBuf,
 }
@@ -35,7 +36,7 @@ pub fn build_plugin_env(spec: &PluginSpawnSpec, paths: &PlatformPaths) -> BTreeM
     let effective_home = if is_root {
         PathBuf::from("/root")
     } else {
-        paths.user_home().to_path_buf()
+        spec.host_user_home.clone()
     };
 
     let mut env = BTreeMap::new();
@@ -45,7 +46,7 @@ pub fn build_plugin_env(spec: &PluginSpawnSpec, paths: &PlatformPaths) -> BTreeM
     env.insert("DECKY_USER".to_owned(), spec.host_user.clone());
     env.insert(
         "DECKY_USER_HOME".to_owned(),
-        paths.user_home().display().to_string(),
+        spec.host_user_home.display().to_string(),
     );
     env.insert(
         "DECKY_HOME".to_owned(),

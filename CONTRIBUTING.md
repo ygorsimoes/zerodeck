@@ -21,6 +21,7 @@ Thank you for helping build **ZeroDeck**! This guide covers everything you need 
 | **`just`** | Task runner for unified checks (`just --list`) |
 | **Node.js & pnpm** | Node `26+` and **`pnpm@12.16.1`** (do not use `npm` or `yarn`) |
 | **Python & `uv`** | Python `>=3.10` + [`uv`](https://docs.astral.sh/uv/) for `ruff` and `pyright` |
+| **`cargo-deny`** | `cargo install --locked cargo-deny` for license & advisory checks |
 | **Docker** *(optional)* | For `just docker-test` and `just docker-up` |
 
 ### Useful Commands
@@ -32,15 +33,14 @@ pnpm install --frozen-lockfile
 # Format Rust + Frontend code
 just fmt
 
-# Run ALL checks (Rust fmt/clippy/test, Python tests, Frontend biome/tsc/build/tests)
+# Run ALL checks (Rust fmt/clippy/test, Python tests + ruff/pyright, cargo-deny,
+# Frontend biome/tsc/build/tests). Without `uv` or `cargo-deny` installed, those
+# steps print a warning and are skipped locally; CI always runs them.
 just check
 
-# Audit dependency licenses & advisories
-cargo deny check
-
-# Run Python lint & strict type checks
-uv tool run ruff check hosts/python
-uv tool run pyright --project hosts/python
+# Run a single group on its own
+just py-lint   # ruff + strict pyright
+just deny      # cargo deny check
 
 # Validate Compose & run tests inside a Linux container
 docker compose config --quiet

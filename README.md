@@ -1,148 +1,193 @@
 <div align="center">
 
-# ⚡ ZeroDeck
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg" />
+  <img alt="ZeroDeck — Performance-first, security-hardened Steam Deck plugin loader daemon" src="docs/assets/banner-dark.svg" width="100%" />
+</picture>
 
-**Performance-first, security-hardened Steam Deck plugin loader daemon written in Rust (Edition 2024) with full Decky plugin compatibility.**
+<br />
+<br />
 
-[![CI](https://github.com/ygorsimoes/zerodeck/actions/workflows/ci.yml/badge.svg)](https://github.com/ygorsimoes/zerodeck/actions/workflows/ci.yml)
-[![Release Please](https://github.com/ygorsimoes/zerodeck/actions/workflows/release-please.yml/badge.svg)](https://github.com/ygorsimoes/zerodeck/actions/workflows/release-please.yml)
-[![PR Lint](https://github.com/ygorsimoes/zerodeck/actions/workflows/pr-lint.yml/badge.svg)](https://github.com/ygorsimoes/zerodeck/actions/workflows/pr-lint.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust 1.100+](https://img.shields.io/badge/Rust-1.100%2B-orange.svg?logo=rust)](rust-toolchain.toml)
-[![Decky Compatible](https://img.shields.io/badge/Decky%20API-v0%20%26%20v1%2B-blueviolet.svg)](docs/architecture/wire-protocol.md)
+[![CI](https://img.shields.io/github/actions/workflow/status/ygorsimoes/zerodeck/ci.yml?branch=main&style=flat-square&label=CI&logo=githubactions&logoColor=white)](https://github.com/ygorsimoes/zerodeck/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ygorsimoes/zerodeck?include_prereleases&style=flat-square&label=Release&color=38BDF8)](https://github.com/ygorsimoes/zerodeck/releases)
+[![PR Lint](https://img.shields.io/github/actions/workflow/status/ygorsimoes/zerodeck/pr-lint.yml?branch=main&style=flat-square&label=PR%20Lint)](https://github.com/ygorsimoes/zerodeck/actions/workflows/pr-lint.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0F172A?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.100.0-EA580C?style=flat-square&logo=rust&logoColor=white)](rust-toolchain.toml)
 
-[Architecture](#-architecture) · [Security Model](#-security--reliability) · [Quick Start](#-quick-start) · [Workspace Layout](#-workspace-layout) · [Contributing](#-contributing)
+<p>
+  <a href="#overview">Overview</a> &nbsp;&bull;&nbsp;
+  <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
+  <a href="#quick-start">Quick Start</a> &nbsp;&bull;&nbsp;
+  <a href="#workspace">Workspace</a> &nbsp;&bull;&nbsp;
+  <a href="#releases">Releases</a> &nbsp;&bull;&nbsp;
+  <a href="#contributing">Contributing</a>
+</p>
 
 </div>
 
+## Overview
+
+**ZeroDeck** is a clean-room, MIT-licensed replacement for `decky-loader` rebuilt in **Rust (Edition 2024)**. It eliminates Python GIL contention, PyInstaller startup overhead, and unsafe filesystem handling while keeping existing Decky plugins working unmodified.
+
+> [!NOTE]
+> ZeroDeck targets full protocol and runtime parity with `decky-loader` (`plugin.json`, `package.json`, `ESMODULE_V1`, `LEGACY_EVAL_IIFE`, `@decky/api`, `@decky/ui`, `main.py`, and `decky` / `decky_plugin`) without copying any GPL code.
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Native Rust Core</h3>
+      Async-native <code>zerodeckd</code> daemon powered by <code>tokio</code>, <code>axum</code>, and <code>reqwest</code> (<code>rustls</code>) with zero Python runtime embedded in the core server.
+    </td>
+    <td width="50%" valign="top">
+      <h3>Security by Default</h3>
+      <code>SafePath</code> canonicalization jail, fail-closed SHA-256 verification, Zip-Slip <code>enclosed_name()</code> guards, <code>0755</code> binary modes, and explicit <code>uid</code>/<code>gid</code> privilege dropping.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Isolated Plugin Workers</h3>
+      Out-of-process <code>zerodeck-py-host</code> workers communicate via newline-delimited JSON over inherited Unix <code>socketpair()</code> FDs or <code>0700</code> per-plugin directories.
+    </td>
+    <td width="50%" valign="top">
+      <h3>Atomic Persistence</h3>
+      Configuration writes (<code>loader.json</code>) use a temporary file, <code>sync_all()</code>, and atomic <code>rename()</code> so power loss never leaves truncated JSON.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <h3>Drop-In CEF Frontend</h3>
+      TypeScript 7 + React 19 Vite bundle externalized to Steam globals (<code>SP_REACT</code>, <code>SP_JSX</code>, <code>SP_REACTDOM</code>) with <code>WSRouter</code> <code>FULL_SYNC</code> replay.
+    </td>
+    <td width="50%" valign="top">
+      <h3>Clean-Room MIT</h3>
+      Verified continuously in CI with <code>cargo-deny</code> (<a href="deny.toml"><code>deny.toml</code></a>) to enforce permissive OSI licenses and block copyleft dependencies.
+    </td>
+  </tr>
+</table>
+
 ---
 
-## 🎯 Why ZeroDeck?
-
-**ZeroDeck** is a clean-room, MIT-licensed replacement for `decky-loader` engineered to eliminate GIL contention, PyInstaller startup overhead, unsafe filesystem primitives, and fragile IPC paths while keeping **existing Decky plugins working unmodified** (`plugin.json`, `package.json`, `ESMODULE_V1`, `LEGACY_EVAL_IIFE`, `@decky/api`, `@decky/ui`, `main.py` + `decky`/`decky_plugin`).
-
-| Pillar | What ZeroDeck Delivers |
-|---|---|
-| ⚡ **Native Rust Core** | Async-native `zerodeckd` daemon built on `tokio` + `axum` + `reqwest` (`rustls`) with zero Python runtime in the core server |
-| 🔒 **Security-by-Default** | Path-jail canonicalization (`SafePath`), fail-closed SHA-256 verification, Zip-Slip guards, `0755` binary permissions, and explicit `uid`/`gid` dropping |
-| 🧩 **Isolated Plugin Workers** | Out-of-process `zerodeck-py-host` workers communicating via newline-delimited JSON over inherited Unix `socketpair()` FDs / `0700` runtime dirs |
-| 💾 **Atomic Persistence** | Temp-file + `sync_all()` + atomic `rename()` for settings (`loader.json`) to prevent JSON corruption on power loss |
-| 🎮 **Drop-In Frontend Compatibility** | TypeScript 7 + React 19 Vite bundle externalized to Steam's CEF globals (`SP_REACT`, `SP_JSX`, `SP_REACTDOM`) with `WSRouter` `FULL_SYNC` replay |
-| 📜 **Clean-Room MIT** | Zero GPL code copied; dependencies audited continuously via `cargo-deny` |
-
----
-
-## 🏗 Architecture
+## Architecture
 
 ```mermaid
 flowchart LR
-    CEF["🎮 Steam GamepadUI CEF<br/>(steamloopback.host)"] <-->|"WS /ws?auth=… (WSRouter)<br/>HTTP /auth/token, /fetch, /plugins/*"| Server["🦀 zerodeckd<br/>(axum + tower-http + cef CDP)"]
-    Server -->|"SafePath + Atomic FS<br/>Zip-Slip + SHA-256"| Core["📦 zerodeck-core & platform"]
-    Server <-->|"Unix socketpair() / 0700 UDS<br/>JSON Lines IPC"| PyHost["🐍 zerodeck-py-host<br/>(isolated python3 worker)"]
-    PyHost --> Plugins["🔌 Decky Plugins<br/>(main.py + py_modules/)"]
+    CEF["Steam GamepadUI CEF<br/>steamloopback.host"] <-->|"HTTP + WS /ws?auth=…<br/>WSRouter & CSRF token"| Server["zerodeckd<br/>axum + tower-http + CDP"]
+    Server -->|"SafePath + Atomic FS<br/>Zip-Slip + SHA-256"| Core["zerodeck-core & platform"]
+    Server <-->|"Unix socketpair() / 0700 UDS<br/>JSON Lines IPC"| PyHost["zerodeck-py-host<br/>isolated python3 worker"]
+    PyHost --> Plugins["Decky Plugins<br/>main.py + py_modules/"]
 ```
 
-For full protocol details (`WSRouter` message types, plugin IPC frames, environment variables, and manifests), see [`docs/architecture/wire-protocol.md`](docs/architecture/wire-protocol.md).
+For full message schemas, WebSocket frame codes, IPC formats, and environment variables, read [`docs/architecture/wire-protocol.md`](docs/architecture/wire-protocol.md).
 
 ---
 
-## 📁 Workspace Layout
-
-| Path | Role |
-|---|---|
-| [`crates/zerodeck-protocol`](crates/zerodeck-protocol) | Wire types (`WsRouter`, `PluginIpcMessage`), `plugin.json` & `package.json` schemas (zero internal crate deps) |
-| [`crates/zerodeck-platform`](crates/zerodeck-platform) | OS path resolution (`UNPRIVILEGED_PATH` / `PRIVILEGED_PATH`), `SafePath` jail, `atomic_write`, privilege helpers |
-| [`crates/zerodeck-core`](crates/zerodeck-core) | Atomic `SettingsManager`, plugin discovery, safe ZIP extraction, SHA-256 verification |
-| [`crates/zerodeck-plugin-host`](crates/zerodeck-plugin-host) | `PluginRuntime` trait, Decky env builder, out-of-process Python host launcher & supervisor |
-| [`crates/zerodeck-cef`](crates/zerodeck-cef) | Chrome DevTools Protocol client & GamepadUI tab discovery |
-| [`crates/zerodeck-server`](crates/zerodeck-server) | Axum HTTP/WebSocket server, ephemeral CSRF auth, restricted CORS, `/healthz` |
-| [`crates/zerodeckd`](crates/zerodeckd) | Main daemon binary (`clap` CLI, `tracing`, config validation, healthcheck, graceful shutdown) |
-| [`hosts/python`](hosts/python) | `zerodeck-py-host` isolated Python worker (`>=3.10`, zero runtime deps, `ruff` + strict `pyright`) |
-| [`frontend`](frontend) | `@zerodeck/frontend` (`pnpm`, TypeScript 7, React 19, Vite 8, Biome, `WSRouter` + Steam externals) |
-| [`deploy/systemd`](deploy/systemd) | `zerodeck.service` systemd unit template |
-
----
-
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
-- **Rust:** `1.100.0` (pinned in [`rust-toolchain.toml`](rust-toolchain.toml) with `rustfmt` and `clippy`)
-- **Task Runner:** [`just`](https://github.com/casey/just)
-- **Frontend:** `node` (`26+`) and `pnpm` (`12.16.1`)
-- **Python Host:** `python3` (`>=3.10`) and [`uv`](https://docs.astral.sh/uv/) (for `ruff` and `pyright`)
-- **Containers (optional):** Docker with BuildKit + Docker Compose
+- **Rust** `1.100.0` (automatically selected via [`rust-toolchain.toml`](rust-toolchain.toml))
+- **[`just`](https://github.com/casey/just)** for unified workspace tasks
+- **Node.js** `26+` and **`pnpm@12.16.1`** (exclusive frontend package manager)
+- **Python** `>=3.10` and **[`uv`](https://docs.astral.sh/uv/)** (for `ruff` and strict `pyright`)
+- **Docker** *(optional)* for hardened container builds and Linux test parity
 
 ### Run Locally
 
 ```bash
-# Install frontend dependencies (uses pnpm exclusively)
+# 1. Install frontend dependencies
 pnpm install --frozen-lockfile
 
-# Build frontend bundle & validate config
+# 2. Build the frontend bundle & validate runtime config
 just build-frontend
 cargo run --bin zerodeckd -- --check-config
 
-# Start the daemon (default 127.0.0.1:1337)
+# 3. Start the daemon (defaults to 127.0.0.1:1337)
 cargo run --bin zerodeckd -- --host 127.0.0.1 --port 1337
 ```
 
-### Run via Docker Compose (Hardened)
+<details>
+<summary>CLI flags &amp; environment variables</summary>
 
-[`compose.yaml`](compose.yaml) runs the multi-stage [`Dockerfile`](Dockerfile) runtime with `read_only: true`, `cap_drop: ["ALL"]`, `no-new-privileges:true`, `tmpfs`, and a `/healthz` check:
+| Flag | Environment Variable | Default | Description |
+|---|---|---|---|
+| `--host` | `SERVER_HOST` | `127.0.0.1` | Bind address for HTTP/WebSocket server |
+| `--port` | `SERVER_PORT` | `1337` | Listen port for HTTP/WebSocket server |
+| `--check-config` | — | `false` | Validate paths, settings, and plugin manifests, then exit |
+| `--healthcheck` | — | `false` | Probe `/healthz` on the running daemon and exit `0`/`1` |
+| — | `UNPRIVILEGED_PATH` | `$HOME/homebrew` | Base directory for `settings/`, `data/`, and `logs/` |
+| — | `PRIVILEGED_PATH` | `$UNPRIVILEGED_PATH` | Base directory for `plugins/` and `services/` |
+
+</details>
+
+### Run with Docker Compose
+
+[`compose.yaml`](compose.yaml) launches the multi-stage [`Dockerfile`](Dockerfile) `runtime` target with `read_only: true`, `cap_drop: ["ALL"]`, `no-new-privileges:true`, `tmpfs`, and a `/healthz` check:
 
 ```bash
-just docker-up
-# Stop and clean up:
-just docker-down
+just docker-up      # Build and start zerodeckd in the background
+just docker-down    # Stop and remove containers
 ```
 
 ---
 
-## 🧪 Verification & Quality Checks
+## Workspace
 
-Run the full cross-language verification suite with a single command:
+```text
+zerodeck/
+├── crates/
+│   ├── zerodeck-protocol       # Wire types (WSRouter, Plugin IPC) and manifest schemas
+│   ├── zerodeck-platform       # OS paths, SafePath jail, atomic FS, privilege helpers
+│   ├── zerodeck-core           # SettingsManager, plugin discovery, ZIP & SHA-256 verification
+│   ├── zerodeck-plugin-host    # PluginRuntime trait, env builder, Python host supervisor
+│   ├── zerodeck-cef            # Chrome DevTools Protocol client & GamepadUI discovery
+│   ├── zerodeck-server         # Axum HTTP/WebSocket server, CSRF auth, CORS, /healthz
+│   └── zerodeckd               # Main daemon binary (CLI, tracing, graceful shutdown)
+├── hosts/python                # zerodeck-py-host (pure-stdlib Python >=3.10 worker)
+├── frontend                    # @zerodeck/frontend (TypeScript 7, React 19, Vite 8, Biome)
+├── deploy/systemd              # zerodeck.service systemd unit template
+└── docs/                       # Wire protocol specs and architecture design documents
+```
+
+### Verification Suite
+
+Run every Rust, Python, and Frontend check in one command:
 
 ```bash
 just check
 ```
 
-<details>
-<summary>What <code>just check</code> and CI validate</summary>
-
-| Area | Command |
+| Check | Command |
 |---|---|
-| 🦀 **Rust fmt & clippy** | `cargo fmt --all --check` & `cargo clippy --workspace --all-targets -- -D warnings` |
-| 🦀 **Rust tests** | `cargo test --workspace` |
-| 🛡️ **License & advisory audit** | `cargo deny check` (enforces [`deny.toml`](deny.toml) MIT-compatible allowlist) |
-| 🐍 **Python host** | `PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v`, `ruff check`, `pyright` (strict) |
-| 🎮 **Frontend** | `pnpm --dir frontend exec biome check .`, `tsc --noEmit`, `vite build`, `node --test frontend/tests/wsrouter.test.ts` |
-| 🐳 **Docker parity** | `docker compose config --quiet` & `just docker-test` |
-
-</details>
+| Rust format, Clippy (`-D warnings`), tests | `just fmt-check && just lint && just test` |
+| License & advisory audit | `cargo deny check` |
+| Python unit tests, Ruff, strict Pyright | `just py-test` / `uv tool run ruff check hosts/python` / `uv tool run pyright --project hosts/python` |
+| Frontend Biome, TypeScript, Vite build, tests | `just fe-check` |
+| Linux container test suite | `docker compose config --quiet && just docker-test` |
 
 ---
 
-## 📦 Releases
+## Releases
 
-Releases are fully automated with **[Release Please](https://github.com/googleapis/release-please)**:
+Versioning and releases are automated by **[Release Please](https://github.com/googleapis/release-please)**:
 
-- Merging [Conventional Commits](https://www.conventionalcommits.org/) into `main` maintains an automated **Release PR** updating versions across `Cargo.toml`, `hosts/python/pyproject.toml`, `frontend/package.json`, `Dockerfile`, and `CHANGELOG.md`.
-- Merging the Release PR tags `vX.Y.Z`, publishes a formatted GitHub Release, pushes the container image to `ghcr.io/ygorsimoes/zerodeck`, and attaches `zerodeck-vX.Y.Z-linux-x86_64.tar.gz` + `SHA256SUMS.txt`.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read:
-
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — dev setup, Conventional Commits, PR checklist, and clean-room rules
-- [`AGENTS.md`](AGENTS.md) — conventions and invariants for AI coding assistants
-- [`SECURITY.md`](SECURITY.md) — private vulnerability reporting and security policy
-- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community expectations
+1. Every PR merged to `main` uses [Conventional Commits](https://www.conventionalcommits.org/) (enforced by [`pr-lint.yml`](.github/workflows/pr-lint.yml)).
+2. Release Please maintains a synchronized Release PR across [`Cargo.toml`](Cargo.toml), [`hosts/python/pyproject.toml`](hosts/python/pyproject.toml), [`frontend/package.json`](frontend/package.json), [`Dockerfile`](Dockerfile), and `CHANGELOG.md`.
+3. Merging the Release PR creates tag `vX.Y.Z`, publishes formatted GitHub release notes, pushes `ghcr.io/ygorsimoes/zerodeck` container tags, and uploads `zerodeck-vX.Y.Z-linux-x86_64.tar.gz` + `SHA256SUMS.txt`.
 
 ---
 
-## 📄 License
+## Contributing
 
-Licensed under the **[MIT License](LICENSE)**.
+Contributions of code, documentation, and plugin compatibility reports are warmly welcome.
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — setup, PR conventions, and clean-room guidelines
+- [`AGENTS.md`](AGENTS.md) — architectural invariants for AI coding assistants
+- [`SECURITY.md`](SECURITY.md) — private vulnerability reporting via GitHub Security Advisories
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — community standards
+
+---
+
+## License
+
+Released under the **[MIT License](LICENSE)**.

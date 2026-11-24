@@ -1,11 +1,29 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Frontend module loading mode matching Decky's `PluginLoadType` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PluginLoadType {
     LegacyEvalIife = 0,
     EsModuleV1 = 1,
+}
+
+impl Serialize for PluginLoadType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginLoadType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::LegacyEvalIife),
+            1 => Ok(Self::EsModuleV1),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown PluginLoadType code: {other}"
+            ))),
+        }
+    }
 }
 
 /// Parsed `plugin.json` manifest.

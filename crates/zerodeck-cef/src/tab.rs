@@ -38,8 +38,14 @@ pub struct CdpTabDescriptor {
 /// Returns `true` when `tab` matches Steam's `GamepadUI` shared JS context.
 #[must_use]
 pub fn is_gamepadui_tab(tab: &CdpTabDescriptor) -> bool {
-    let url_matches = tab.url.contains("https://steamloopback.host/routes/")
-        || tab.url.contains("https://steamloopback.host/index.html");
+    let url_matches = tab.url.starts_with("https://steamloopback.host/routes/")
+        || tab.url == "https://steamloopback.host/index.html"
+        || tab
+            .url
+            .starts_with("https://steamloopback.host/index.html?")
+        || tab
+            .url
+            .starts_with("https://steamloopback.host/index.html#");
     let title_matches = SHARED_CONTEXT_TITLES.contains(&tab.title.as_str());
     url_matches && title_matches
 }

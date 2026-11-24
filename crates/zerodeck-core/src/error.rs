@@ -50,6 +50,10 @@ pub enum CoreError {
     #[error("unsafe archive entry rejected: `{entry}`")]
     UnsafeArchiveEntry { entry: String },
 
+    /// Extracted archive exceeded the configured maximum uncompressed byte budget.
+    #[error("archive `{entry}` exceeded maximum uncompressed limit of {max_bytes} bytes")]
+    ArchiveSizeExceeded { entry: String, max_bytes: u64 },
+
     /// Remote install requires a SHA-256 digest unless `allow_unverified_installs` is enabled.
     #[error("missing required SHA-256 digest for remote installation")]
     MissingSha256,

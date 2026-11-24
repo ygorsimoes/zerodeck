@@ -5,8 +5,9 @@ import os
 import shutil
 import time
 import types
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 EmitCallback = Callable[[dict[str, Any]], Awaitable[None]]
 

@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
-from typing import Any, Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+IPC_READER_LIMIT = 4 * 1024 * 1024  # 4 MiB line buffer for large plugin IPC payloads
 
 
 class JsonLineTransport:
@@ -22,12 +25,15 @@ class JsonLineTransport:
     async def from_fd(cls, fd: int) -> JsonLineTransport:
         sock = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
         sock.setblocking(False)
-        reader, writer = await asyncio.open_connection(sock=sock)
+        reader, writer = await asyncio.open_connection(sock=sock, limit=IPC_READER_LIMIT)
         return cls(reader, writer)
 
     @classmethod
     async def from_socket_path(cls, socket_path: str) -> JsonLineTransport:
-        reader, writer = await asyncio.open_unix_connection(socket_path)
+        reader, writer = await asyncio.open_unix_connection(
+            socket_path,
+            limit=IPC_READER_LIMIT,
+        )
         return cls(reader, writer)
 
     async def send_json(self, payload: dict[str, Any]) -> None:
@@ -36,7 +42,7 @@ class JsonLineTransport:
             self._writer.write(line.encode("utf-8"))
             await self._writer.drain()
 
-    async def serve(self, on_message: Callable[[str], Awaitable[Optional[str]]]) -> None:
+    async def serve(self, on_message: Callable[[str], Awaitable[str | None]]) -> None:
         while True:
             raw = await self._reader.readline()
             if not raw:

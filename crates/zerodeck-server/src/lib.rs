@@ -68,6 +68,7 @@ mod tests {
         assert_eq!(unauth_res.status(), StatusCode::FORBIDDEN);
 
         let auth_res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -83,5 +84,30 @@ mod tests {
         let ws_err = WsClientMessage::from_json_str(r#"{"type": -99}"#)
             .expect_err("unknown WS type must error");
         assert_eq!(ws_err, ProtocolError::UnknownMessageType(-99));
+
+        let post_plugin_assets = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/plugins/demo/assets/file")
+                    .body(Body::empty())
+                    .expect("build post plugin assets"),
+            )
+            .await
+            .expect("call post plugin assets");
+        assert_eq!(post_plugin_assets.status(), StatusCode::FORBIDDEN);
+
+        let traversal_assets = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/plugins/demo/../assets/secret")
+                    .body(Body::empty())
+                    .expect("build traversal plugin assets"),
+            )
+            .await
+            .expect("call traversal plugin assets");
+        assert_eq!(traversal_assets.status(), StatusCode::FORBIDDEN);
     }
 }

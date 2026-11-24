@@ -5,7 +5,10 @@ mod discovery;
 mod error;
 mod settings;
 
-pub use archive::{InstallSource, extract_zip_safely, verify_sha256_policy};
+pub use archive::{
+    DEFAULT_MAX_ARCHIVE_BYTES, InstallSource, extract_zip_safely, extract_zip_safely_with_limit,
+    verify_sha256_policy,
+};
 pub use discovery::{DiscoveredPlugin, discover_plugins};
 pub use error::CoreError;
 pub use settings::SettingsManager;
@@ -191,5 +194,64 @@ mod tests {
         )
         .expect("confirmed local sideload succeeds");
         assert_eq!(ok_local_confirmed, expected_hex);
+
+        let whitespace_remote = verify_sha256_policy(
+            payload,
+            &InstallSource::Remote {
+                sha256: Some("   ".to_owned()),
+            },
+            false,
+        )
+        .expect_err("whitespace-only hash must be treated as missing");
+        assert!(matches!(whitespace_remote, CoreError::MissingSha256));
+
+        let mismatch = verify_sha256_policy(
+            payload,
+            &InstallSource::Remote {
+                sha256: Some("0".repeat(64)),
+            },
+            false,
+        )
+        .expect_err("wrong sha256 must fail");
+        assert!(matches!(mismatch, CoreError::Sha256Mismatch { .. }));
+
+        let allowed_override =
+            verify_sha256_policy(payload, &InstallSource::Remote { sha256: None }, true)
+                .expect("allow_unverified overrides missing hash");
+        assert_eq!(allowed_override, expected_hex);
+    }
+
+    #[test]
+    fn extract_zip_safely_rejects_symlinks_and_oversized_entries() {
+        let dir = TestDir::new("zip-hardening");
+        let dest = dir.0.join("out");
+        fs::create_dir_all(&dest).expect("create out dir");
+
+        let mut sym_buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut sym_buf);
+            writer
+                .add_symlink("link", "/etc/passwd", SimpleFileOptions::default())
+                .expect("add symlink");
+            writer.finish().expect("finish symlink zip");
+        }
+        let err_sym =
+            extract_zip_safely(sym_buf.get_ref(), &dest).expect_err("must reject zip symlink");
+        assert!(matches!(err_sym, CoreError::UnsafeArchiveEntry { .. }));
+
+        let mut big_buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut big_buf);
+            writer
+                .start_file("huge.bin", SimpleFileOptions::default())
+                .expect("start huge entry");
+            writer
+                .write_all(&vec![b'A'; 1024])
+                .expect("write huge bytes");
+            writer.finish().expect("finish huge zip");
+        }
+        let err_limit = crate::extract_zip_safely_with_limit(big_buf.get_ref(), &dest, 512)
+            .expect_err("must reject entry exceeding byte limit");
+        assert!(matches!(err_limit, CoreError::ArchiveSizeExceeded { .. }));
     }
 }

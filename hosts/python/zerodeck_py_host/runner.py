@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import inspect
 import json
 import os
 import signal
 import sys
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .decky_api import EmitCallback, build_decky_module
 from .ipc import JsonLineTransport
@@ -30,6 +32,7 @@ class PluginRunner:
         self.emit_sink = emit_sink
         self.plugin: Any = None
         self.uninstalling = False
+        self.main_task: asyncio.Task[Any] | None = None
 
     def load(self) -> None:
         plugin_dir = os.getenv("DECKY_PLUGIN_DIR", str(self.entrypoint.parent))
@@ -52,35 +55,49 @@ class PluginRunner:
 
     async def start_lifecycle(self) -> None:
         if hasattr(self.plugin, "_migration"):
-            if self.api_version > 0:
-                await self.plugin._migration()
-            else:
-                await self.plugin._migration(self.plugin)
+            res = (
+                self.plugin._migration()
+                if self.api_version > 0
+                else self.plugin._migration(self.plugin)
+            )
+            if inspect.isawaitable(res):
+                await res
         if hasattr(self.plugin, "_main"):
-            if self.api_version > 0:
-                asyncio.create_task(self.plugin._main())
-            else:
-                asyncio.create_task(self.plugin._main(self.plugin))
+            coro = (
+                self.plugin._main()
+                if self.api_version > 0
+                else self.plugin._main(self.plugin)
+            )
+            if inspect.isawaitable(coro):
+                self.main_task = asyncio.create_task(coro)
+                await asyncio.sleep(0)
 
     async def stop_lifecycle(self) -> None:
+        if self.main_task is not None and not self.main_task.done():
+            self.main_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.main_task
+        self.main_task = None
+
         if hasattr(self.plugin, "_unload"):
-            if self.api_version > 0:
-                await self.plugin._unload()
-            else:
-                await self.plugin._unload(self.plugin)
+            res = (
+                self.plugin._unload()
+                if self.api_version > 0
+                else self.plugin._unload(self.plugin)
+            )
+            if inspect.isawaitable(res):
+                await res
         if self.uninstalling and hasattr(self.plugin, "_uninstall"):
-            if self.api_version > 0:
-                await self.plugin._uninstall()
-            else:
-                await self.plugin._uninstall(self.plugin)
+            res = (
+                self.plugin._uninstall()
+                if self.api_version > 0
+                else self.plugin._uninstall(self.plugin)
+            )
+            if inspect.isawaitable(res):
+                await res
 
-    async def handle_message(self, raw: str) -> Optional[str]:
-        data = json.loads(raw)
-        if "uninstall" in data:
-            self.uninstalling = bool(data.get("uninstall"))
-            return None
-
-        call_id = str(data["id"])
+    async def handle_message(self, raw: str) -> str | None:
+        call_id = ""
         response: dict[str, Any] = {
             "type": 1,
             "id": call_id,
@@ -88,6 +105,16 @@ class PluginRunner:
             "res": None,
         }
         try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("IPC payload must be a JSON object")
+
+            if "uninstall" in data:
+                self.uninstalling = bool(data.get("uninstall"))
+                return None
+
+            call_id = str(data["id"])
+            response["id"] = call_id
             method_name = str(data["method"])
             if method_name.startswith("_"):
                 raise PermissionError(f"cannot call private method {method_name}")
@@ -97,12 +124,17 @@ class PluginRunner:
                 if self.api_version > 0:
                     raise RuntimeError("legacy kwargs call is disallowed on api_version > 0")
                 kwargs = data.get("args") or {}
-                response["res"] = await method(self.plugin, **kwargs)
+                result = method(self.plugin, **kwargs)
             else:
                 if self.api_version < 1:
                     raise RuntimeError("api_version >= 1 required for positional calls")
                 args = data.get("args") or []
-                response["res"] = await method(*args)
+                result = method(*args)
+
+            if inspect.isawaitable(result):
+                response["res"] = await result
+            else:
+                response["res"] = result
         except Exception as exc:  # noqa: BLE001
             response["success"] = False
             response["res"] = str(exc)

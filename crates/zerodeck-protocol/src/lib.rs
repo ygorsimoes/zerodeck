@@ -114,4 +114,24 @@ mod tests {
         let err = WsClientMessage::from_json_str(missing_id).expect_err("missing id");
         assert_eq!(err, ProtocolError::MissingField("id"));
     }
+
+    #[test]
+    fn plugin_load_type_serializes_as_integer_zero_and_one() {
+        assert_eq!(
+            serde_json::to_value(PluginLoadType::LegacyEvalIife).expect("serialize legacy"),
+            json!(0)
+        );
+        assert_eq!(
+            serde_json::to_value(PluginLoadType::EsModuleV1).expect("serialize esmodule"),
+            json!(1)
+        );
+        assert_eq!(
+            serde_json::from_value::<PluginLoadType>(json!(0)).expect("deserialize 0"),
+            PluginLoadType::LegacyEvalIife
+        );
+        assert_eq!(
+            serde_json::from_value::<PluginLoadType>(json!(1)).expect("deserialize 1"),
+            PluginLoadType::EsModuleV1
+        );
+    }
 }

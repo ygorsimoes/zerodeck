@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from zerodeck_py_host.ipc import JsonLineTransport
 from zerodeck_py_host.runner import PluginRunner
 
 
@@ -196,6 +201,115 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
             reply = json.loads(raw_reply)
             self.assertEqual(reply["res"], "from_py_modules")
             self.assertTrue(reply["success"])
+
+    async def test_python_module_entrypoint_help_exits_zero(self) -> None:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        proc = subprocess.run(
+            [sys.executable, "-m", "zerodeck_py_host", "--help"],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+
+    async def test_sync_method_malformed_json_and_lifecycle_task_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "sync_plugin"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "import asyncio",
+                        "",
+                        "class Plugin:",
+                        "    def __init__(self):",
+                        "        self.cancelled = False",
+                        "",
+                        "    async def _main(self):",
+                        "        try:",
+                        "            await asyncio.sleep(60)",
+                        "        except asyncio.CancelledError:",
+                        "            self.cancelled = True",
+                        "            raise",
+                        "",
+                        "    def ping_sync(self):",
+                        "        return 'pong-sync'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(
+                    entrypoint=entrypoint,
+                    plugin_name="SyncDemo",
+                    api_version=1,
+                    emit_sink=emit_sink,
+                )
+                runner.load()
+                await runner.start_lifecycle()
+                self.assertIsNotNone(runner.main_task)
+
+                sync_reply_raw = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "sync-1", "method": "ping_sync", "args": []})
+                )
+                assert sync_reply_raw is not None
+                sync_reply = json.loads(sync_reply_raw)
+                self.assertEqual(sync_reply["res"], "pong-sync")
+                self.assertTrue(sync_reply["success"])
+
+                bad_reply_raw = await runner.handle_message("{not valid json")
+                assert bad_reply_raw is not None
+                bad_reply = json.loads(bad_reply_raw)
+                self.assertFalse(bad_reply["success"])
+
+                await runner.stop_lifecycle()
+                self.assertTrue(runner.plugin.cancelled)
+
+    async def test_json_line_transport_handles_payloads_above_64kib(self) -> None:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            transport = await JsonLineTransport.from_fd(left.fileno())
+            left.close()
+
+            large_text = "x" * 100_000
+            payload = (json.dumps({"type": 0, "id": "big", "data": large_text}) + "\n").encode(
+                "utf-8"
+            )
+
+            async def write_all() -> None:
+                right.setblocking(True)
+                right.sendall(payload)
+                right.shutdown(socket.SHUT_WR)
+
+            received: list[str] = []
+
+            async def on_msg(line: str) -> str | None:
+                received.append(line)
+                return None
+
+            await asyncio.gather(
+                asyncio.to_thread(lambda: (right.setblocking(True), right.sendall(payload), right.shutdown(socket.SHUT_WR))),
+                transport.serve(on_msg),
+            )
+            await transport.close()
+            self.assertEqual(len(received), 1)
+            self.assertEqual(len(json.loads(received[0])["data"]), 100_000)
+        finally:
+            right.close()
 
 
 if __name__ == "__main__":

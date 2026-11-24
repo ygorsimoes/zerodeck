@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { MessageType, PyError, type WebSocketLike, WSRouter } from '../src/wsrouter.ts';
@@ -140,4 +141,44 @@ test('WSRouter dispatches EVENT (5) and replays in-flight CALLs on FULL_SYNC (4)
     }),
   });
   assert.equal(await pendingCall, 'recovered');
+});
+
+test('WSRouter rejects pending call on DISCARD (2) and survives malformed JSON', async () => {
+  const sockets: MockWebSocket[] = [];
+  const router = new WSRouter({
+    baseUrl: 'ws://127.0.0.1:1337',
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const conn = router.connect('tok-4');
+  sockets[0].emit('open', {});
+  await conn;
+
+  sockets[0].emit('message', { data: '{invalid json' });
+
+  const discardedCall = router.call('plugin/unloaded');
+  sockets[0].emit('message', {
+    data: JSON.stringify({ type: MessageType.Discard, id: 1 }),
+  });
+
+  await assert.rejects(discardedCall, /discarded/i);
+});
+
+test('vite steamExternalsPlugin exports named JSX and React bindings', async () => {
+  const { renderSteamGlobalModule } = await import('../vite.config.ts');
+  const jsxShim = renderSteamGlobalModule('react/jsx-runtime', 'SP_JSX');
+  assert.match(jsxShim, /export const jsx\b/);
+  assert.match(jsxShim, /export const jsxs\b/);
+  assert.match(jsxShim, /export const Fragment\b/);
+
+  const reactShim = renderSteamGlobalModule('react', 'SP_REACT');
+  assert.match(reactShim, /export const useState\b/);
+  assert.match(reactShim, /export default\b/);
+
+  const viteSrc = readFileSync(new URL('../vite.config.ts', import.meta.url), 'utf8');
+  assert.match(viteSrc, /renderSteamGlobalModule/);
 });

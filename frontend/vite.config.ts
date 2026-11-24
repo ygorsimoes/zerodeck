@@ -1,11 +1,50 @@
 import { resolve } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 
-const STEAM_GLOBAL_MODULES: Record<string, string> = {
-  react: 'SP_REACT',
-  'react/jsx-runtime': 'SP_JSX',
-  'react-dom': 'SP_REACTDOM',
+const STEAM_GLOBAL_MODULES: Record<string, { globalKey: string; namedExports: string[] }> = {
+  react: {
+    globalKey: 'SP_REACT',
+    namedExports: [
+      'Children',
+      'Component',
+      'Fragment',
+      'PureComponent',
+      'StrictMode',
+      'Suspense',
+      'createContext',
+      'createElement',
+      'forwardRef',
+      'lazy',
+      'memo',
+      'useCallback',
+      'useContext',
+      'useEffect',
+      'useLayoutEffect',
+      'useMemo',
+      'useReducer',
+      'useRef',
+      'useState',
+    ],
+  },
+  'react/jsx-runtime': {
+    globalKey: 'SP_JSX',
+    namedExports: ['Fragment', 'jsx', 'jsxs'],
+  },
+  'react-dom': {
+    globalKey: 'SP_REACTDOM',
+    namedExports: ['createPortal', 'createRoot', 'flushSync', 'hydrateRoot'],
+  },
 };
+
+export function renderSteamGlobalModule(pkg: string, globalKey: string): string {
+  const entry = STEAM_GLOBAL_MODULES[pkg];
+  const named = entry ? entry.namedExports : [];
+  const lines = [`const g = globalThis[${JSON.stringify(globalKey)}];`, 'export default g;'];
+  for (const name of named) {
+    lines.push(`export const ${name} = g?.${name};`);
+  }
+  return `${lines.join('\n')}\n`;
+}
 
 function steamExternalsPlugin(): Plugin {
   const prefix = '\0steam-global:';
@@ -21,8 +60,8 @@ function steamExternalsPlugin(): Plugin {
     load(id) {
       if (!id.startsWith(prefix)) return null;
       const pkg = id.slice(prefix.length);
-      const globalKey = STEAM_GLOBAL_MODULES[pkg];
-      return `const g = globalThis[${JSON.stringify(globalKey)}];\nexport default g;\n`;
+      const entry = STEAM_GLOBAL_MODULES[pkg];
+      return entry ? renderSteamGlobalModule(pkg, entry.globalKey) : null;
     },
   };
 }

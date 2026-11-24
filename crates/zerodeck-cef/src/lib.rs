@@ -35,5 +35,13 @@ mod tests {
             websocket_debugger_url: None,
         };
         assert!(!is_gamepadui_tab(&external));
+
+        let spoofed_query = CdpTabDescriptor {
+            id: "4".to_owned(),
+            title: "SharedJSContext".to_owned(),
+            url: "https://evil.example/?next=https://steamloopback.host/index.html".to_owned(),
+            websocket_debugger_url: None,
+        };
+        assert!(!is_gamepadui_tab(&spoofed_query));
     }
 }

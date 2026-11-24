@@ -21,19 +21,18 @@ impl PlatformPaths {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let user_home = lookup("DECKY_USER_HOME")
-            .or_else(|| lookup("HOME"))
-            .filter(|v| !v.is_empty())
+        let non_empty = |key: &str| lookup(key).filter(|v| !v.is_empty());
+
+        let user_home = non_empty("DECKY_USER_HOME")
+            .or_else(|| non_empty("HOME"))
             .map_or_else(|| PathBuf::from("/home/deck"), PathBuf::from);
 
-        let unprivileged_root = lookup("UNPRIVILEGED_PATH")
-            .or_else(|| lookup("DECKY_HOME"))
-            .filter(|v| !v.is_empty())
+        let unprivileged_root = non_empty("UNPRIVILEGED_PATH")
+            .or_else(|| non_empty("DECKY_HOME"))
             .map_or_else(|| user_home.join("homebrew"), PathBuf::from);
 
-        let privileged_root = lookup("PRIVILEGED_PATH")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| unprivileged_root.clone(), PathBuf::from);
+        let privileged_root =
+            non_empty("PRIVILEGED_PATH").map_or_else(|| unprivileged_root.clone(), PathBuf::from);
 
         Self {
             unprivileged_root,

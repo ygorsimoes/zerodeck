@@ -173,7 +173,13 @@ export class WSRouter {
   }
 
   private handleRawMessage(raw: string): void {
-    const data = JSON.parse(raw) as MessageFromBackend;
+    let data: MessageFromBackend;
+    try {
+      data = JSON.parse(raw) as MessageFromBackend;
+    } catch (err: unknown) {
+      console.error('[ZeroDeck] failed to parse WebSocket JSON frame', err);
+      return;
+    }
     switch (data.type) {
       case MessageType.Reply: {
         const pending = this.runningCalls.get(data.id);
@@ -194,7 +200,11 @@ export class WSRouter {
         break;
       }
       case MessageType.Discard: {
-        this.runningCalls.delete(data.id);
+        const pending = this.runningCalls.get(data.id);
+        if (pending) {
+          pending.reject(new Error(`Call ${data.id} discarded by backend`));
+          this.runningCalls.delete(data.id);
+        }
         this.write({ type: MessageType.ReceivedResponse, id: data.id });
         break;
       }

@@ -153,4 +153,17 @@ mod tests {
             PrivilegeTarget::HostUser
         );
     }
+
+    #[test]
+    fn platform_paths_skips_empty_env_values_in_fallback_chain() {
+        let env = HashMap::from([
+            ("DECKY_USER_HOME", ""),
+            ("HOME", "/home/fallback"),
+            ("UNPRIVILEGED_PATH", ""),
+            ("DECKY_HOME", "/opt/decky"),
+        ]);
+        let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
+        assert_eq!(paths.user_home(), PathBuf::from("/home/fallback"));
+        assert_eq!(paths.unprivileged_root(), PathBuf::from("/opt/decky"));
+    }
 }

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 152 152" width="152" height="152" role="img" aria-label="ZeroDeck logo">
+  <title>ZeroDeck</title>
+  <g transform="translate(0 0) scale(1)">
+    <mask id="zd-logo-gap" maskUnits="userSpaceOnUse" x="0" y="0" width="152" height="152">
+      <rect width="152" height="152" fill="#fff"/>
+      <line x1="107" y1="22" x2="45" y2="130" stroke="#000" stroke-width="28" stroke-linecap="round"/>
+    </mask>
+    <rect width="152" height="152" rx="36" fill="#FF5A1F"/>
+    <rect x="40" y="24" width="72" height="104" rx="36" fill="none" stroke="#111111" stroke-width="14" mask="url(#zd-logo-gap)"/>
+    <line x1="103" y1="29" x2="49" y2="123" stroke="#F2EFE8" stroke-width="14" stroke-linecap="round"/>
+  </g>
+</svg>

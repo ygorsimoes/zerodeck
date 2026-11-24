@@ -48,10 +48,10 @@ plugin contracts, rebuilt from scratch as a native daemon.
 | `SafePath` jail: canonicalized paths that can't escape their root, symlinks included | ✅ |
 | Atomic settings writes (temp file + `fsync` + rename): no corrupted JSON on power loss | ✅ |
 | Zip-Slip-safe extraction and fail-closed SHA-256 verification for downloads | ✅ |
-| Python worker with the `decky` / `decky_plugin` module surface | ✅ |
-| Supervised plugin processes with restart and backoff | 🚧 |
-| Private plugin IPC over inherited `socketpair()` FDs (no `/tmp` sockets) | 🚧 |
-| Plugins drop to the `deck` user unless they declare `"root"` | 🚧 |
+| Python worker with `decky` / `decky_plugin`, `settings`, and `helpers` compatibility | ✅ |
+| Supervised plugin processes with restart, backoff, and crash-loop guard | ✅ |
+| Private plugin IPC over inherited `socketpair()` FDs (no `/tmp` sockets) | ✅ |
+| Plugins drop to the `deck` user unless they declare `"root"` | ✅ |
 | Plugin static, asset and data routes behind the path jail | 🚧 |
 | Injection into Steam's UI and the Quick Access Menu | 🚧 |
 
@@ -228,10 +228,10 @@ frames, IPC messages, manifests and environment variables) is documented in
 
 ## Roadmap
 
-- [ ] **Phase 1 · Foundation** (in progress): workspace, wire protocol types, path jail, atomic
-  settings, safe archive extraction, plugin discovery, HTTP/WebSocket server, CI and releases
-- [ ] **Phase 2 · Plugin host:** process supervisor and Python worker, tested against real Decky
-  plugins
+- [x] **Phase 1 · Foundation:** workspace, wire protocol types, path jail, atomic settings,
+  safe archive extraction, plugin discovery, HTTP/WebSocket server, CI and releases
+- [x] **Phase 2 · Plugin host:** privilege drop, `socketpair()` IPC, process supervisor,
+  `zerodeck-py-host` parity (`settings`, `helpers`, v0/v1), and async `/ws` RPC wiring
 - [ ] **Phase 3 · Full server:** `FULL_SYNC`, `/fetch` proxy, plugin static and data routes, file
   picker, store installer
 - [ ] **Phase 4 · Steam integration:** CEF injection, crash recovery, Quick Access Menu UI,

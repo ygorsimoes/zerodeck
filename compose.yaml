@@ -1,0 +1,33 @@
+services:
+  zerodeckd:
+    build:
+      context: .
+      target: runtime
+    image: zerodeck:runtime
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+      - /run/zerodeck:rw,nosuid,size=16m
+    volumes:
+      - ./.dev-homebrew:/homebrew
+    environment:
+      UNPRIVILEGED_PATH: /homebrew
+      PRIVILEGED_PATH: /homebrew
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "1337"
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:1337:1337"
+    restart: unless-stopped
+
+  linux-test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: linux-test
+    image: zerodeck:test

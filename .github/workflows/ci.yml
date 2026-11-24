@@ -54,3 +54,18 @@ jobs:
       - run: pnpm --dir frontend exec tsc --noEmit
       - run: pnpm --dir frontend build
       - run: node --test frontend/tests/wsrouter.test.ts
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

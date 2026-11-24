@@ -28,4 +28,16 @@ fe-check:
     pnpm --dir frontend build
     node --test frontend/tests/wsrouter.test.ts
 
+docker-build:
+    docker build --target runtime -t zerodeck:runtime .
+
+docker-test:
+    docker build --target linux-test -t zerodeck:test .
+
+docker-up:
+    docker compose up -d --build
+
+docker-down:
+    docker compose down
+
 check: fmt-check lint test py-test fe-check

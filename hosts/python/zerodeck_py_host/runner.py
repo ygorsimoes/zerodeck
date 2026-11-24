@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import sys
+import traceback
 from collections.abc import Awaitable
 from contextlib import suppress
 from pathlib import Path
@@ -158,6 +159,7 @@ class PluginRunner:
         except Exception as exc:  # noqa: BLE001
             response["success"] = False
             response["res"] = str(exc)
+            response["error"] = _error_detail(exc)
 
         try:
             return json.dumps(response, ensure_ascii=False)
@@ -170,9 +172,18 @@ class PluginRunner:
                     "id": response["id"],
                     "success": False,
                     "res": f"plugin result is not JSON serializable: {exc}",
+                    "error": _error_detail(exc),
                 },
                 ensure_ascii=False,
             )
+
+
+def _error_detail(exc: BaseException) -> dict[str, str]:
+    """Describes a failed call for the daemon: exception class name plus formatted traceback."""
+    return {
+        "name": type(exc).__name__,
+        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    }
 
 
 async def _run_worker(args: argparse.Namespace) -> None:

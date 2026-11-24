@@ -103,13 +103,26 @@ impl Serialize for PluginIpcToWorker {
     }
 }
 
+/// Exception details a worker attaches to a failed `RESPONSE` (`success: false`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginIpcError {
+    /// Exception class name raised by the plugin method (e.g. `ValueError`).
+    pub name: String,
+    /// Formatted traceback, when the worker provides one.
+    #[serde(default)]
+    pub traceback: Option<String>,
+}
+
 /// Messages received from a plugin worker process over newline-delimited JSON.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PluginIpcFromWorker {
     Response {
         id: String,
         success: bool,
+        /// Call result, or the error message string when `success` is `false`.
         res: Value,
+        /// Optional exception details for failed calls; absent or malformed values become `None`.
+        error: Option<PluginIpcError>,
     },
     Event {
         event: String,
@@ -136,7 +149,16 @@ impl PluginIpcFromWorker {
                     .and_then(Value::as_bool)
                     .ok_or(ProtocolError::MissingField("success"))?;
                 let res = value.get("res").cloned().unwrap_or(Value::Null);
-                Ok(Self::Response { id, success, res })
+                let error = value
+                    .get("error")
+                    .cloned()
+                    .and_then(|raw| serde_json::from_value(raw).ok());
+                Ok(Self::Response {
+                    id,
+                    success,
+                    res,
+                    error,
+                })
             }
             PluginIpcType::Event => {
                 let event = value

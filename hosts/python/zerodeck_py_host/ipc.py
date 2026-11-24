@@ -23,7 +23,9 @@ class JsonLineTransport:
 
     @classmethod
     async def from_fd(cls, fd: int) -> JsonLineTransport:
-        sock = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        """Takes ownership of an inherited socket FD; closing the transport closes it."""
+        # `socket.fromfd` would dup() the descriptor and leak the inherited original.
+        sock = socket.socket(fileno=fd)
         sock.setblocking(False)
         reader, writer = await asyncio.open_connection(sock=sock, limit=IPC_READER_LIMIT)
         return cls(reader, writer)

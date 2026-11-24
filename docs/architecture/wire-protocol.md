@@ -39,9 +39,13 @@ Each line is a UTF-8 JSON object terminated by `\n`:
 | `type` | Name | Direction | Fields |
 |---:|---|---|---|
 | `0` | `CALL` | Daemon -> Worker | `id` (UUID string), `method`, `args`, `legacy` (optional bool) |
-| `1` | `RESPONSE` | Worker -> Daemon | `id`, `success`, `res` |
+| `1` | `RESPONSE` | Worker -> Daemon | `id`, `success`, `res`, `error` (optional) |
 | `2` | `EVENT` | Worker -> Daemon | `event`, `args` |
 | — | `CONTROL` | Daemon -> Worker | `uninstall: bool` |
+
+When `success` is `false`, `res` holds the error message string and the worker adds `error: { "name": string, "traceback": string | null }` (the exception class name and formatted traceback), which maps onto the WebSocket `ERROR` frame's `name`/`traceback`. Receivers must treat `error` as optional and ignore it if malformed.
+
+The worker takes ownership of the inherited IPC socket FD (`--fd`) and closes it on shutdown.
 
 ## 3. Plugin Manifests & Environment
 

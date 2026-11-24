@@ -63,6 +63,10 @@ def _build_logger(plugin_name: str, log_dir: str) -> tuple[logging.Logger, str]:
 
         timestamp = time.strftime("%Y-%m-%d %H.%M.%S")
         target_log = log_path / f"{timestamp}.log"
+        suffix = 1
+        while target_log.exists():
+            target_log = log_path / f"{timestamp}-{suffix}.log"
+            suffix += 1
         log_file = str(target_log)
         file_handler = logging.FileHandler(target_log, encoding="utf-8")
         file_handler.setFormatter(formatter)

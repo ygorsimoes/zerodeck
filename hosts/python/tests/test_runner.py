@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from zerodeck_py_host.ipc import JsonLineTransport
 from zerodeck_py_host.runner import PluginRunner
+from zerodeck_py_host.settings import SettingsManager
 
 
 class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
@@ -448,6 +449,329 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(json.loads(received[0])["data"]), 100_000)
         finally:
             right.close()
+
+    async def test_settings_module_roundtrips_atomically_and_preserves_corrupt_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "settings_plugin"
+            settings_dir = root / "settings"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            settings_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "from settings import SettingsManager",
+                        "",
+                        "class Plugin:",
+                        "    def __init__(self):",
+                        "        self.cfg = SettingsManager(",
+                        "            'settings', default_settings={'flag': True}",
+                        "        )",
+                        "",
+                        "    async def get_flag(self):",
+                        "        return self.cfg.getSetting('flag', False)",
+                        "",
+                        "    async def set_flag(self, val):",
+                        "        self.cfg.setSetting('flag', val)",
+                        "        return self.cfg.getSetting('flag')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_SETTINGS_DIR": str(settings_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(entrypoint, "SettingsDemo", 1, emit_sink)
+                runner.load()
+                r1 = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "s1", "method": "get_flag", "args": []})
+                )
+                r2 = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "s2", "method": "set_flag", "args": [False]})
+                )
+
+                assert r1 is not None and r2 is not None
+                self.assertTrue(json.loads(r1)["res"])
+                self.assertFalse(json.loads(r2)["res"])
+
+                on_disk = json.loads((settings_dir / "settings.json").read_text(encoding="utf-8"))
+                self.assertEqual(on_disk, {"flag": False})
+
+                # Corrupt JSON must not be silently truncated or overwritten by read().
+                corrupt_path = settings_dir / "corrupt.json"
+                corrupt_path.write_text("{broken json", encoding="utf-8")
+                self.assertIs(sys.modules["settings"].SettingsManager, SettingsManager)
+
+                corrupt_mgr = SettingsManager("corrupt", settings_directory=settings_dir)
+                self.assertEqual(corrupt_mgr.settings, {})
+                self.assertEqual(corrupt_path.read_text(encoding="utf-8"), "{broken json")
+
+    async def test_helpers_module_exposes_ssl_context_homebrew_path_and_user(self) -> None:
+        import ssl
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "helpers_plugin"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "from helpers import get_homebrew_path, get_ssl_context, get_user",
+                        "",
+                        "class Plugin:",
+                        "    async def info(self):",
+                        "        ctx = get_ssl_context()",
+                        "        return {",
+                        "            'is_ctx': hasattr(ctx, 'wrap_socket'),",
+                        "            'home': get_homebrew_path(),",
+                        "            'user': get_user(),",
+                        "        }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+                "DECKY_HOME": "/home/deck/homebrew",
+                "DECKY_USER": "deck",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(entrypoint, "HelpersDemo", 1, emit_sink)
+                runner.load()
+                raw_reply = await runner.handle_message(
+                    json.dumps({"type": 0, "id": "h1", "method": "info", "args": []})
+                )
+
+            assert raw_reply is not None
+            reply = json.loads(raw_reply)
+            self.assertTrue(reply["success"], msg=reply)
+            self.assertTrue(reply["res"]["is_ctx"])
+            self.assertEqual(reply["res"]["home"], "/home/deck/homebrew")
+            self.assertEqual(reply["res"]["user"], "deck")
+            self.assertIsInstance(
+                sys.modules["helpers"].get_ssl_context(),
+                ssl.SSLContext,
+            )
+
+    async def test_api_version_0_supports_classmethod_staticmethod_and_plain_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "v0_methods"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "class Plugin:",
+                        "    PREFIX = 'ok'",
+                        "",
+                        "    async def _main(self):",
+                        "        Plugin.MAIN_CALLED = True",
+                        "",
+                        "    @classmethod",
+                        "    async def cls_method(cls, value='x'):",
+                        "        return f'{cls.PREFIX}:{value}'",
+                        "",
+                        "    @staticmethod",
+                        "    async def static_method(value='y'):",
+                        "        return f'static:{value}'",
+                        "",
+                        "    async def plain_method(self, value='z'):",
+                        "        return f'{self.PREFIX}-plain:{value}'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(entrypoint, "V0Methods", 0, emit_sink)
+                runner.load()
+                await runner.start_lifecycle()
+                c = await runner.handle_message(
+                    json.dumps(
+                        {
+                            "type": 0,
+                            "id": "c1",
+                            "method": "cls_method",
+                            "args": {"value": "1"},
+                            "legacy": True,
+                        }
+                    )
+                )
+                s = await runner.handle_message(
+                    json.dumps(
+                        {
+                            "type": 0,
+                            "id": "s1",
+                            "method": "static_method",
+                            "args": {"value": "2"},
+                            "legacy": True,
+                        }
+                    )
+                )
+                p = await runner.handle_message(
+                    json.dumps(
+                        {
+                            "type": 0,
+                            "id": "p1",
+                            "method": "plain_method",
+                            "args": {"value": "3"},
+                            "legacy": True,
+                        }
+                    )
+                )
+
+            assert c is not None and s is not None and p is not None
+            self.assertEqual(json.loads(c)["res"], "ok:1")
+            self.assertEqual(json.loads(s)["res"], "static:2")
+            self.assertEqual(json.loads(p)["res"], "ok-plain:3")
+
+    async def test_blocking_sync_method_does_not_block_concurrent_calls_or_emit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "blocking_sync"
+            log_dir = root / "logs"
+            plugin_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "import threading",
+                        "import time",
+                        "import decky",
+                        "",
+                        "class Plugin:",
+                        "    def __init__(self):",
+                        "        self.started = threading.Event()",
+                        "        self.release = threading.Event()",
+                        "",
+                        "    def slow_sync(self):",
+                        "        self.started.set()",
+                        "        assert self.release.wait(timeout=2.0), 'fast call never ran'",
+                        "        return 'done-sync'",
+                        "",
+                        "    async def fast_async(self):",
+                        "        self.release.set()",
+                        "        await decky.emit('fast', 1)",
+                        "        return 'done-fast'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            emitted: list[dict[str, object]] = []
+
+            async def emit_sink(payload: dict[str, object]) -> None:
+                emitted.append(payload)
+
+            env = {
+                "DECKY_PLUGIN_DIR": str(plugin_dir),
+                "DECKY_PLUGIN_LOG_DIR": str(log_dir),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                runner = PluginRunner(entrypoint, "SyncThreadDemo", 1, emit_sink)
+                runner.load()
+
+                slow_task = asyncio.create_task(
+                    runner.handle_message(
+                        json.dumps({"type": 0, "id": "slow", "method": "slow_sync", "args": []})
+                    )
+                )
+                # Wait until slow_sync is actively executing inside a worker thread.
+                while not runner.plugin.started.is_set():
+                    await asyncio.sleep(0.01)
+
+                fast_raw = await asyncio.wait_for(
+                    runner.handle_message(
+                        json.dumps({"type": 0, "id": "fast", "method": "fast_async", "args": []})
+                    ),
+                    timeout=1.0,
+                )
+                slow_raw = await asyncio.wait_for(slow_task, timeout=1.0)
+
+            assert fast_raw is not None and slow_raw is not None
+            self.assertEqual(json.loads(fast_raw)["res"], "done-fast")
+            self.assertEqual(json.loads(slow_raw)["res"], "done-sync")
+            self.assertEqual(emitted, [{"type": 2, "event": "fast", "args": [1]}])
+
+    async def test_py_modules_precedes_existing_sys_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plugin_dir = root / "precedence_plugin"
+            py_mods = plugin_dir / "py_modules"
+            other_dir = root / "other"
+            log_dir = root / "logs"
+            py_mods.mkdir(parents=True)
+            other_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            (other_dir / "shared_dep.py").write_text("SOURCE = 'other'\n", encoding="utf-8")
+            (py_mods / "shared_dep.py").write_text("SOURCE = 'py_modules'\n", encoding="utf-8")
+            entrypoint = plugin_dir / "main.py"
+            entrypoint.write_text(
+                "\n".join(
+                    [
+                        "import shared_dep",
+                        "class Plugin:",
+                        "    async def src(self):",
+                        "        return shared_dep.SOURCE",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def emit_sink(_payload: dict[str, object]) -> None:
+                return None
+
+            sys.path.insert(0, str(other_dir))
+            try:
+                with patch.dict(
+                    os.environ,
+                    {"DECKY_PLUGIN_DIR": str(plugin_dir), "DECKY_PLUGIN_LOG_DIR": str(log_dir)},
+                    clear=False,
+                ):
+                    runner = PluginRunner(entrypoint, "PrecedenceDemo", 1, emit_sink)
+                    runner.load()
+                    raw = await runner.handle_message(
+                        json.dumps({"type": 0, "id": "p", "method": "src", "args": []})
+                    )
+                assert raw is not None
+                self.assertEqual(json.loads(raw)["res"], "py_modules")
+            finally:
+                if str(other_dir) in sys.path:
+                    sys.path.remove(str(other_dir))
+                sys.modules.pop("shared_dep", None)
 
 
 if __name__ == "__main__":

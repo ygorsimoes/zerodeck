@@ -35,6 +35,9 @@ just fmt
 # Run ALL checks (Rust fmt/clippy/test, Python tests, Frontend biome/tsc/build/tests)
 just check
 
+# Audit dependency licenses & advisories
+cargo deny check
+
 # Run Python lint & strict type checks
 uv tool run ruff check hosts/python
 uv tool run pyright --project hosts/python

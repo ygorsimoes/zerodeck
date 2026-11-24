@@ -169,3 +169,123 @@ fn serves_on_ipv6_loopback() {
 fn serves_on_localhost_hostname() {
     serve_then_shutdown("localhost");
 }
+
+fn write_e2e_plugin(home: &TempHome, pid_file: &std::path::Path, stop_file: &std::path::Path) {
+    let plug_dir = home.0.join("plugins").join("e2e_plug");
+    std::fs::create_dir_all(&plug_dir).expect("create plugin dir");
+    std::fs::write(
+        plug_dir.join("plugin.json"),
+        r#"{"name":"E2ePlug","author":"Tester","api_version":1}"#,
+    )
+    .expect("write plugin.json");
+    std::fs::write(
+        plug_dir.join("main.py"),
+        format!(
+            r#"import os, decky
+from pathlib import Path
+
+class Plugin:
+    async def _main(self):
+        Path({pid:?}).write_text(str(os.getpid()), encoding="utf-8")
+
+    async def _unload(self):
+        Path({stop:?}).write_text("clean", encoding="utf-8")
+
+    async def echo_and_emit(self, msg):
+        await decky.emit("e2e_event", msg)
+        return f"echo:{{msg}}"
+"#,
+            pid = pid_file.display().to_string(),
+            stop = stop_file.display().to_string(),
+        ),
+    )
+    .expect("write main.py");
+}
+
+#[tokio::test]
+async fn daemon_runs_python_plugin_over_ws_and_shuts_down_worker_on_sigterm() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let home = TempHome::new("plugin-e2e");
+    let pid_file = home.0.join("worker.pid");
+    let stop_file = home.0.join("worker.stopped");
+    write_e2e_plugin(&home, &pid_file, &stop_file);
+
+    let py_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../hosts/python")
+        .canonicalize()
+        .expect("resolve hosts/python");
+    let port = free_port("127.0.0.1");
+    let mut daemon = Daemon(
+        daemon_command(&home, "127.0.0.1", port)
+            .env("PYTHONPATH", py_host)
+            .spawn()
+            .expect("spawn zerodeckd"),
+    );
+
+    wait_until_healthy(&home, "127.0.0.1", port);
+
+    let mut http = TcpStream::connect(("127.0.0.1", port)).expect("connect http");
+    http.write_all(b"GET /auth/token HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .expect("send /auth/token");
+    let mut resp = String::new();
+    http.read_to_string(&mut resp).expect("read token");
+    let token = resp.rsplit("\r\n\r\n").next().expect("body").trim();
+    assert_ne!(token, "");
+
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws?auth={token}"))
+            .await
+            .expect("connect ws");
+    ws.send(Message::Text(
+        json!({
+            "type": 0,
+            "id": 1,
+            "route": "loader/call_plugin_method",
+            "args": ["E2ePlug", "echo_and_emit", "hello"]
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send ws call");
+
+    let mut got_reply = false;
+    let mut got_event = false;
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .expect("ws frame timeout")
+            .expect("ws open")
+            .expect("ws frame");
+        let parsed: Value = serde_json::from_str(frame.to_text().expect("text")).expect("json");
+        if parsed["type"] == json!(1) && parsed["id"] == json!(1) {
+            assert_eq!(parsed["result"], json!("echo:hello"));
+            got_reply = true;
+        } else if parsed["type"] == json!(5) && parsed["event"] == json!("loader/plugin_event") {
+            assert_eq!(
+                parsed["args"],
+                json!([{"plugin": "E2ePlug", "event": "e2e_event", "args": ["hello"]}])
+            );
+            got_event = true;
+        }
+    }
+    assert!(
+        got_reply && got_event,
+        "missing reply={got_reply} or event={got_event}"
+    );
+    assert!(pid_file.is_file(), "worker did not write pid file");
+
+    sigterm(&daemon);
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(10));
+    assert!(status.success(), "daemon exited with {status}");
+    assert_eq!(
+        std::fs::read_to_string(&stop_file).expect("read stop marker"),
+        "clean"
+    );
+}

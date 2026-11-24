@@ -1,14 +1,16 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use zerodeck_cef::CefConfig;
-use zerodeck_core::{SettingsManager, discover_plugins};
+use zerodeck_core::{PluginManager, SettingsManager, discover_plugins};
 use zerodeck_platform::PlatformPaths;
-use zerodeck_plugin_host::PythonHostConfig;
+use zerodeck_plugin_host::{PythonHostConfig, SupervisorConfig};
 use zerodeck_protocol::WsMessageType;
 use zerodeck_server::{AppState, ServerConfig, serve};
 
@@ -38,6 +40,30 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_target(true)
         .init();
+}
+
+/// Resolves the `zerodeck_py_host` module search path from `PYTHONPATH` or standard install/repo
+/// locations.
+fn resolve_python_host_path() -> Option<String> {
+    if let Ok(env_path) = std::env::var("PYTHONPATH")
+        && !env_path.is_empty()
+    {
+        return Some(env_path);
+    }
+
+    let mut candidates = vec![PathBuf::from("/opt/zerodeck/python")];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("../python"));
+    }
+    candidates.push(PathBuf::from("hosts/python"));
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hosts/python"));
+
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("zerodeck_py_host").is_dir())
+        .map(|dir| dir.canonicalize().unwrap_or(dir).display().to_string())
 }
 
 /// Resolves `host:port` (IP literal or hostname) to socket addresses.
@@ -152,21 +178,44 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let python_host = PythonHostConfig {
+        host_module_path: resolve_python_host_path(),
+        ..PythonHostConfig::default()
+    };
+    let sup_config = SupervisorConfig {
+        python_host: python_host.clone(),
+        ..SupervisorConfig::default()
+    };
+    let manager = Arc::new(
+        PluginManager::from_parts(
+            paths,
+            settings,
+            plugins,
+            sup_config,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .context("initialize plugin manager")?,
+    );
+    if let Err(err) = manager.start_all().await {
+        warn!(error = %err, "one or more plugins failed during startup");
+    }
+
     let config = ServerConfig {
         host: cli.host,
         port: cli.port,
         cef: CefConfig::default(),
-        python_host: PythonHostConfig::default(),
+        python_host,
         ..ServerConfig::default()
     };
     let listener = bind_first(&resolve(&config.host, config.port).await?).await?;
     let addr = listener.local_addr().context("read bound address")?;
-    let state = AppState::with_plugins(config, plugins);
+    let state = AppState::with_manager(config, Arc::clone(&manager));
 
     info!(listen = %addr, "ZeroDeck daemon listening");
-    serve(listener, state, shutdown_signal())
+    let serve_result = serve(listener, state, shutdown_signal())
         .await
-        .context("serve HTTP/WS")?;
+        .context("serve HTTP/WS");
 
-    Ok(())
+    manager.shutdown_all().await;
+    serve_result
 }

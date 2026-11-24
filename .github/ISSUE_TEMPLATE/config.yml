@@ -6,3 +6,6 @@ contact_links:
   - name: "📡 Wire Protocol Architecture"
     url: https://github.com/ygorsimoes/zerodeck/blob/main/docs/architecture/wire-protocol.md
     about: "Review ZeroDeck IPC and WebSocket protocol specifications before proposing protocol changes."
+  - name: "🔒 Report a Security Vulnerability"
+    url: https://github.com/ygorsimoes/zerodeck/security/advisories/new
+    about: "Please report security issues privately through GitHub Security Advisories instead of public issues."

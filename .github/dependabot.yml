@@ -1,3 +1,5 @@
+# Dependency update policy. Tools pinned by version ARG + SHA-256 in the Dockerfile (cargo-deny,
+# just, ruff, pyright, cargo-fuzz) are bumped by hand; see CONTRIBUTING.md.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -7,6 +9,8 @@ updates:
       day: monday
       time: "09:00"
       timezone: UTC
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
@@ -28,6 +32,8 @@ updates:
       day: monday
       time: "09:00"
       timezone: UTC
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
@@ -49,6 +55,8 @@ updates:
       day: monday
       time: "09:00"
       timezone: UTC
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps)"
@@ -59,11 +67,17 @@ updates:
 
   - package-ecosystem: docker
     directory: /
+    # The `rust` image tag must equal rust-toolchain.toml (checked by `just lint-infra`), which
+    # Dependabot cannot edit; bump the Rust toolchain by hand in both places.
+    ignore:
+      - dependency-name: rust
     schedule:
       interval: weekly
       day: monday
       time: "09:00"
       timezone: UTC
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 3
     commit-message:
       prefix: "chore(deps-docker)"
@@ -72,12 +86,16 @@ updates:
       - docker
 
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
       day: monday
       time: "09:00"
       timezone: UTC
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(ci)"

@@ -4,6 +4,8 @@
 #   dev        pinned toolchain, checkout bind-mounted   just check / just shell / just fmt ...
 #   daemon     zerodeckd built and run from source       just dev
 #   fuzz       dev + nightly + cargo-fuzz                just fuzz <target>
+#
+# Optional host variables (also read from a `.env` file): ZERODECK_PORT (default 1337), RUST_LOG.
 name: zerodeck
 
 x-dev: &dev
@@ -17,6 +19,12 @@ x-dev: &dev
   image: zerodeck-dev:local
   profiles: ["dev"]
   init: true
+  # Unprivileged user, no capabilities, no setuid escalation: nothing in the dev loop needs more.
+  user: dev
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
   working_dir: /workspace
   volumes:
     - .:/workspace

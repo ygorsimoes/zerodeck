@@ -35,10 +35,14 @@ setup:
     {{ if native == "true" { "true" } else { "docker compose build dev" } }}
     {{ dev }} just _fe-deps
 
-# Run every check CI runs: formatting, lints, tests, licenses
+# Core checks before a PR: formatting, lints, tests, licenses (CI jobs rust/deny/python/frontend)
 [group('dev')]
 check:
     {{ dev }} just _check
+
+# Everything CI runs except fuzzing: check + Python matrix + infra lint + runtime smoke test
+[group('dev')]
+ci: check py-matrix lint-infra smoke
 
 # Format Rust and frontend code
 [group('dev')]
@@ -106,11 +110,12 @@ py-test-on version:
 py-matrix:
     for v in {{ python_versions }}; do just py-test-on "$v"; done
 
-# Lint the infrastructure: workflows (actionlint), Dockerfile (hadolint), compose file
+# Lint the infrastructure: version pins in sync, compose, workflows (actionlint, zizmor), Dockerfile (hadolint)
 [group('checks')]
-lint-infra:
+lint-infra: _toolchain-sync
     docker compose config --quiet
     docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12 -color
+    docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.33.1 --offline --no-progress .
     docker run --rm -i -v "$PWD/.hadolint.yaml:/hadolint.yaml:ro" hadolint/hadolint:v2.15.1 \
         hadolint --config /hadolint.yaml - < Dockerfile
 
@@ -244,6 +249,35 @@ _deny:
         echo "error: cargo-deny missing from the dev image" >&2
         exit 1
     fi
+
+# Versions that must agree across files (Dependabot and humans only ever bump one of them).
+[private]
+_toolchain-sync:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fail=0
+    expect() { # <what> <expected> <actual...>
+        local what="$1" want="$2"; shift 2
+        for got in "$@"; do
+            if [[ "${got}" != "${want}" ]]; then
+                echo "error: ${what}: expected ${want}, found ${got}" >&2
+                fail=1
+            fi
+        done
+    }
+    rust="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+    expect "Dockerfile rust image vs rust-toolchain.toml" "${rust}" \
+        $(grep -oE '^FROM rust:[0-9.]+' Dockerfile | cut -d: -f2)
+    expect "Cargo.toml rust-version vs rust-toolchain.toml" "${rust%.*}" \
+        "$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+    pnpm="$(sed -n 's/.*"packageManager": "pnpm@\([^"]*\)".*/\1/p' package.json)"
+    expect "Dockerfile pnpm vs package.json packageManager" "${pnpm}" \
+        $(grep -oE 'pnpm@[0-9][0-9.]*' Dockerfile | cut -d@ -f2) \
+        "$(sed -n 's/^ARG PNPM_VERSION=//p' Dockerfile)"
+    expect "just in workflows vs Dockerfile JUST_VERSION" "$(sed -n 's/^ARG JUST_VERSION=//p' Dockerfile)" \
+        $(grep -rhoE 'just@[0-9][0-9.]*' .github | cut -d@ -f2)
+    [[ "${fail}" -eq 0 ]] && echo "toolchain pins in sync (rust ${rust}, pnpm ${pnpm})"
+    exit "${fail}"
 
 [private]
 _fe-deps:

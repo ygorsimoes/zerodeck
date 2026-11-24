@@ -169,6 +169,66 @@ mod tests {
         assert_eq!(crate::router::redacted_uri(&plain), "/healthz");
     }
 
+    async fn get_status(app: &axum::Router, uri: &str, header: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().uri(uri);
+        if let Some(token) = header {
+            req = req.header("X-Decky-Auth", token);
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).expect("build request"))
+            .await
+            .expect("call router")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn query_auth_paths_require_a_valid_token() {
+        let state = AppState::new(ServerConfig::default());
+        let token = state.csrf_token().to_owned();
+        let app = build_router(state);
+
+        for uri in ["/fetch", "/fetch?auth=wrong", "/ws", "/ws?auth=wrong"] {
+            assert_eq!(
+                get_status(&app, uri, None).await,
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+        // A valid token gets past the middleware (`/fetch` itself is not routed yet).
+        assert_eq!(
+            get_status(&app, &format!("/fetch?url=x&auth={token}"), None).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            get_status(&app, "/fetch", Some(&token)).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn percent_encoded_traversal_is_not_treated_as_public() {
+        let app = build_router(AppState::new(ServerConfig::default()));
+        for uri in [
+            "/plugins/demo/assets/%2e%2e/%2e%2e/secret",
+            "/plugins/demo/assets/%2E%2e/secret",
+            "/static/%2e%2e/settings/loader.json",
+        ] {
+            assert_eq!(
+                get_status(&app, uri, None).await,
+                StatusCode::FORBIDDEN,
+                "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_comparison_matches_only_identical_tokens() {
+        assert!(crate::auth::tokens_match("abc-123", "abc-123"));
+        assert!(!crate::auth::tokens_match("abc-123", "abc-124"));
+        assert!(!crate::auth::tokens_match("abc-123", "abc-1234"));
+        assert!(!crate::auth::tokens_match("", "abc"));
+    }
+
     mod ws {
         use std::net::SocketAddr;
         use std::time::Duration;

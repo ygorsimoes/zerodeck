@@ -10,7 +10,9 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 - CORS origin allowlist: `https://steamloopback.host` with `allow_credentials = true`.
 - `Host` allowlist (DNS-rebinding defense): every request carrying a `Host` header must name a loopback host (`localhost`, `127.0.0.0/8`, or `[::1]`, any port); anything else gets `403 Forbidden`.
 - The `?auth=` token is redacted from HTTP request trace spans.
-- Public/allowlisted paths: `/auth/token`, `/healthz`, `/ws`, `/fetch`, `/frontend/*`, `/static/*`, `/locales/*`, `/steam_resource/*`, `/plugins/load_main/*`, `/plugins/*/assets/*`, `/plugins/*/data/*`, `/plugins/*/dist/*`.
+- `/ws` and `/fetch` are **not** public. `/fetch` accepts the token as `?auth=<token>` or the header; `/ws` requires `?auth=<token>` (browsers cannot set headers on a WebSocket upgrade).
+- Token comparison is constant-time, and `..` path segments (including percent-encoded `%2e%2e`) are never treated as public.
+- Public/allowlisted paths (`GET`/`HEAD` only, except the first two): `/auth/token`, `/healthz`, `/frontend/*`, `/static/*`, `/locales/*`, `/steam_resource/*`, `/plugins/load_main/*`, `/plugins/*/assets/*`, `/plugins/*/data/*`, `/plugins/*/dist/*`.
 
 ### WebSocket Router (`/ws?auth=<token>`)
 Messages are JSON objects keyed by integer `type`:

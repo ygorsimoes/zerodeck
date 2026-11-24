@@ -63,7 +63,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 CMD ["sh", "-c", "cargo test --workspace && PYTHONPATH=hosts/python python3 -m unittest discover -s hosts/python/tests -v"]
 
 FROM debian:bookworm-slim AS runtime
+# x-release-please-start-version
 ARG VERSION=0.1.0
+# x-release-please-end
 LABEL org.opencontainers.image.title="ZeroDeck" \
       org.opencontainers.image.description="Performance-first, security-hardened Steam Deck plugin loader daemon" \
       org.opencontainers.image.version="${VERSION}" \

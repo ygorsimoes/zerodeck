@@ -1,0 +1,25 @@
+[package]
+name = "zerodeckd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zerodeck-cef.workspace = true
+zerodeck-core.workspace = true
+zerodeck-platform.workspace = true
+zerodeck-plugin-host.workspace = true
+zerodeck-protocol.workspace = true
+zerodeck-server.workspace = true

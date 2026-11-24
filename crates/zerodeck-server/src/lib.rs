@@ -366,5 +366,387 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_server_closes(&mut ws).await;
         }
+
+        fn server_test_paths(root: &std::path::Path) -> zerodeck_platform::PlatformPaths {
+            let root_str = root.display().to_string();
+            let home_str = root.join("home").display().to_string();
+            std::fs::create_dir_all(&home_str).expect("create home");
+            let lookup = std::collections::HashMap::from([
+                ("UNPRIVILEGED_PATH", root_str.as_str()),
+                ("PRIVILEGED_PATH", root_str.as_str()),
+                ("DECKY_USER_HOME", home_str.as_str()),
+                ("HOME", home_str.as_str()),
+            ]);
+            zerodeck_platform::PlatformPaths::from_lookup(|k| {
+                lookup.get(k).map(|v| (*v).to_owned())
+            })
+        }
+
+        fn python_host_dir() -> String {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../hosts/python")
+                .canonicalize()
+                .expect("resolve hosts/python")
+                .display()
+                .to_string()
+        }
+
+        async fn spawn_manager_server(
+            config: ServerConfig,
+            manager: std::sync::Arc<zerodeck_core::PluginManager>,
+        ) -> (SocketAddr, String) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let state = AppState::with_manager(config, manager);
+            let token = state.csrf_token().to_owned();
+            tokio::spawn(serve(listener, state, std::future::pending()));
+            (addr, token)
+        }
+
+        async fn next_text_frame<S>(ws: &mut S) -> Value
+        where
+            S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+        {
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("ws frame timeout")
+                    .expect("ws stream open")
+                    .expect("ws frame ok");
+                if let Message::Text(txt) = frame {
+                    return serde_json::from_str(&txt).expect("valid json frame");
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_slow_plugin_call_does_not_starve_keepalive_or_concurrent_calls() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-slow-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let plug = paths.plugins_dir().join("slow");
+            std::fs::create_dir_all(&plug).expect("plug dir");
+            std::fs::write(
+                plug.join("plugin.json"),
+                r#"{"name":"SlowPlug","author":"Tester","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            std::fs::write(
+                plug.join("main.py"),
+                "import asyncio\nclass Plugin:\n    async def wait_ms(self, ms):\n        await asyncio.sleep(ms / 1000.0)\n        return 'waited'\n",
+            )
+            .expect("main.py");
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+
+            let srv_cfg = ServerConfig {
+                ws_ping_interval: Duration::from_millis(80),
+                ..ServerConfig::default()
+            };
+            let (addr, token) = spawn_manager_server(srv_cfg, manager.clone()).await;
+            let mut ws = connect(addr, &token).await;
+
+            // Slow call runs 350ms (> 4 keepalive intervals of 80ms); ping/pong must keep flowing
+            // and a concurrent ping must reply before the slow call finishes.
+            let slow_call = json!({
+                "type": 0, "id": 1, "route": "loader/call_plugin_method",
+                "args": ["SlowPlug", "wait_ms", 350]
+            });
+            let fast_call = json!({
+                "type": 0, "id": 2, "route": "utilities/ping", "args": []
+            });
+            ws.send(Message::Text(slow_call.to_string().into()))
+                .await
+                .expect("send slow");
+            ws.send(Message::Text(fast_call.to_string().into()))
+                .await
+                .expect("send fast");
+
+            let mut replies = Vec::new();
+            let mut pings_seen = 0usize;
+            while replies.len() < 2 {
+                let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("ws frame timeout")
+                    .expect("ws stream open")
+                    .expect("ws frame ok");
+                match frame {
+                    Message::Text(txt) => {
+                        replies.push(serde_json::from_str::<Value>(&txt).expect("json"));
+                    }
+                    Message::Ping(_) => {
+                        pings_seen += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                pings_seen >= 2,
+                "expected keepalive pings during slow call, saw {pings_seen}"
+            );
+            assert_eq!(replies[0]["id"], json!(2));
+            assert_eq!(replies[0]["result"], json!("pong"));
+            assert_eq!(replies[1]["id"], json!(1));
+            assert_eq!(replies[1]["result"], json!("waited"));
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        fn seed_v0_and_v1_plugins(paths: &zerodeck_platform::PlatformPaths) {
+            let v0 = paths.plugins_dir().join("v0");
+            std::fs::create_dir_all(&v0).expect("v0 dir");
+            std::fs::write(
+                v0.join("plugin.json"),
+                r#"{"name":"V0","author":"Alice","api_version":0}"#,
+            )
+            .expect("v0 manifest");
+            std::fs::write(
+                v0.join("main.py"),
+                "class Plugin:\n    async def greet(self, name='world'):\n        return f'hi {name}'\n",
+            )
+            .expect("v0 main");
+
+            let v1 = paths.plugins_dir().join("v1");
+            std::fs::create_dir_all(&v1).expect("v1 dir");
+            std::fs::write(
+                v1.join("plugin.json"),
+                r#"{"name":"V1","author":"Bob","api_version":1}"#,
+            )
+            .expect("v1 manifest");
+            std::fs::write(
+                v1.join("main.py"),
+                r#"import os, decky
+class Plugin:
+    async def emit_and_sum(self, a, b):
+        await decky.emit("tick", a + b)
+        return a + b
+    async def boom(self):
+        raise ValueError("nope")
+    async def die(self):
+        os._exit(1)
+"#,
+            )
+            .expect("v1 main");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_dispatches_v0_legacy_v1_positional_private_guard_and_plugin_events() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-rpc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            seed_v0_and_v1_plugins(&paths);
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                initial_backoff: Duration::from_secs(5),
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+
+            let (addr, token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+            let mut ws = connect(addr, &token).await;
+
+            // Legacy v0 call
+            ws.send(Message::Text(
+                json!({
+                    "type": 0, "id": 10, "route": "loader/call_legacy_plugin_method",
+                    "args": ["V0", "greet", {"name": "deck"}]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send v0");
+            assert_eq!(
+                next_text_frame(&mut ws).await,
+                json!({"type": 1, "id": 10, "result": "hi deck"})
+            );
+
+            // Private method guard
+            ws.send(Message::Text(
+                json!({
+                    "type": 0, "id": 11, "route": "loader/call_plugin_method",
+                    "args": ["V1", "_main"]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send private");
+            let priv_err = next_text_frame(&mut ws).await;
+            assert_eq!(priv_err["type"], json!(-1));
+            assert_eq!(priv_err["id"], json!(11));
+
+            // v1 call + loader/plugin_event broadcast
+            ws.send(Message::Text(
+                json!({
+                    "type": 0, "id": 12, "route": "loader/call_plugin_method",
+                    "args": ["V1", "emit_and_sum", 20, 22]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send v1");
+            let f1 = next_text_frame(&mut ws).await;
+            let f2 = next_text_frame(&mut ws).await;
+            let frames = [f1, f2];
+            assert!(frames.iter().any(|f| {
+                f["type"] == json!(1) && f["id"] == json!(12) && f["result"] == json!(42)
+            }));
+            assert!(frames.iter().any(|f| {
+                f["type"] == json!(5)
+                    && f["event"] == json!("loader/plugin_event")
+                    && f["args"] == json!([{"plugin": "V1", "event": "tick", "args": [42]}])
+            }));
+
+            // Python exception -> ERROR (-1) with traceback
+            ws.send(Message::Text(
+                json!({
+                    "type": 0, "id": 13, "route": "loader/call_plugin_method",
+                    "args": ["V1", "boom"]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send boom");
+            let boom = next_text_frame(&mut ws).await;
+            assert_eq!(boom["type"], json!(-1));
+            assert_eq!(boom["error"]["name"], json!("ValueError"));
+            assert!(boom["error"]["traceback"].as_str().is_some());
+
+            // Worker crash mid-call -> DISCARD (2)
+            ws.send(Message::Text(
+                json!({
+                    "type": 0, "id": 14, "route": "loader/call_plugin_method",
+                    "args": ["V1", "die"]
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send die");
+            let disc = next_text_frame(&mut ws).await;
+            assert_eq!(disc, json!({"type": 2, "id": 14}));
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn http_methods_call_plugin_method_respects_contract() {
+            use axum::body::{Body, to_bytes};
+            use axum::http::{Request, StatusCode};
+            use tower::ServiceExt;
+
+            let dir = std::env::temp_dir().join(format!("zd-srv-http-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+
+            let p = paths.plugins_dir().join("demo");
+            std::fs::create_dir_all(&p).expect("demo dir");
+            std::fs::write(
+                p.join("plugin.json"),
+                r#"{"name":"Demo","author":"Alice","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            std::fs::write(
+                p.join("main.py"),
+                "class Plugin:\n    async def add(self, a, b):\n        return a + b\n    async def fail(self):\n        raise RuntimeError('bad')\n",
+            )
+            .expect("main.py");
+
+            let passive = paths.plugins_dir().join("passive");
+            std::fs::create_dir_all(&passive).expect("passive dir");
+            std::fs::write(
+                passive.join("plugin.json"),
+                r#"{"name":"Passive","author":"Bob"}"#,
+            )
+            .expect("passive plugin.json");
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+
+            let state = AppState::with_manager(ServerConfig::default(), manager.clone());
+            let token = state.csrf_token().to_owned();
+            let app = crate::build_router(state);
+
+            let call = |body: Value| {
+                let app = app.clone();
+                let token = token.clone();
+                async move {
+                    let res = app
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri("/methods/call_plugin_method")
+                                .header("X-Decky-Auth", token)
+                                .header("Content-Type", "application/json")
+                                .body(Body::from(body.to_string()))
+                                .expect("req"),
+                        )
+                        .await
+                        .expect("resp");
+                    let status = res.status();
+                    let bytes = to_bytes(res.into_body(), 16 * 1024).await.expect("body");
+                    let json: Value = serde_json::from_slice(&bytes).expect("json");
+                    (status, json)
+                }
+            };
+
+            let (st, ok_body) =
+                call(json!({"plugin_name":"Demo","method_name":"add","args":[2,3]})).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(ok_body, json!({"success": true, "result": 5}));
+
+            let (st, exc_body) = call(json!({"plugin_name":"Demo","method_name":"fail"})).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(exc_body["success"], json!(false));
+            assert_eq!(exc_body["result"]["name"], json!("RuntimeError"));
+
+            let (st, _) = call(json!({"plugin_name":"Demo","method_name":"_main"})).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST);
+
+            let (st, _) = call(json!({"plugin_name":"Missing","method_name":"add"})).await;
+            assert_eq!(st, StatusCode::NOT_FOUND);
+
+            let (st, _) = call(json!({"plugin_name":"Passive","method_name":"x"})).await;
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

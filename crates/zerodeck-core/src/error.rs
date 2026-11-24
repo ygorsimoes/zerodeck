@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 use zerodeck_platform::PlatformError;
+use zerodeck_plugin_host::HostError;
 
 /// Errors produced by `ZeroDeck` core domain services.
 #[derive(Debug, Error)]
@@ -9,6 +10,14 @@ pub enum CoreError {
     /// Underlying OS/platform operation failed.
     #[error(transparent)]
     Platform(#[from] PlatformError),
+
+    /// Plugin worker host error.
+    #[error(transparent)]
+    Host(#[from] HostError),
+
+    /// Target plugin is disabled in `loader.json`.
+    #[error("plugin `{0}` is disabled")]
+    PluginDisabled(String),
 
     /// Filesystem I/O error.
     #[error("I/O error at `{path}`: {source}")]

@@ -9,11 +9,13 @@ import os
 import signal
 import sys
 import traceback
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
+from . import helpers as helpers_mod
+from . import settings as settings_mod
 from .decky_api import EmitCallback, build_decky_module
 from .ipc import JsonLineTransport
 
@@ -27,6 +29,7 @@ class PluginRunner:
         plugin_name: str,
         api_version: int,
         emit_sink: EmitCallback,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
         self.entrypoint = entrypoint
         self.plugin_name = plugin_name
@@ -35,16 +38,24 @@ class PluginRunner:
         self.plugin: Any = None
         self.uninstalling = False
         self.main_task: asyncio.Task[Any] | None = None
+        self._decky_logger: Any = None
+        self._stop_event: asyncio.Event | None = stop_event
 
     def load(self) -> None:
         plugin_dir = os.getenv("DECKY_PLUGIN_DIR", str(self.entrypoint.parent))
-        py_modules_dir = str(Path(plugin_dir) / "py_modules")
-        if py_modules_dir not in sys.path:
-            sys.path.append(py_modules_dir)
+        py_modules_dir = Path(plugin_dir) / "py_modules"
+        if py_modules_dir.is_dir():
+            py_modules_str = str(py_modules_dir)
+            if py_modules_str in sys.path:
+                sys.path.remove(py_modules_str)
+            sys.path.insert(0, py_modules_str)
 
         decky_mod = build_decky_module(self.plugin_name, self.emit_sink)
+        self._decky_logger = decky_mod.logger
         sys.modules["decky"] = decky_mod
         sys.modules["decky_plugin"] = decky_mod
+        sys.modules["settings"] = settings_mod
+        sys.modules["helpers"] = helpers_mod
 
         spec = importlib.util.spec_from_file_location("_zerodeck_plugin_main", self.entrypoint)
         if spec is None or spec.loader is None:
@@ -55,31 +66,65 @@ class PluginRunner:
         plugin_cls = cast(Any, module).Plugin
         self.plugin = plugin_cls() if self.api_version > 0 else plugin_cls
 
+    def _resolve_callable(self, method_name: str) -> tuple[Callable[..., Any], tuple[Any, ...]]:
+        method = cast(Callable[..., Any], getattr(self.plugin, method_name))
+        if self.api_version == 0:
+            raw_attr = inspect.getattr_static(self.plugin, method_name)
+            if not isinstance(raw_attr, (staticmethod, classmethod)):
+                return method, (self.plugin,)
+        return method, ()
+
+    async def _invoke(
+        self,
+        method_name: str,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        call_kwargs = kwargs or {}
+        callable_fn, prefix = self._resolve_callable(method_name)
+        full_args = (*prefix, *args)
+        if inspect.iscoroutinefunction(callable_fn):
+            result = callable_fn(*full_args, **call_kwargs)
+        else:
+            result = await asyncio.to_thread(callable_fn, *full_args, **call_kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def start_lifecycle(self) -> None:
         if hasattr(self.plugin, "_migration"):
-            res = (
-                self.plugin._migration()
-                if self.api_version > 0
-                else self.plugin._migration(self.plugin)
-            )
-            if inspect.isawaitable(res):
-                await res
+            try:
+                await self._invoke("_migration")
+            except Exception:
+                if self._decky_logger is not None:
+                    self._decky_logger.exception("plugin _migration failed")
+                raise
         if hasattr(self.plugin, "_main"):
-            coro = (
-                self.plugin._main()
-                if self.api_version > 0
-                else self.plugin._main(self.plugin)
+            callable_fn, prefix = self._resolve_callable("_main")
+            if inspect.iscoroutinefunction(callable_fn):
+                coro = cast(Awaitable[Any], callable_fn(*prefix))
+                if inspect.iscoroutine(coro):
+                    self.main_task = asyncio.create_task(coro)
+                else:
+
+                    async def _await_task(awaitable: Awaitable[Any]) -> Any:
+                        return await awaitable
+
+                    self.main_task = asyncio.create_task(_await_task(coro))
+            else:
+                self.main_task = asyncio.create_task(self._invoke("_main"))
+            self.main_task.add_done_callback(self._log_main_task_result)
+            await asyncio.sleep(0)
+
+    def _log_main_task_result(self, task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None and self._decky_logger is not None:
+            self._decky_logger.error(
+                "plugin _main task failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
             )
-            if inspect.iscoroutine(coro):
-                self.main_task = asyncio.create_task(coro)
-                await asyncio.sleep(0)
-            elif inspect.isawaitable(coro):
-
-                async def _await_task(awaitable: Awaitable[Any]) -> Any:
-                    return await awaitable
-
-                self.main_task = asyncio.create_task(_await_task(coro))
-                await asyncio.sleep(0)
 
     async def stop_lifecycle(self) -> None:
         if self.main_task is not None and not self.main_task.done():
@@ -89,21 +134,9 @@ class PluginRunner:
         self.main_task = None
 
         if hasattr(self.plugin, "_unload"):
-            res = (
-                self.plugin._unload()
-                if self.api_version > 0
-                else self.plugin._unload(self.plugin)
-            )
-            if inspect.isawaitable(res):
-                await res
+            await self._invoke("_unload")
         if self.uninstalling and hasattr(self.plugin, "_uninstall"):
-            res = (
-                self.plugin._uninstall()
-                if self.api_version > 0
-                else self.plugin._uninstall(self.plugin)
-            )
-            if inspect.isawaitable(res):
-                await res
+            await self._invoke("_uninstall")
 
     async def handle_message(self, raw: str) -> str | None:
         call_id = ""
@@ -121,6 +154,8 @@ class PluginRunner:
 
             if "uninstall" in data:
                 self.uninstalling = bool(data.get("uninstall"))
+                if self._stop_event is not None:
+                    self._stop_event.set()
                 return None
 
             call_id = str(data["id"])
@@ -128,7 +163,6 @@ class PluginRunner:
             method_name = str(data["method"])
             if method_name.startswith("_"):
                 raise PermissionError(f"cannot call private method {method_name}")
-            method = getattr(self.plugin, method_name)
 
             raw_args = data.get("args")
             if data.get("legacy"):
@@ -140,7 +174,7 @@ class PluginRunner:
                     kwargs = cast(dict[str, Any], raw_args)
                 else:
                     raise ValueError("legacy args must be a JSON object")
-                result = method(self.plugin, **kwargs)
+                response["res"] = await self._invoke(method_name, kwargs=kwargs)
             else:
                 if self.api_version < 1:
                     raise RuntimeError("api_version >= 1 required for positional calls")
@@ -150,12 +184,7 @@ class PluginRunner:
                     args = cast(list[Any], raw_args)
                 else:
                     raise ValueError("args must be a JSON array")
-                result = method(*args)
-
-            if inspect.isawaitable(result):
-                response["res"] = await result
-            else:
-                response["res"] = result
+                response["res"] = await self._invoke(method_name, args=tuple(args))
         except Exception as exc:  # noqa: BLE001
             response["success"] = False
             response["res"] = str(exc)
@@ -164,8 +193,6 @@ class PluginRunner:
         try:
             return json.dumps(response, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
-            # A plugin returned a value JSON cannot encode (e.g. a `set`): report it to the caller
-            # instead of letting the exception escape and kill the worker's IPC loop.
             return json.dumps(
                 {
                     "type": 1,
@@ -194,39 +221,44 @@ async def _run_worker(args: argparse.Namespace) -> None:
     else:
         raise ValueError("either --fd or --socket-path must be provided")
 
+    stop_event = asyncio.Event()
     runner = PluginRunner(
         entrypoint=Path(args.entrypoint),
         plugin_name=args.plugin_name,
         api_version=args.api_version,
         emit_sink=transport.send_json,
+        stop_event=stop_event,
     )
-    runner.load()
-    await runner.start_lifecycle()
+    try:
+        runner.load()
+        await runner.start_lifecycle()
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            pass
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_event.set)
+            except NotImplementedError:
+                pass
 
-    serve_task = asyncio.create_task(transport.serve(runner.handle_message))
-    stop_task = asyncio.create_task(stop_event.wait())
-    done, pending = await asyncio.wait(
-        [serve_task, stop_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for task in pending:
-        task.cancel()
-    for task in done:
-        if task is serve_task and not task.cancelled():
-            exc = task.exception()
-            if exc is not None:
-                raise exc
+        serve_task = asyncio.create_task(transport.serve(runner.handle_message))
+        stop_task = asyncio.create_task(stop_event.wait())
+        done, pending = await asyncio.wait(
+            [serve_task, stop_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for pending_task in pending:
+            pending_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending_task
+        for task in done:
+            if task is serve_task and not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
 
-    await runner.stop_lifecycle()
-    await transport.close()
+        await runner.stop_lifecycle()
+    finally:
+        await transport.close()
 
 
 def main() -> None:

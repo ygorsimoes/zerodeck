@@ -3,6 +3,7 @@
 mod archive;
 mod discovery;
 mod error;
+mod manager;
 mod settings;
 
 pub use archive::{
@@ -12,6 +13,7 @@ pub use archive::{
 };
 pub use discovery::{DiscoveredPlugin, discover_plugins};
 pub use error::CoreError;
+pub use manager::{PluginManager, PluginSummary};
 pub use settings::SettingsManager;
 
 #[cfg(test)]
@@ -425,5 +427,158 @@ mod tests {
             }
         ));
         assert!(!dest.exists());
+    }
+
+    fn manager_test_paths(root: &std::path::Path) -> zerodeck_platform::PlatformPaths {
+        let root_str = root.display().to_string();
+        let home_str = root.join("home").display().to_string();
+        fs::create_dir_all(&home_str).expect("create home");
+        let lookup = std::collections::HashMap::from([
+            ("UNPRIVILEGED_PATH", root_str.as_str()),
+            ("PRIVILEGED_PATH", root_str.as_str()),
+            ("DECKY_USER_HOME", home_str.as_str()),
+            ("HOME", home_str.as_str()),
+        ]);
+        zerodeck_platform::PlatformPaths::from_lookup(|k| lookup.get(k).map(|v| (*v).to_owned()))
+    }
+
+    fn python_host_module_path() -> String {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hosts/python")
+            .canonicalize()
+            .expect("resolve hosts/python")
+            .display()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_manager_respects_plugin_order_and_disabled_plugins() {
+        let dir = TestDir::new("mgr-order");
+        let paths = manager_test_paths(&dir.0);
+        for (folder, name, has_main) in [
+            ("alpha", "Alpha", false),
+            ("beta", "Beta", false),
+            ("gamma", "Gamma", true),
+            ("delta", "Delta", false),
+        ] {
+            let p = paths.plugins_dir().join(folder);
+            fs::create_dir_all(&p).expect("create plugin dir");
+            fs::write(
+                p.join("plugin.json"),
+                format!(r#"{{"name":"{name}","author":"Tester","api_version":1}}"#),
+            )
+            .expect("write plugin.json");
+            if has_main {
+                fs::write(p.join("main.py"), "raise RuntimeError('must not spawn')")
+                    .expect("write main.py");
+            }
+        }
+
+        let mut settings =
+            SettingsManager::open(paths.settings_dir().join("loader.json")).expect("open settings");
+        settings
+            .set("pluginOrder", vec!["Beta", "Alpha"])
+            .expect("set pluginOrder");
+        settings
+            .set("disabledPlugins", vec!["Gamma"])
+            .expect("set disabledPlugins");
+
+        let config = zerodeck_plugin_host::SupervisorConfig {
+            python_host: zerodeck_plugin_host::PythonHostConfig {
+                python_bin: "python3".to_owned(),
+                host_module_path: Some(python_host_module_path()),
+            },
+            ..zerodeck_plugin_host::SupervisorConfig::default()
+        };
+
+        let manager =
+            crate::PluginManager::open(paths.clone(), config, "0.1.0").expect("open manager");
+        manager.start_all().await.expect("start_all");
+
+        let list = manager.list_plugins();
+        let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Beta", "Alpha", "Delta", "Gamma"]);
+
+        let gamma = list.iter().find(|p| p.name == "Gamma").expect("gamma");
+        assert!(gamma.disabled);
+        assert_eq!(gamma.state, zerodeck_plugin_host::PluginState::Stopped);
+
+        let err = manager
+            .call_plugin_method("Gamma", "ping", serde_json::json!([]), false)
+            .await
+            .expect_err("disabled plugin call must fail");
+        assert!(matches!(err, CoreError::PluginDisabled(ref n) if n == "Gamma"));
+
+        // Also verify snake_case `disabled_plugins` fallback when `disabledPlugins` is absent.
+        let dir2 = TestDir::new("mgr-snake");
+        let paths2 = manager_test_paths(&dir2.0);
+        fs::create_dir_all(paths2.settings_dir()).expect("settings dir");
+        fs::write(
+            paths2.settings_dir().join("loader.json"),
+            r#"{"disabled_plugins":["Alpha"]}"#,
+        )
+        .expect("write snake_case loader.json");
+        let alpha = paths2.plugins_dir().join("alpha");
+        fs::create_dir_all(&alpha).expect("alpha dir");
+        fs::write(
+            alpha.join("plugin.json"),
+            r#"{"name":"Alpha","author":"Tester"}"#,
+        )
+        .expect("write plugin.json");
+        let manager2 = crate::PluginManager::open(
+            paths2,
+            zerodeck_plugin_host::SupervisorConfig::default(),
+            "0.1.0",
+        )
+        .expect("open manager2");
+        assert!(manager2.list_plugins()[0].disabled);
+
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_manager_calls_and_reloads_active_plugin() {
+        let dir = TestDir::new("mgr-reload");
+        let paths = manager_test_paths(&dir.0);
+        let p = paths.plugins_dir().join("echo");
+        fs::create_dir_all(&p).expect("create plugin dir");
+        fs::write(
+            p.join("plugin.json"),
+            r#"{"name":"Echo","author":"Tester","api_version":1}"#,
+        )
+        .expect("write plugin.json");
+        fs::write(
+            p.join("main.py"),
+            "class Plugin:\n    async def ping(self):\n        return 'pong'\n",
+        )
+        .expect("write main.py");
+
+        let config = zerodeck_plugin_host::SupervisorConfig {
+            python_host: zerodeck_plugin_host::PythonHostConfig {
+                python_bin: "python3".to_owned(),
+                host_module_path: Some(python_host_module_path()),
+            },
+            ..zerodeck_plugin_host::SupervisorConfig::default()
+        };
+
+        let manager = crate::PluginManager::open(paths, config, "0.1.0").expect("open manager");
+        manager.start_all().await.expect("start_all");
+
+        let res = manager
+            .call_plugin_method("Echo", "ping", serde_json::json!([]), false)
+            .await
+            .expect("call ping");
+        assert_eq!(res, serde_json::json!("pong"));
+
+        manager.reload_plugin("Echo").await.expect("reload Echo");
+        let res2 = manager
+            .call_plugin_method("Echo", "ping", serde_json::json!([]), false)
+            .await
+            .expect("call ping after reload");
+        assert_eq!(res2, serde_json::json!("pong"));
+
+        manager.shutdown_all().await;
     }
 }

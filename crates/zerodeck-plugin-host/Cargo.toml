@@ -11,8 +11,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+rustix.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 zerodeck-platform.workspace = true
 zerodeck-protocol.workspace = true

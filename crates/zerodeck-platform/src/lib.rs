@@ -11,7 +11,9 @@ pub use fs::atomic_write;
 pub use paths::PlatformPaths;
 pub use privilege::PrivilegeTarget;
 #[cfg(unix)]
-pub use privilege::{ProcessIdentity, current_process_identity};
+pub use privilege::{
+    HostUserIdentity, ProcessIdentity, current_process_identity, ensure_owned_dir,
+};
 pub use safe_path::{SafePath, SafePathSet};
 
 #[cfg(test)]
@@ -185,5 +187,121 @@ mod tests {
         let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
         assert_eq!(paths.user_home(), PathBuf::from("/home/fallback"));
         assert_eq!(paths.unprivileged_root(), PathBuf::from("/opt/decky"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_user_identity_bypasses_passwd_when_unprivileged() {
+        let env = HashMap::from([("DECKY_USER", "alice"), ("DECKY_USER_HOME", "/Users/alice")]);
+        let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
+        let current = crate::current_process_identity();
+        let resolved = crate::HostUserIdentity::resolve_from(
+            &paths,
+            current.uid.max(501),
+            "",
+            "",
+            Some("alice"),
+            None,
+        )
+        .expect("unprivileged host must bypass /etc/passwd");
+
+        assert_eq!(resolved.username, "alice");
+        assert_eq!(resolved.uid, current.uid);
+        assert_eq!(resolved.gid, current.gid);
+        assert_eq!(resolved.home_dir, PathBuf::from("/Users/alice"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_user_identity_skips_uid_zero_home_and_falls_back_to_deck_when_root() {
+        let env = HashMap::from([("HOME", "/root")]);
+        let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      deck:x:1000:1000:Steam Deck User:/home/deck:/bin/bash\n";
+        let group = "root:x:0:\n\
+                     wheel:x:998:deck\n\
+                     video:x:985:someone,deck\n";
+
+        let resolved =
+            crate::HostUserIdentity::resolve_from(&paths, 0, passwd, group, None, Some(0))
+                .expect("root daemon must skip uid 0 home and find deck");
+
+        assert_eq!(resolved.username, "deck");
+        assert_eq!(resolved.uid, 1000);
+        assert_eq!(resolved.gid, 1000);
+        assert_eq!(resolved.supplemental_gids, vec![985, 998]);
+        assert_eq!(resolved.home_dir, PathBuf::from("/home/deck"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_user_identity_fails_closed_when_root_cannot_find_non_root_user() {
+        let env = HashMap::from([("HOME", "/root")]);
+        let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
+        let passwd =
+            "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n";
+
+        let err = crate::HostUserIdentity::resolve_from(&paths, 0, passwd, "", None, Some(0))
+            .expect_err("must fail closed rather than falling back to root or nobody");
+        assert!(matches!(err, PlatformError::HostUserNotFound(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_owned_dir_creates_directory_and_applies_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("owned-dir");
+        let target = dir.0.join("nested/ipc");
+        crate::ensure_owned_dir(&target, None, Some(0o700)).expect("create 0700 dir");
+
+        let mode = fs::metadata(&target)
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_owned_dir_rejects_symlink_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("owned-dir-symlink");
+        let outside = dir.0.join("outside");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).expect("chmod outside");
+
+        let link = dir.0.join("evil-link");
+        std::os::unix::fs::symlink(&outside, &link).expect("create symlink");
+
+        let err = crate::ensure_owned_dir(&link, None, Some(0o700))
+            .expect_err("must reject symlink directory target");
+        assert!(matches!(err, PlatformError::Io { .. }));
+        let mode = fs::metadata(&outside)
+            .expect("stat outside")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "symlink target permissions must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_user_identity_skips_uid_zero_decky_user_home_even_if_passwd_has_non_deck_user() {
+        let env = HashMap::from([("HOME", "/root")]);
+        let paths = PlatformPaths::from_lookup(|k| env.get(k).map(|v| (*v).to_owned()));
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      deck:x:1000:1000:Steam Deck User:/home/deck:/bin/bash\n";
+
+        // Verify resolve() also filters uid == 0 on DECKY_USER_HOME before falling back.
+        let resolved = crate::HostUserIdentity::resolve_from(&paths, 0, passwd, "", None, Some(0))
+            .expect("must skip uid 0 and fall back to deck");
+        assert_eq!(resolved.username, "deck");
+        assert_eq!(resolved.home_dir, PathBuf::from("/home/deck"));
     }
 }

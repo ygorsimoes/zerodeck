@@ -40,8 +40,19 @@ impl Default for PythonHostConfig {
     }
 }
 
+const PRESERVED_BASE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
 impl PythonHostConfig {
-    /// Builds a `tokio::process::Command` pre-populated with `DECKY_*` env variables.
+    /// Builds a sanitized `tokio::process::Command` with `env_clear()`, `cwd`, and `DECKY_*` env.
     #[must_use]
     pub fn build_command(&self, spec: &PluginSpawnSpec, paths: &PlatformPaths) -> Command {
         let mut cmd = Command::new(&self.python_bin);
@@ -50,10 +61,29 @@ impl PythonHostConfig {
         cmd.arg("--plugin-name").arg(&spec.manifest.name);
         cmd.arg("--api-version")
             .arg(spec.manifest.api_version.to_string());
+
+        cmd.env_clear();
+        for key in PRESERVED_BASE_ENV_VARS {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
         cmd.envs(build_plugin_env(spec, paths));
-        if let Some(module_path) = &self.host_module_path {
+
+        let python_path = self
+            .host_module_path
+            .clone()
+            .or_else(|| std::env::var("PYTHONPATH").ok().filter(|v| !v.is_empty()));
+        if let Some(module_path) = python_path {
             cmd.env("PYTHONPATH", module_path);
         }
+
+        if let Some(plugin_dir) = spec.entrypoint.parent()
+            && plugin_dir.is_dir()
+        {
+            cmd.current_dir(plugin_dir);
+        }
+
         cmd
     }
 }

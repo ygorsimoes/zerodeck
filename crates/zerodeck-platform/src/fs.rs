@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
@@ -7,6 +7,9 @@ use uuid::Uuid;
 use crate::PlatformError;
 
 /// Atomically writes `contents` to `path` via a sibling temp file, `sync_all`, and `rename`.
+///
+/// An existing target keeps its permission bits, and on Unix the parent directory is synced after
+/// the rename so the new directory entry itself survives a power loss.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), PlatformError> {
     let parent = path
         .parent()
@@ -23,12 +26,16 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), PlatformError> {
         .and_then(|n| n.to_str())
         .unwrap_or("zerodeck");
     let tmp_path = parent.join(format!(".{file_name}.tmp.{}", Uuid::new_v4()));
+    let existing_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
 
     let write_res = (|| -> std::io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp_path)?;
+        if let Some(permissions) = existing_permissions {
+            file.set_permissions(permissions)?;
+        }
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
@@ -44,5 +51,21 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), PlatformError> {
         });
     }
 
+    sync_dir(parent)
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<(), PlatformError> {
+    File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|source| PlatformError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_dir(_dir: &Path) -> Result<(), PlatformError> {
     Ok(())
 }

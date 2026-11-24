@@ -117,6 +117,26 @@ mod tests {
         assert_eq!(leftovers.len(), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TestDir::new("atomic-perms");
+        let target = dir.0.join("secrets.json");
+        fs::write(&target, b"{}").expect("seed target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+        atomic_write(&target, br#"{"token":"x"}"#).expect("atomic write");
+
+        let mode = fs::metadata(&target)
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn platform_paths_respects_unprivileged_and_privileged_overrides() {
         let env = HashMap::from([

@@ -269,6 +269,74 @@ test('WSRouter backs off exponentially between failed reconnects and resets afte
   assert.equal(delays.at(-1), 100);
 });
 
+test('WSRouter.start keeps retrying until the daemon hands out a token', async () => {
+  const urls: string[] = [];
+  const delays: number[] = [];
+  const pending: (() => void)[] = [];
+  let tokenRequests = 0;
+  const router = new WSRouter({
+    reconnectDelayMs: 100,
+    refreshAuthToken: async () => {
+      tokenRequests += 1;
+      if (tokenRequests < 3) throw new Error('connection refused');
+      return 'tok-late';
+    },
+    schedule: (callback, delayMs) => {
+      delays.push(delayMs);
+      pending.push(callback);
+    },
+    createSocket: (url) => {
+      urls.push(url);
+      return new MockWebSocket();
+    },
+  });
+
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    router.start();
+    for (let i = 0; i < 2; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      pending.shift()?.();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.equal(tokenRequests, 3);
+  assert.deepEqual(delays, [100, 200]);
+  assert.equal(urls.length, 1);
+  assert.match(urls[0], /auth=tok-late$/);
+});
+
+test('WSRouter.start requires refreshAuthToken', () => {
+  assert.throws(() => new WSRouter().start(), /refreshAuthToken/);
+});
+
+test('WSRouter rejects calls that exceed callTimeoutMs and stops replaying them', async () => {
+  const sockets: MockWebSocket[] = [];
+  const router = new WSRouter({
+    callTimeoutMs: 10,
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const conn = router.connect('tok-7');
+  sockets[0].emit('open', {});
+  await conn;
+
+  await assert.rejects(router.call('slow/never'), /timed out after 10ms/);
+
+  const conn2 = router.connect('tok-7');
+  sockets[1].emit('open', {});
+  await conn2;
+  assert.deepEqual(JSON.parse(sockets[1].sent[0]).messages, []);
+});
+
 test('vite steamExternalsPlugin exports named JSX and React bindings', async () => {
   const { renderSteamGlobalModule } = await import('../vite.config.ts');
   const jsxShim = renderSteamGlobalModule('react/jsx-runtime', 'SP_JSX');

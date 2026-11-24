@@ -159,7 +159,20 @@ class PluginRunner:
             response["success"] = False
             response["res"] = str(exc)
 
-        return json.dumps(response, ensure_ascii=False)
+        try:
+            return json.dumps(response, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            # A plugin returned a value JSON cannot encode (e.g. a `set`): report it to the caller
+            # instead of letting the exception escape and kill the worker's IPC loop.
+            return json.dumps(
+                {
+                    "type": 1,
+                    "id": response["id"],
+                    "success": False,
+                    "res": f"plugin result is not JSON serializable: {exc}",
+                },
+                ensure_ascii=False,
+            )
 
 
 async def _run_worker(args: argparse.Namespace) -> None:

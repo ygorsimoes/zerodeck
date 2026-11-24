@@ -18,6 +18,9 @@ pub struct DiscoveredPlugin {
 }
 
 /// Scans `plugins_dir` for subdirectories containing a valid `plugin.json`.
+///
+/// A plugin whose `plugin.json` or `package.json` cannot be read or parsed is logged and skipped,
+/// so one broken plugin never prevents the remaining plugins (or the daemon) from loading.
 pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, CoreError> {
     if !plugins_dir.exists() {
         return Ok(Vec::new());
@@ -35,64 +38,67 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
             source,
         })?;
         let dir_path = entry.path();
-        if !dir_path.is_dir() {
-            continue;
-        }
-
-        let plugin_json_path = dir_path.join("plugin.json");
-        if !plugin_json_path.is_file() {
+        if !dir_path.is_dir() || !dir_path.join("plugin.json").is_file() {
             continue;
         }
 
         let directory = entry.file_name().to_string_lossy().into_owned();
-        let plugin_raw = fs::read_to_string(&plugin_json_path).map_err(|source| CoreError::Io {
-            path: plugin_json_path.clone(),
-            source,
-        })?;
-        let manifest: PluginManifest =
-            serde_json::from_str(&plugin_raw).map_err(|source| CoreError::ManifestParse {
-                path: plugin_json_path,
-                source,
-            })?;
-
-        let package_json_path = dir_path.join("package.json");
-        let package = if package_json_path.is_file() {
-            let pkg_raw =
-                fs::read_to_string(&package_json_path).map_err(|source| CoreError::Io {
-                    path: package_json_path.clone(),
-                    source,
-                })?;
-            Some(
-                serde_json::from_str::<PackageManifest>(&pkg_raw).map_err(|source| {
-                    CoreError::ManifestParse {
-                        path: package_json_path,
-                        source,
-                    }
-                })?,
-            )
-        } else {
-            None
-        };
-
-        let load_type = package
-            .as_ref()
-            .map_or(PluginLoadType::LegacyEvalIife, PackageManifest::load_type);
-        let has_entrypoint = dir_path.join("main.py").is_file();
-        let passive = !has_entrypoint;
-
-        if load_type == PluginLoadType::LegacyEvalIife {
-            warn!(plugin = %manifest.name, "discovered legacy IIFE plugin");
+        match load_plugin(&dir_path, directory) {
+            Ok(plugin) => plugins.push(plugin),
+            Err(err) => {
+                warn!(plugin_dir = %dir_path.display(), error = %err, "skipping invalid plugin");
+            }
         }
-
-        plugins.push(DiscoveredPlugin {
-            directory,
-            manifest,
-            package,
-            load_type,
-            passive,
-            has_entrypoint,
-        });
     }
 
     Ok(plugins)
+}
+
+fn load_plugin(dir_path: &Path, directory: String) -> Result<DiscoveredPlugin, CoreError> {
+    let plugin_json_path = dir_path.join("plugin.json");
+    let plugin_raw = fs::read_to_string(&plugin_json_path).map_err(|source| CoreError::Io {
+        path: plugin_json_path.clone(),
+        source,
+    })?;
+    let manifest: PluginManifest =
+        serde_json::from_str(&plugin_raw).map_err(|source| CoreError::ManifestParse {
+            path: plugin_json_path,
+            source,
+        })?;
+
+    let package_json_path = dir_path.join("package.json");
+    let package = if package_json_path.is_file() {
+        let pkg_raw = fs::read_to_string(&package_json_path).map_err(|source| CoreError::Io {
+            path: package_json_path.clone(),
+            source,
+        })?;
+        Some(
+            serde_json::from_str::<PackageManifest>(&pkg_raw).map_err(|source| {
+                CoreError::ManifestParse {
+                    path: package_json_path,
+                    source,
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let load_type = package
+        .as_ref()
+        .map_or(PluginLoadType::LegacyEvalIife, PackageManifest::load_type);
+    let has_entrypoint = dir_path.join("main.py").is_file();
+
+    if load_type == PluginLoadType::LegacyEvalIife {
+        warn!(plugin = %manifest.name, "discovered legacy IIFE plugin");
+    }
+
+    Ok(DiscoveredPlugin {
+        directory,
+        manifest,
+        package,
+        load_type,
+        passive: !has_entrypoint,
+        has_entrypoint,
+    })
 }

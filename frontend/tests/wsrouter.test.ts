@@ -168,6 +168,68 @@ test('WSRouter rejects pending call on DISCARD (2) and survives malformed JSON',
   await assert.rejects(discardedCall, /discarded/i);
 });
 
+test('WSRouter keeps dispatching EVENT to other listeners when one throws synchronously', async () => {
+  const sockets: MockWebSocket[] = [];
+  const router = new WSRouter({
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const conn = router.connect('tok-5');
+  sockets[0].emit('open', {});
+  await conn;
+
+  const received: unknown[] = [];
+  router.addEventListener('loader/tick', () => {
+    throw new Error('listener bug');
+  });
+  router.addEventListener('loader/tick', (payload) => {
+    received.push(payload);
+  });
+
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    assert.doesNotThrow(() => {
+      sockets[0].emit('message', {
+        data: JSON.stringify({ type: MessageType.Event, event: 'loader/tick', args: [7] }),
+      });
+    });
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(received, [7]);
+});
+
+test('WSRouter fetches a fresh auth token before reconnecting', async () => {
+  const sockets: MockWebSocket[] = [];
+  const urls: string[] = [];
+  const router = new WSRouter({
+    reconnectDelayMs: 0,
+    refreshAuthToken: async () => 'tok-new',
+    createSocket: (url) => {
+      urls.push(url);
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const conn = router.connect('tok-old');
+  sockets[0].emit('open', {});
+  await conn;
+
+  sockets[0].emit('close', {});
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(urls.length, 2);
+  assert.match(urls[0], /auth=tok-old$/);
+  assert.match(urls[1], /auth=tok-new$/);
+});
+
 test('vite steamExternalsPlugin exports named JSX and React bindings', async () => {
   const { renderSteamGlobalModule } = await import('../vite.config.ts');
   const jsxShim = renderSteamGlobalModule('react/jsx-runtime', 'SP_JSX');

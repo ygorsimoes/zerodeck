@@ -130,6 +130,36 @@ mod tests {
     }
 
     #[test]
+    fn discover_plugins_skips_invalid_manifests_and_keeps_valid_plugins() {
+        let dir = TestDir::new("discover-invalid");
+
+        let good = dir.0.join("good-plugin");
+        fs::create_dir_all(&good).expect("create good dir");
+        fs::write(
+            good.join("plugin.json"),
+            r#"{"name": "Good Plugin", "author": "Alice"}"#,
+        )
+        .expect("write good plugin.json");
+
+        let bad_plugin_json = dir.0.join("bad-plugin-json");
+        fs::create_dir_all(&bad_plugin_json).expect("create bad plugin.json dir");
+        fs::write(bad_plugin_json.join("plugin.json"), "{not json").expect("write bad plugin.json");
+
+        let bad_package_json = dir.0.join("bad-package-json");
+        fs::create_dir_all(&bad_package_json).expect("create bad package.json dir");
+        fs::write(
+            bad_package_json.join("plugin.json"),
+            r#"{"name": "Bad Package", "author": "Bob"}"#,
+        )
+        .expect("write plugin.json");
+        fs::write(bad_package_json.join("package.json"), "[1, 2").expect("write bad package.json");
+
+        let plugins = discover_plugins(&dir.0).expect("discovery must tolerate invalid plugins");
+        let names: Vec<&str> = plugins.iter().map(|p| p.manifest.name.as_str()).collect();
+        assert_eq!(names, vec!["Good Plugin"]);
+    }
+
+    #[test]
     fn extract_zip_safely_rejects_zip_slip_traversal() {
         let dir = TestDir::new("zip-slip");
         let dest = dir.0.join("out");

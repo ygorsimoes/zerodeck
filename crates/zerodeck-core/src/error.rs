@@ -78,4 +78,40 @@ pub enum CoreError {
     /// Computed SHA-256 digest does not match expected value.
     #[error("SHA-256 mismatch: expected {expected}, got {actual}")]
     Sha256Mismatch { expected: String, actual: String },
+
+    /// Outbound HTTP request was blocked by the SSRF policy.
+    #[error("outbound HTTP request blocked by policy: {0}")]
+    HttpPolicy(String),
+
+    /// Outbound HTTP request failed at transport or protocol level.
+    #[error("outbound HTTP request failed: {0}")]
+    HttpRequest(String),
+
+    /// Remote download exceeded the configured maximum byte budget.
+    #[error("download exceeded maximum allowed size of {max_bytes} bytes")]
+    DownloadSizeExceeded { max_bytes: usize },
+
+    /// Plugin install source URI or path could not be parsed.
+    #[error("invalid install source: {0}")]
+    InvalidInstallSource(String),
+
+    /// Installed plugin manifest metadata did not match caller expectations.
+    #[error("plugin manifest {field} mismatch: expected `{expected}`, got `{actual}`")]
+    ManifestMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+
+    /// Extracted plugin archive does not contain a top-level `plugin.json`.
+    #[error("archive does not contain a top-level plugin.json manifest")]
+    MissingPluginManifest,
+
+    /// Dotted setting path or protected lifecycle setting write is invalid.
+    #[error("invalid setting: {0}")]
+    InvalidSetting(String),
+
+    /// Debug hot-reload watcher failed.
+    #[error("debug watcher error: {0}")]
+    Watcher(String),
 }

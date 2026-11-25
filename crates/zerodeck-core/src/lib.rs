@@ -3,6 +3,7 @@
 mod archive;
 mod discovery;
 mod error;
+pub mod http_policy;
 mod manager;
 mod settings;
 
@@ -13,6 +14,9 @@ pub use archive::{
 };
 pub use discovery::{DiscoveredPlugin, discover_plugins};
 pub use error::CoreError;
+pub use http_policy::{
+    DEFAULT_MAX_REDIRECTS, OutboundHttpPolicy, ValidatedResponse, send_checked_request,
+};
 pub use manager::{PluginManager, PluginSummary};
 pub use settings::SettingsManager;
 
@@ -580,5 +584,238 @@ mod tests {
         assert_eq!(res2, serde_json::json!("pong"));
 
         manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_normalizes_permissions_without_unix_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::env::var_os("ZERODECK_TEST_UMASK_077").is_none() {
+            let exe = std::env::current_exe().expect("current test binary");
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("umask 077 && exec \"$1\" --exact \"$2\"")
+                .arg("sh")
+                .arg(&exe)
+                .arg("tests::extract_zip_normalizes_permissions_without_unix_mode")
+                .env("ZERODECK_TEST_UMASK_077", "1")
+                .status()
+                .expect("spawn umask 077 subtest");
+            assert!(status.success(), "umask 077 subtest must succeed");
+            return;
+        }
+
+        let dir = TestDir::new("zip-perms-umask077");
+        let dest = dir.0.join("plugin");
+
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut buf);
+            let stripped = SimpleFileOptions::default().unix_permissions(0);
+            let dos_no_mode = SimpleFileOptions::default().external_attributes(0);
+            let executable = SimpleFileOptions::default().unix_permissions(0o755);
+
+            writer
+                .add_directory("explicit_dir", stripped)
+                .expect("add explicit dir");
+            writer
+                .start_file("sub/file.txt", stripped)
+                .expect("start stripped file");
+            writer.write_all(b"hello").expect("write stripped file");
+            writer
+                .start_file("sub/dos.txt", dos_no_mode)
+                .expect("start dos file");
+            writer.write_all(b"dos").expect("write dos file");
+            writer
+                .start_file("sub/bin/run", executable)
+                .expect("start exec file");
+            writer.write_all(b"#!/bin/sh\n").expect("write exec file");
+            writer.finish().expect("finish zip");
+        }
+
+        extract_zip_safely(buf.get_ref(), &dest).expect("extract zip under umask 077");
+
+        let mode_of = |rel: &str| -> u32 {
+            let p = if rel.is_empty() {
+                dest.clone()
+            } else {
+                dest.join(rel)
+            };
+            fs::metadata(&p)
+                .unwrap_or_else(|e| panic!("stat {}: {e}", p.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        assert_eq!(mode_of(""), 0o755, "destination root must be 0o755");
+        assert_eq!(mode_of("explicit_dir"), 0o755, "explicit dir must be 0o755");
+        assert_eq!(mode_of("sub"), 0o755, "implicit parent dir must be 0o755");
+        assert_eq!(mode_of("sub/bin"), 0o755, "nested parent dir must be 0o755");
+        assert_eq!(
+            mode_of("sub/file.txt"),
+            0o644,
+            "stripped file must be normalized to 0o644"
+        );
+        assert_eq!(
+            mode_of("sub/dos.txt"),
+            0o644,
+            "DOS entry without unix_mode must be normalized to 0o644"
+        );
+        assert_eq!(
+            mode_of("sub/bin/run"),
+            0o755,
+            "executable file must remain 0o755"
+        );
+    }
+
+    #[test]
+    fn http_policy_blocks_loopback_metadata_and_allows_private_lan() {
+        let policy = crate::http_policy::OutboundHttpPolicy::production();
+
+        for blocked in [
+            "",
+            "   ",
+            "not a url",
+            "http://example.com:0/x",
+            "ftp://example.com/file.zip",
+            "http://127.0.0.1/x",
+            "http://[::1]:8080/json",
+            "http://localhost:1337/auth/token",
+            "http://LOCALHOST./auth/token",
+            "http://sub.localhost/a",
+            "http://0.0.0.0/x",
+            "http://0.42.0.1/x",
+            "http://[::]/x",
+            "http://169.254.169.254/latest",
+            "http://[fe80::1]/",
+            "http://[::ffff:127.0.0.1]:1337/auth/token",
+            "http://[::ffff:169.254.169.254]/latest",
+            "http://[::127.0.0.1]/x",
+            "http://224.0.0.1/x",
+            "http://[ff02::1]/x",
+            "file:///etc/passwd",
+        ] {
+            let err = policy
+                .validate_url(blocked)
+                .expect_err(&format!("production policy must reject `{blocked}`"));
+            assert!(
+                matches!(err, CoreError::HttpPolicy(_)),
+                "expected HttpPolicy error for `{blocked}`, got {err:?}"
+            );
+        }
+
+        for allowed in [
+            "https://plugins.deckbrew.xyz/a.zip",
+            "http://192.168.1.50:8096",
+            "http://10.0.0.5:8123",
+            "http://172.16.4.2",
+            "http://[fd00::1]/api",
+            "http://[::ffff:192.168.1.50]/api",
+        ] {
+            policy
+                .validate_url(allowed)
+                .unwrap_or_else(|e| panic!("production policy must accept `{allowed}`: {e}"));
+        }
+    }
+
+    async fn spawn_http_redirect_mock() -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let port = listener.local_addr().expect("mock addr").port();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let req = String::from_utf8_lossy(&buf);
+                let resp = if req.starts_with("GET /redirect ") {
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1337/auth/token\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if req.starts_with("GET /metadata ") {
+                    "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if req.starts_with("GET /hop ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if req.starts_with("GET /loop ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else if req.starts_with("GET /ok ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn http_policy_blocks_redirect_into_loopback() {
+        let (port, server) = spawn_http_redirect_mock().await;
+        let policy =
+            crate::http_policy::OutboundHttpPolicy::for_loopback_ports_for_testing(vec![port]);
+        let client = reqwest::Client::new();
+
+        for path in ["redirect", "metadata", "loop"] {
+            let err = crate::http_policy::send_checked_request(
+                &client,
+                &policy,
+                reqwest::Method::GET,
+                &format!("http://127.0.0.1:{port}/{path}"),
+                reqwest::header::HeaderMap::new(),
+                None,
+                5,
+            )
+            .await
+            .expect_err(&format!("`/{path}` must be blocked by policy"));
+            assert!(
+                matches!(err, CoreError::HttpPolicy(_)),
+                "expected HttpPolicy for `/{path}`, got {err:?}"
+            );
+        }
+
+        let ok = crate::http_policy::send_checked_request(
+            &client,
+            &policy,
+            reqwest::Method::GET,
+            &format!("http://127.0.0.1:{port}/hop"),
+            reqwest::header::HeaderMap::new(),
+            None,
+            5,
+        )
+        .await
+        .expect("allowed relative redirect on mock port must succeed");
+        assert_eq!(ok.status(), reqwest::StatusCode::OK);
+        assert_eq!(ok.text().await.expect("body"), "ok");
+
+        let prod_policy = crate::http_policy::OutboundHttpPolicy::production();
+        let prod_client = prod_policy.build_client().expect("build production client");
+        let err_prod = crate::http_policy::send_checked_request(
+            &prod_client,
+            &prod_policy,
+            reqwest::Method::GET,
+            &format!("http://127.0.0.1:{port}/ok"),
+            reqwest::header::HeaderMap::new(),
+            None,
+            5,
+        )
+        .await
+        .expect_err("production policy must block loopback port even if server is listening");
+        assert!(matches!(err_prod, CoreError::HttpPolicy(_)));
+
+        assert!(matches!(
+            policy.validate_ip(std::net::IpAddr::from([127, 0, 0, 1])),
+            Err(CoreError::HttpPolicy(_))
+        ));
+
+        server.abort();
     }
 }

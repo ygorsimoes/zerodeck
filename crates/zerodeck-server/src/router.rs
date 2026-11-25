@@ -575,8 +575,10 @@ async fn stream_file_response(
     };
     let modified = meta.modified().ok();
 
+    // RFC 7232 section 3.3: an `If-Modified-Since` later than the current time is ignored.
     if !no_store
         && let (Some(since), Some(mtime)) = (if_modified_since, modified)
+        && since <= SystemTime::now()
         && epoch_secs(mtime) <= epoch_secs(since)
     {
         let builder = Response::builder().status(StatusCode::NOT_MODIFIED);

@@ -362,6 +362,9 @@ mod tests {
         assert_eq!(st, StatusCode::NOT_MODIFIED);
         assert_eq!(body, "");
         assert_eq!(hdrs.get("x-content-type-options").unwrap(), "nosniff");
+        let (st, _, body) = call_get_with(&app, "HEAD", uri, &[("if-modified-since", &lm)]).await;
+        assert_eq!(st, StatusCode::NOT_MODIFIED, "HEAD");
+        assert_eq!(body, "");
         // An older validator yields the full body.
         let (st, _, body) = call_get_with(
             &app,
@@ -376,6 +379,33 @@ mod tests {
         let (st, _, _) =
             call_get_with(&app, "GET", uri, &[("if-modified-since", "nonsense")]).await;
         assert_eq!(st, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_if_modified_since_in_the_future_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-ims-future-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        // RFC 7232 section 3.3: a date later than the server's current time is invalid.
+        let future = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_hours(24),
+        );
+        for method in ["GET", "HEAD"] {
+            let (st, _, _) = call_get_with(
+                &app,
+                method,
+                "/plugins/Demo/assets/a.png",
+                &[("if-modified-since", &future)],
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{method}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

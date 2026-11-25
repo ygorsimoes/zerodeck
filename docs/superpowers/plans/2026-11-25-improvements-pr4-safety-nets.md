@@ -77,7 +77,7 @@ pinned dev image; CI only calls recipes. New tools are pinned in the `Dockerfile
 - Modify: `README.md`, `docs/architecture/wire-protocol.md`, `AGENTS.md`, `SECURITY.md`, `CONTRIBUTING.md`
 
 - [ ] **Step 1: Checklist** — each item present and accurate:
-  - README: `--allow-non-loopback`/`ZERODECK_ALLOW_NON_LOOPBACK`; `developer.allow_unsafe_root_plugins` (disk-only); container examples with `-p 127.0.0.1:1337:1337`; recipes `test-privileged`, `coverage`.
+  - README: `--allow-non-loopback`/`ZERODECK_ALLOW_NON_LOOPBACK`; `--allow-unsafe-root-plugins`/`ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS` (root-only, systemd drop-in); container examples with `-p 127.0.0.1:1337:1337`; recipes `test-privileged`, `coverage`.
   - wire-protocol.md: `session` param, `failure_reason`, `PluginBlockedError`, `TooManyPendingCalls`, WS limits, static headers/304, `/fetch` 502 vs 504, bind policy.
   - AGENTS.md: graph edge server→platform, `forbid(unsafe_code)` rule, `privileged_*` test rule, new recipes in §6/§7.
   - SECURITY.md: threat model for root plugins and `PRIVILEGED_PATH`; non-loopback bind risk.

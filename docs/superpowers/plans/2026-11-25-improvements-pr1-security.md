@@ -32,7 +32,7 @@ preflight are recorded by `PluginManager` with a reason that `loader/get_plugins
 2. A `session` query value with odd characters (`../`, spaces, 200 chars) must be rejected with `400`, not keyed — test in Task 2.
 3. A `"root"` plugin reloaded by the debug watcher must go through the same preflight as startup — test in Task 4.
 4. Running the daemon as a normal user (macOS / dev) must never block a plugin for ownership — test in Task 4.
-5. `loader/set_setting` with key `developer` and an object containing `allow_unsafe_root_plugins` must be rejected like the dotted key — test in Task 4.
+5. The unsafe root plugin opt-in must come only from the daemon's command line (`--allow-unsafe-root-plugins` / `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS`); a `developer.allow_unsafe_root_plugins` key in `loader.json` must not unblock a root plugin — tests in Task 4.
 
 ---
 
@@ -148,10 +148,12 @@ preflight are recorded by `PluginManager` with a reason that `loader/get_plugins
 
 ### Task 4: Spawn preflight — root plugins in non-root-owned trees, missing Python host (S5, S4)
 
+Superseded during implementation: opt-in moved from loader.json to the daemon command line (spec S5).
+
 **Files:**
 - Create: `crates/zerodeck-platform/src/ownership.rs` (+ export in `lib.rs`)
 - Create: `crates/zerodeck-core/src/preflight.rs` (+ `mod` in `lib.rs`)
-- Modify: `crates/zerodeck-core/src/manager.rs` (all spawn paths, `PluginSummary`, `set_setting`)
+- Modify: `crates/zerodeck-core/src/manager.rs` (all spawn paths, `PluginSummary`, `set_allow_unsafe_root_plugins`)
 - Modify: `crates/zerodeck-core/src/error.rs` (new variant)
 - Modify: `crates/zerodeck-server/src/router.rs` (`serialize_plugin_summaries`, `core_error_to_ws`)
 - Modify: `crates/zerodeckd/src/main.rs` (candidate lists, Python host probe, ancestor warning)
@@ -187,17 +189,17 @@ preflight are recorded by `PluginManager` with a reason that `loader/get_plugins
   - `CoreError::PluginBlocked { name: String, reason: String }` (`#[error("plugin `{name}` cannot start: {reason}")]`); WS error name `PluginBlockedError`; legacy HTTP maps it to `503`.
   - `pub fn set_python_host_missing(&self, reason: Option<String>)`.
   - Private `async fn spawn_checked(&self, plugin: &DiscoveredPlugin) -> Result<(), CoreError>` used by `start_all` (logs and continues per plugin), `reload_plugin` (both spawn and `supervisor.reload_plugin` branches), `install_plugin`, `enable_plugin`. Success clears a recorded reason.
-  - Setting key constant `ALLOW_UNSAFE_ROOT_PLUGINS_PATH = "developer.allow_unsafe_root_plugins"`.
+  - `pub fn set_allow_unsafe_root_plugins(&self, allow: bool)`, called once by `zerodeckd` from the daemon flag `--allow-unsafe-root-plugins` / env `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS`; `loader.json` is never read for it.
 - Produces (`main.rs`): `fn python_host_candidates(exe_dir: Option<&Path>) -> Vec<PathBuf>` and `fn frontend_candidates(exe_dir: Option<&Path>) -> Vec<PathBuf>`; cwd-relative and `CARGO_MANIFEST_DIR` entries only under `#[cfg(debug_assertions)]`. `async fn probe_python_host(cfg: &PythonHostConfig) -> Option<String>` returns a reason when `python3 -c "import zerodeck_py_host"` (with the resolved `PYTHONPATH`) fails.
 
 - [ ] **Step 1: Write failing platform tests** (`ownership.rs`): `root_owned_0755_dir_and_0644_file_pass` (`check_entry` → None), `non_root_owner_is_violation` (uid 1000), `group_or_world_writable_is_violation` (`0o775`, `0o757`), `symlink_is_violation`, and `tree_owned_by_current_user_is_reported_when_not_root` (temp dir; skip assertion body if euid == 0) checking `check_root_only_tree` returns `NotRootOwned` for the temp root. `non_root_writable_ancestors_lists_user_owned_temp_dir`.
-- [ ] **Step 2: Write failing core tests** (`preflight.rs` tests): `blocks_root_plugin_with_violation_when_daemon_is_root`, `skips_tree_check_when_daemon_is_not_root` (closure panics if called), `skips_tree_check_for_non_root_plugins`, `opt_in_bypasses_tree_check`, `missing_python_host_blocks_every_backend_plugin`. Manager tests (in `crates/zerodeck-core/src/lib.rs` tests module, next to the existing manager tests): `set_setting_rejects_unsafe_root_plugins_opt_in` — both `set_setting("developer.allow_unsafe_root_plugins", true)` and `set_setting("developer", json!({"allow_unsafe_root_plugins": true}))` → `CoreError::InvalidSetting`; `set_setting("developer.allow_unverified_installs", true)` still Ok. `python_host_missing_marks_plugins_failed_with_reason` — `set_python_host_missing(Some(..))`, `start_all`, `list_plugins()` shows `Failed` + reason, no worker spawned. `debug_reload_runs_preflight` — with Python host missing, `reload_plugin` returns `PluginBlocked`.
+- [ ] **Step 2: Write failing core tests** (`preflight.rs` tests): `blocks_root_plugin_with_violation_when_daemon_is_root`, `skips_tree_check_when_daemon_is_not_root` (closure panics if called), `skips_tree_check_for_non_root_plugins`, `opt_in_bypasses_tree_check`, `missing_python_host_blocks_every_backend_plugin`. Manager tests (in `crates/zerodeck-core/src/lib.rs` tests module, next to the existing manager tests): `unsafe_root_plugins_opt_in_bypasses_tree_check` — with a root daemon assumed and `{"developer":{"allow_unsafe_root_plugins":true}}` in `loader.json`, a user-owned `"root"` plugin is still `Failed` with a reason naming the path; after `set_allow_unsafe_root_plugins(true)`, `reload_plugin` starts it and clears the reason. `python_host_missing_marks_plugins_failed_with_reason` — `set_python_host_missing(Some(..))`, `start_all`, `list_plugins()` shows `Failed` + reason, no worker spawned. `debug_reload_runs_preflight` — with Python host missing, `reload_plugin` returns `PluginBlocked`.
 - [ ] **Step 3: Write failing `main.rs` tests**: `release_candidates_exclude_cwd_and_manifest_dir` gated `#[cfg(not(debug_assertions))]` and `debug_candidates_include_repo_paths` gated `#[cfg(debug_assertions)]`, asserting on `python_host_candidates(Some(Path::new("/usr/local/bin")))` and `frontend_candidates(...)`.
-- [ ] **Step 4: Write failing privileged daemon test** `privileged_root_plugin_in_user_owned_dir_is_blocked`: as root, write a `"root"`-flagged plugin, `chown -R $ZERODECK_TEST_HOST_USER` it, start daemon, `loader/get_plugins` entry has `state` `"Failed"` and `failure_reason` containing the plugin path; stop; write `{"developer":{"allow_unsafe_root_plugins":true}}` to `settings/loader.json`; restart; entry reaches `"Running"`.
+- [ ] **Step 4: Write failing privileged daemon test** `privileged_root_plugin_in_user_owned_dir_is_blocked`: as root, write a `"root"`-flagged plugin, `chown -R $ZERODECK_TEST_HOST_USER` it, start daemon, `loader/get_plugins` entry has `state` `"Failed"` and `failure_reason` containing the plugin path; stop; write `{"developer":{"allow_unsafe_root_plugins":true}}` to `settings/loader.json`; restart; entry is still `"Failed"` (the `loader.json` key does not unblock); stop; restart with `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`; entry reaches `"Running"`.
 - [ ] **Step 5: Run to verify failure** — `just check-rust` and `just test-privileged`; Expected: FAIL.
 - [ ] **Step 6: Implement** per Interfaces. `serialize_plugin_summaries` adds `"failure_reason"` (null when none). At startup, when euid == 0, `main.rs` logs one `warn!` listing `non_root_writable_ancestors(paths.privileged_root())`. If `probe_python_host` returns a reason, `error!` once and call `manager.set_python_host_missing(Some(reason))` before `start_all`.
 - [ ] **Step 7: Run to verify pass** — `just check-rust && just test-privileged`; Expected: PASS.
-- [ ] **Step 8: Docs.** `wire-protocol.md`: `failure_reason` field on plugin summaries, `PluginBlockedError`, the opt-in key and that `set_setting` rejects it. `README.md`: note on root plugins and the developer opt-in. `SECURITY.md`: threat-model paragraph — root plugins must live in root-owned trees; `~/homebrew` ancestors are `deck`-owned on stock SteamOS (startup warning), relocation tracked as an open decision.
+- [ ] **Step 8: Docs.** `wire-protocol.md`: `failure_reason` field on plugin summaries, `PluginBlockedError`, the daemon opt-in flag/env and that `loader.json` cannot enable it. `README.md`: note on root plugins and the developer opt-in. `SECURITY.md`: threat-model paragraph — root plugins must live in root-owned trees; `~/homebrew` ancestors are `deck`-owned on stock SteamOS (startup warning), relocation tracked as an open decision.
 - [ ] **Step 9: Commit** — two commits: `fix(core): refuse to start root plugins from trees writable by non-root users` (platform + core + server + daemon privileged test + docs) and `fix(zerodeckd): drop dev-only search paths from release builds and fail plugins fast without a Python host`.
 
 ### Task 5: Duplicate plugin names (S6)

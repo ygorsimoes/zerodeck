@@ -274,7 +274,8 @@ headers, bind policy), `AGENTS.md` (new recipes, privileged job, `forbid(unsafe_
   (a) keep `~/homebrew/plugins` (Decky-compatible) with S5's ownership fix + warning; (b) move
   `PRIVILEGED_PATH` to a root-owned location such as `/var/lib/zerodeck` and keep a compatibility
   symlink. This design implements (a) plus the per-spawn root check in S5; (b) is a separate
-  decision for Phase 4's installer.
+  decision for Phase 4's installer. Crash restarts by the worker supervisor (with backoff) re-exec
+  the plugin without re-running the S5 check; closing that belongs to this decision too.
 
 ## Left to the builder
 

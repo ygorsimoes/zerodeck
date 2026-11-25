@@ -1,9 +1,11 @@
+use std::error::Error as StdError;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, LOCATION,
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderName, LOCATION,
     PROXY_AUTHORIZATION, TRANSFER_ENCODING, WWW_AUTHENTICATE,
 };
 use reqwest::{Body, Client, ClientBuilder, Method, Response, StatusCode, redirect};
@@ -25,9 +27,52 @@ pub type ValidatedResponse = Response;
 /// targets and redirect hops.
 #[derive(Debug, Clone, Default)]
 pub struct OutboundHttpPolicy {
+    allow_loopback_for_tests: bool,
     allowed_loopback_ports: Vec<u16>,
     connect_timeout: Option<Duration>,
     response_timeout: Option<Duration>,
+    user_agent: Option<String>,
+}
+
+/// Pooled [`reqwest::Client`] paired with the [`OutboundHttpPolicy`] enforced on its DNS resolver,
+/// redirect policy, and proxy configuration.
+#[derive(Debug, Clone)]
+pub struct CheckedHttpClient {
+    inner: Client,
+    policy: OutboundHttpPolicy,
+}
+
+impl CheckedHttpClient {
+    /// Builds a [`CheckedHttpClient`] using `policy`'s defaults (`redirect::Policy::none()`,
+    /// `.no_proxy()`, [`PolicyDnsResolver`], and any configured timeouts or user agent).
+    pub fn new(policy: OutboundHttpPolicy) -> Result<Self, CoreError> {
+        Self::from_builder(policy, Client::builder())
+    }
+
+    /// Builds a [`CheckedHttpClient`] from a caller-supplied [`reqwest::ClientBuilder`], layering
+    /// `policy`'s mandatory redirect, no-proxy, DNS guard, and optional timeout/user-agent config.
+    pub fn from_builder(
+        policy: OutboundHttpPolicy,
+        builder: ClientBuilder,
+    ) -> Result<Self, CoreError> {
+        let inner = policy
+            .configure_client_builder(builder)
+            .build()
+            .map_err(|err| CoreError::HttpRequest(format!("failed to build HTTP client: {err}")))?;
+        Ok(Self { inner, policy })
+    }
+
+    /// Underlying pooled [`reqwest::Client`].
+    #[must_use]
+    pub fn inner(&self) -> &Client {
+        &self.inner
+    }
+
+    /// Outbound SSRF policy bound to this client.
+    #[must_use]
+    pub fn policy(&self) -> &OutboundHttpPolicy {
+        &self.policy
+    }
 }
 
 impl OutboundHttpPolicy {
@@ -38,15 +83,25 @@ impl OutboundHttpPolicy {
         Self::default()
     }
 
+    /// Test-only helper enabling or disabling loopback access across all ports while keeping
+    /// metadata, unspecified, multicast, and non-HTTP scheme blocks intact.
+    #[must_use]
+    pub fn with_allow_loopback_for_tests(mut self, allow: bool) -> Self {
+        self.allow_loopback_for_tests = allow;
+        self
+    }
+
     /// Test-only policy permitting loopback connections exclusively to the listed local ports
     /// (for example, an ephemeral mock HTTP server bound on `127.0.0.1:0`), while still blocking
     /// all other loopback ports (such as `:1337` or `:8080`), metadata IPs, and non-HTTP schemes.
     #[must_use]
     pub fn for_loopback_ports_for_testing(ports: Vec<u16>) -> Self {
         Self {
+            allow_loopback_for_tests: false,
             allowed_loopback_ports: ports,
             connect_timeout: None,
             response_timeout: None,
+            user_agent: None,
         }
     }
 
@@ -62,10 +117,24 @@ impl OutboundHttpPolicy {
         self
     }
 
+    /// Configures a `User-Agent` header applied when building HTTP clients.
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = Some(user_agent.into());
+        self
+    }
+
     /// Returns a [`reqwest::ClientBuilder`] pre-configured with no automatic redirects, no system
-    /// proxy bypasses, and a DNS resolver enforcing this policy.
+    /// proxy bypasses, a DNS resolver enforcing this policy, and any configured timeouts or user
+    /// agent.
     pub fn client_builder(&self) -> ClientBuilder {
-        let mut builder = Client::builder()
+        self.configure_client_builder(Client::builder())
+    }
+
+    /// Applies this policy's mandatory redirect, no-proxy, and DNS safeguards (plus any configured
+    /// timeouts or user agent) to an existing [`reqwest::ClientBuilder`].
+    pub fn configure_client_builder(&self, builder: ClientBuilder) -> ClientBuilder {
+        let mut builder = builder
             .redirect(redirect::Policy::none())
             .no_proxy()
             .dns_resolver(Arc::new(PolicyDnsResolver {
@@ -76,6 +145,9 @@ impl OutboundHttpPolicy {
         }
         if let Some(response) = self.response_timeout {
             builder = builder.timeout(response);
+        }
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.user_agent(user_agent);
         }
         builder
     }
@@ -88,7 +160,16 @@ impl OutboundHttpPolicy {
             .map_err(|err| CoreError::HttpRequest(format!("failed to build HTTP client: {err}")))
     }
 
-    /// Validates an IP address against the production SSRF blocklist (always rejects loopback).
+    /// Builds a pooled [`CheckedHttpClient`] enforcing this policy.
+    pub fn build_checked_client(&self) -> Result<CheckedHttpClient, CoreError> {
+        let inner = self.build_client()?;
+        Ok(CheckedHttpClient {
+            inner,
+            policy: self.clone(),
+        })
+    }
+
+    /// Validates an IP address against this policy's SSRF blocklist.
     pub fn validate_ip(&self, ip: IpAddr) -> Result<(), CoreError> {
         self.validate_ip_inner(ip, None)
     }
@@ -126,7 +207,8 @@ impl OutboundHttpPolicy {
     }
 
     fn allows_loopback_port(&self, port: Option<u16>) -> bool {
-        port.is_some_and(|p| self.allowed_loopback_ports.contains(&p))
+        self.allow_loopback_for_tests
+            || port.is_some_and(|p| self.allowed_loopback_ports.contains(&p))
     }
 
     fn validate_parsed_url(&self, url: &Url) -> Result<u16, CoreError> {
@@ -237,45 +319,41 @@ impl OutboundHttpPolicy {
         Ok(())
     }
 
-    async fn resolve_and_pin_hop(
-        &self,
-        url: &Url,
-    ) -> Result<Option<(String, Vec<SocketAddr>)>, CoreError> {
-        let port = self.validate_parsed_url(url)?;
-        match url.host() {
-            Some(Host::Ipv4(v4)) => {
-                self.validate_ip_for_port(IpAddr::V4(v4), port)?;
-                Ok(None)
-            }
-            Some(Host::Ipv6(v6)) => {
-                self.validate_ip_for_port(IpAddr::V6(v6), port)?;
-                Ok(None)
-            }
-            Some(Host::Domain(domain)) => {
-                let addrs: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
-                    .await
-                    .map_err(|err| {
-                        CoreError::HttpRequest(format!(
-                            "DNS resolution failed for `{domain}`: {err}"
-                        ))
-                    })?
-                    .collect();
-                if addrs.is_empty() {
-                    return Err(CoreError::HttpPolicy(format!(
-                        "DNS resolution returned no addresses for `{domain}`"
-                    )));
-                }
-                for addr in &addrs {
-                    self.validate_ip_for_port(addr.ip(), port)?;
-                }
-                Ok(Some((domain.to_owned(), addrs)))
-            }
-            None => Err(CoreError::HttpPolicy(format!(
-                "outbound URL `{url}` has no host"
-            ))),
+    async fn precheck_domain_for_port(&self, url: &Url) -> Result<(), CoreError> {
+        if self.allow_loopback_for_tests || self.allowed_loopback_ports.is_empty() {
+            return Ok(());
         }
+        let port = self.validate_parsed_url(url)?;
+        if let Some(Host::Domain(domain)) = url.host() {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|err| {
+                    CoreError::HttpRequest(format!("DNS resolution failed for `{domain}`: {err}"))
+                })?
+                .collect();
+            if addrs.is_empty() {
+                return Err(CoreError::HttpPolicy(format!(
+                    "DNS resolution returned no addresses for `{domain}`"
+                )));
+            }
+            for addr in &addrs {
+                self.validate_ip_for_port(addr.ip(), port)?;
+            }
+        }
+        Ok(())
     }
 }
+
+#[derive(Debug)]
+struct BlockedByDnsPolicy(String);
+
+impl fmt::Display for BlockedByDnsPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl StdError for BlockedByDnsPolicy {}
 
 #[derive(Debug)]
 struct PolicyDnsResolver {
@@ -290,11 +368,9 @@ impl reqwest::dns::Resolve for PolicyDnsResolver {
             let addrs: Vec<SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
             if addrs.is_empty() {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::AddrNotAvailable,
-                    format!("DNS resolution returned no addresses for `{host}`"),
-                ))
-                    as Box<dyn std::error::Error + Send + Sync>);
+                return Err(Box::new(BlockedByDnsPolicy(format!(
+                    "DNS resolution returned no addresses for `{host}`"
+                ))) as Box<dyn StdError + Send + Sync>);
             }
             for addr in &addrs {
                 let allowed =
@@ -304,11 +380,8 @@ impl reqwest::dns::Resolve for PolicyDnsResolver {
                         policy.validate_ip(addr.ip())
                     };
                 if let Err(err) = allowed {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        err.to_string(),
-                    ))
-                        as Box<dyn std::error::Error + Send + Sync>);
+                    return Err(Box::new(BlockedByDnsPolicy(err.to_string()))
+                        as Box<dyn StdError + Send + Sync>);
                 }
             }
             let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
@@ -317,45 +390,44 @@ impl reqwest::dns::Resolve for PolicyDnsResolver {
     }
 }
 
-/// Validates and dispatches an outbound HTTP request while enforcing `policy` across DNS
-/// resolution and up to `max_redirects` HTTP redirect hops.
+/// Validates and dispatches an outbound HTTP request using a pooled [`CheckedHttpClient`],
+/// enforcing its [`OutboundHttpPolicy`] across DNS resolution and up to `max_redirects` redirect
+/// hops.
 ///
-/// Each hop resolves DNS ahead of connecting, validates every resolved IP against `policy`, pins
-/// the validated addresses on a `reqwest::ClientBuilder` configured with
-/// [`redirect::Policy::none()`] and `.no_proxy()`, and re-validates every `Location` target before
-/// issuing the next hop.
+/// The wrapped [`reqwest::Client`] disables automatic redirects and system proxies and uses
+/// [`PolicyDnsResolver`] so resolved IPs are validated at connect time while preserving connection
+/// pooling, configured timeouts, and user agent. Each redirect `Location` is validated before
+/// issuing the next hop, and sensitive headers (including `Host`) are stripped on cross-origin
+/// redirects.
 pub async fn send_checked_request(
-    client: &Client,
-    policy: &OutboundHttpPolicy,
+    client: &CheckedHttpClient,
     mut method: Method,
     url: &str,
     mut headers: HeaderMap,
     mut body: Option<Body>,
     max_redirects: usize,
 ) -> Result<ValidatedResponse, CoreError> {
-    let _ = client;
+    let policy = client.policy();
     let mut current_url = policy.validate_url(url)?;
     let mut had_body = body.is_some();
     let mut reusable_body = body.as_ref().and_then(|b| b.as_bytes().map(<[u8]>::to_vec));
 
     for hop in 0..=max_redirects {
-        let pinned = policy.resolve_and_pin_hop(&current_url).await?;
-        let mut builder = policy.client_builder();
-        if let Some((domain, addrs)) = &pinned {
-            builder = builder.resolve_to_addrs(domain, addrs);
-        }
-        let hop_client = builder.build().map_err(|err| {
-            CoreError::HttpRequest(format!("failed to build hop HTTP client: {err}"))
-        })?;
+        policy.validate_parsed_url(&current_url)?;
+        policy.precheck_domain_for_port(&current_url).await?;
 
-        let mut req_builder = hop_client.request(method.clone(), current_url.clone());
+        let mut req_builder = client.inner().request(method.clone(), current_url.clone());
         req_builder = req_builder.headers(headers.clone());
         if let Some(req_body) = body.take() {
             req_builder = req_builder.body(req_body);
         }
 
         let response = req_builder.send().await.map_err(|err| {
-            CoreError::HttpRequest(format!("request to `{current_url}` failed: {err}"))
+            if let Some(msg) = extract_dns_policy_block(&err) {
+                CoreError::HttpPolicy(msg)
+            } else {
+                CoreError::HttpRequest(format!("request to `{current_url}` failed: {err}"))
+            }
         })?;
 
         let status = response.status();
@@ -420,6 +492,17 @@ pub async fn send_checked_request(
     )))
 }
 
+fn extract_dns_policy_block(err: &(dyn StdError + 'static)) -> Option<String> {
+    let mut cur: Option<&(dyn StdError + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(blocked) = e.downcast_ref::<BlockedByDnsPolicy>() {
+            return Some(blocked.0.clone());
+        }
+        cur = e.source();
+    }
+    None
+}
+
 fn is_localhost_domain(normalized: &str) -> bool {
     normalized == "localhost" || normalized.ends_with(".localhost")
 }
@@ -445,6 +528,7 @@ fn strip_sensitive_headers(headers: &mut HeaderMap) {
     headers.remove(AUTHORIZATION);
     headers.remove(COOKIE);
     headers.remove(HeaderName::from_static("cookie2"));
+    headers.remove(HOST);
     headers.remove(PROXY_AUTHORIZATION);
     headers.remove(WWW_AUTHENTICATE);
 }
@@ -465,5 +549,29 @@ fn clone_body_for_redirect(
         (true, None) => Err(CoreError::HttpRequest(
             "cannot replay streaming request body across HTTP redirect".to_owned(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::dns::Resolve;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn policy_dns_resolver_blocks_localhost_in_production_mode() {
+        let resolver = PolicyDnsResolver {
+            policy: OutboundHttpPolicy::production(),
+        };
+        let name: reqwest::dns::Name = "localhost".parse().expect("valid dns name");
+        let err = resolver
+            .resolve(name)
+            .await
+            .err()
+            .expect("production DNS resolver must reject localhost IP");
+        assert!(
+            extract_dns_policy_block(err.as_ref()).is_some(),
+            "expected BlockedByDnsPolicy error, got {err}"
+        );
     }
 }

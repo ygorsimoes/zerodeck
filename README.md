@@ -178,6 +178,12 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | | `PYTHONPATH` | auto-detected | Override search path containing `zerodeck_py_host` |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
+Without `ZERODECK_FRONTEND_DIR` / `PYTHONPATH`, the frontend and `zerodeck_py_host` are searched
+in `/opt/zerodeck/{frontend,python}` and next to the binary (`<exe>/../{frontend,python}`). Debug builds also try the working directory
+and the source tree; release builds never do, because those can be writable by a non-root user. If
+`zerodeck_py_host` cannot be imported, the daemon still starts and serves the UI, logs one error,
+and every backend plugin shows as `Failed` with the reason in `failure_reason`.
+
 Plugins flagged `"root"` keep root privileges, so a root daemon only starts them from a tree that
 only root can modify: `plugins/` and every file and directory of the plugin must be owned by root,
 must not be group- or world-writable, and must not be symlinks. Store installs already produce such

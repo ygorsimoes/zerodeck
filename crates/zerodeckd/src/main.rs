@@ -1,11 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use zerodeck_cef::CefConfig;
 use zerodeck_core::{
@@ -54,6 +56,102 @@ fn init_tracing() {
         .init();
 }
 
+/// Directories searched for `zerodeck_py_host`, in order. Release builds only look at install
+/// locations: the working directory (`~/homebrew/services` under systemd) and the build tree may be
+/// writable by the unprivileged user, and root plugins import this module.
+fn python_host_candidates(exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    install_candidates(exe_dir, "python", "hosts/python")
+}
+
+/// Directories searched for the `@zerodeck/frontend` bundle, in order (same policy as
+/// [`python_host_candidates`]).
+fn frontend_candidates(exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    install_candidates(exe_dir, "frontend", "frontend/dist")
+}
+
+fn install_candidates(exe_dir: Option<&Path>, installed: &str, repo: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![Path::new("/opt/zerodeck").join(installed)];
+    if let Some(dir) = exe_dir {
+        candidates.push(dir.join("..").join(installed));
+    }
+    #[cfg(debug_assertions)]
+    {
+        candidates.push(PathBuf::from(repo));
+        candidates.push(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(repo),
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = repo;
+    candidates
+}
+
+fn current_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
+
+const PYTHON_HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Returns why `python3 -c "import zerodeck_py_host"` fails with the resolved `PYTHONPATH`, or
+/// `None` when the worker host is importable.
+async fn probe_python_host(cfg: &PythonHostConfig) -> Option<String> {
+    let python = &cfg.python_bin;
+    let python_path = cfg
+        .host_module_path
+        .clone()
+        .or_else(|| std::env::var("PYTHONPATH").ok().filter(|v| !v.is_empty()));
+    let mut cmd = tokio::process::Command::new(python);
+    cmd.args(["-c", "import zerodeck_py_host"])
+        .env_clear()
+        // `-c` puts the working directory on `sys.path`: probe from `/` so a planted module in a
+        // user-writable working directory is never imported by a root daemon.
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(path) = std::env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(path) = &python_path {
+        cmd.env("PYTHONPATH", path);
+    }
+    let shown_path = python_path.as_deref().unwrap_or("<unset>");
+
+    let output = match tokio::time::timeout(PYTHON_HOST_PROBE_TIMEOUT, cmd.output()).await {
+        Err(_) => {
+            return Some(format!(
+                "`{python} -c \"import zerodeck_py_host\"` did not finish within \
+                 {PYTHON_HOST_PROBE_TIMEOUT:?} (PYTHONPATH={shown_path})"
+            ));
+        }
+        Ok(Err(err)) => {
+            return Some(format!(
+                "cannot run `{python}` for the Python worker host: {err}"
+            ));
+        }
+        Ok(Ok(output)) => output,
+    };
+    if output.status.success() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no error output");
+    Some(format!(
+        "the Python worker host `zerodeck_py_host` is not importable by `{python}` \
+         (PYTHONPATH={shown_path}): {detail}"
+    ))
+}
+
 /// Resolves the `zerodeck_py_host` module search path from `PYTHONPATH` or standard install/repo
 /// locations.
 fn resolve_python_host_path() -> Option<String> {
@@ -63,16 +161,7 @@ fn resolve_python_host_path() -> Option<String> {
         return Some(env_path);
     }
 
-    let mut candidates = vec![PathBuf::from("/opt/zerodeck/python")];
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        candidates.push(parent.join("../python"));
-    }
-    candidates.push(PathBuf::from("hosts/python"));
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hosts/python"));
-
-    candidates
+    python_host_candidates(current_exe_dir().as_deref())
         .into_iter()
         .find(|dir| dir.join("zerodeck_py_host").is_dir())
         .map(|dir| dir.canonicalize().unwrap_or(dir).display().to_string())
@@ -92,16 +181,7 @@ fn resolve_frontend_path() -> Option<PathBuf> {
         return None;
     }
 
-    let mut candidates = vec![PathBuf::from("/opt/zerodeck/frontend")];
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        candidates.push(parent.join("../frontend"));
-    }
-    candidates.push(PathBuf::from("frontend/dist"));
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/dist"));
-
-    candidates
+    frontend_candidates(current_exe_dir().as_deref())
         .into_iter()
         .find(|dir| dir.is_dir())
         .map(|dir| dir.canonicalize().unwrap_or(dir))
@@ -252,6 +332,7 @@ async fn run_daemon(
         host_module_path: resolve_python_host_path(),
         ..PythonHostConfig::default()
     };
+    let python_host_missing = probe_python_host(&python_host).await;
     let config = ServerConfig {
         host: cli.host,
         port: cli.port,
@@ -288,6 +369,10 @@ async fn run_daemon(
         )
         .context("initialize plugin manager")?,
     );
+    if let Some(reason) = python_host_missing {
+        error!(reason = %reason, "Python worker host unavailable; backend plugins will not start");
+        manager.set_python_host_missing(Some(reason));
+    }
     if let Err(err) = manager.start_all().await {
         warn!(error = %err, "one or more plugins failed during startup");
     }
@@ -369,6 +454,89 @@ mod tests {
         list.iter()
             .map(|a| a.parse().expect("socket addr"))
             .collect()
+    }
+
+    const EXE_DIR: &str = "/usr/local/bin";
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_candidates_exclude_cwd_and_manifest_dir() {
+        let exe_dir = Path::new(EXE_DIR);
+        assert_eq!(
+            python_host_candidates(Some(exe_dir)),
+            vec![
+                PathBuf::from("/opt/zerodeck/python"),
+                exe_dir.join("../python")
+            ]
+        );
+        assert_eq!(
+            frontend_candidates(Some(exe_dir)),
+            vec![
+                PathBuf::from("/opt/zerodeck/frontend"),
+                exe_dir.join("../frontend")
+            ]
+        );
+        assert_eq!(
+            python_host_candidates(None),
+            vec![PathBuf::from("/opt/zerodeck/python")]
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_candidates_include_repo_paths() {
+        let exe_dir = Path::new(EXE_DIR);
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            python_host_candidates(Some(exe_dir)),
+            vec![
+                PathBuf::from("/opt/zerodeck/python"),
+                exe_dir.join("../python"),
+                PathBuf::from("hosts/python"),
+                manifest_dir.join("../../hosts/python"),
+            ]
+        );
+        assert_eq!(
+            frontend_candidates(Some(exe_dir)),
+            vec![
+                PathBuf::from("/opt/zerodeck/frontend"),
+                exe_dir.join("../frontend"),
+                PathBuf::from("frontend/dist"),
+                manifest_dir.join("../../frontend/dist"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_python_host_accepts_importable_host() {
+        let host = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hosts/python");
+        let cfg = PythonHostConfig {
+            host_module_path: Some(host.display().to_string()),
+            ..PythonHostConfig::default()
+        };
+        assert_eq!(probe_python_host(&cfg).await, None);
+    }
+
+    #[tokio::test]
+    async fn probe_python_host_reports_why_it_fails() {
+        let missing_module = PythonHostConfig {
+            host_module_path: Some("/nonexistent/zerodeck/python".to_owned()),
+            ..PythonHostConfig::default()
+        };
+        let reason = probe_python_host(&missing_module)
+            .await
+            .expect("module outside PYTHONPATH is missing");
+        assert!(reason.contains("zerodeck_py_host"), "{reason}");
+        assert!(reason.contains("/nonexistent/zerodeck/python"), "{reason}");
+
+        let missing_python = PythonHostConfig {
+            python_bin: "/nonexistent/python3".to_owned(),
+            host_module_path: None,
+        };
+        let reason = probe_python_host(&missing_python)
+            .await
+            .expect("missing interpreter");
+        assert!(reason.contains("/nonexistent/python3"), "{reason}");
     }
 
     #[test]

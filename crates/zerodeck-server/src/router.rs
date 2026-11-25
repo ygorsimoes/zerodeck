@@ -499,7 +499,7 @@ fn core_file_error_response(err: &CoreError) -> Response {
                 StdError::source(plat).and_then(|s| s.downcast_ref::<std::io::Error>())
             {
                 io_error_status(io_err).into_response()
-            } else if plat.to_string().contains("escapes allowed root") {
+            } else if err.is_path_escape() {
                 (StatusCode::FORBIDDEN, "Forbidden").into_response()
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
@@ -1461,9 +1461,7 @@ fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
             format!("invalid method `{method}`"),
             None,
         ),
-        CoreError::Platform(ref plat) if plat.to_string().contains("escapes allowed root") => {
-            ws_error(id, "PathEscapeError", err.to_string(), None)
-        }
+        e if e.is_path_escape() => ws_error(id, "PathEscapeError", e.to_string(), None),
         CoreError::MissingSha256 => ws_error(id, "MissingSha256Error", err.to_string(), None),
         CoreError::Sha256Mismatch { .. } => {
             ws_error(id, "Sha256MismatchError", err.to_string(), None)

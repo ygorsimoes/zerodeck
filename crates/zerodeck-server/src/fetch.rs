@@ -14,23 +14,6 @@ const MAX_FETCH_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const DECKY_HEADER_PREFIX: &str = "x-decky-header-";
 const EXCLUDED_HEADERS_KEY: &str = "x-decky-fetch-excluded-headers";
 
-const DEFAULT_STRIPPED_REQUEST_HEADERS: &[&str] = &[
-    "host",
-    "x-decky-auth",
-    "x-decky-fetch-excluded-headers",
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-    "accept-encoding",
-    "cookie",
-];
-
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -41,6 +24,19 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+const BLOCKED_TRANSLATED_HEADERS: &[&str] =
+    &["host", "x-decky-auth", "content-length", "accept-encoding"];
+
+const RAW_ONLY_STRIPPED_HEADERS: &[&str] = &["x-decky-fetch-excluded-headers", "cookie"];
+
+fn default_stripped_request_headers() -> impl Iterator<Item = &'static str> {
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .chain(BLOCKED_TRANSLATED_HEADERS.iter())
+        .chain(RAW_ONLY_STRIPPED_HEADERS.iter())
+        .copied()
+}
 
 /// Streaming CORS proxy handler for `ANY /fetch?fetch_url=<url>`.
 pub async fn handle_fetch(
@@ -125,9 +121,8 @@ fn connection_token_set(headers: &HeaderMap) -> HashSet<String> {
 }
 
 fn build_upstream_headers(incoming: &HeaderMap) -> ReqwestHeaderMap {
-    let mut excluded: HashSet<String> = DEFAULT_STRIPPED_REQUEST_HEADERS
-        .iter()
-        .map(|s| (*s).to_owned())
+    let mut excluded: HashSet<String> = default_stripped_request_headers()
+        .map(str::to_owned)
         .collect();
     excluded.extend(connection_token_set(incoming));
 
@@ -181,10 +176,7 @@ fn build_upstream_headers(incoming: &HeaderMap) -> ReqwestHeaderMap {
 }
 
 fn is_blocked_translated_header(lower_name: &str) -> bool {
-    matches!(
-        lower_name,
-        "host" | "connection" | "content-length" | "transfer-encoding" | "accept-encoding"
-    )
+    HOP_BY_HOP_HEADERS.contains(&lower_name) || BLOCKED_TRANSLATED_HEADERS.contains(&lower_name)
 }
 
 fn stream_upstream_response(upstream: reqwest::Response) -> Response {
@@ -228,4 +220,73 @@ fn connection_token_set_reqwest(headers: &ReqwestHeaderMap) -> HashSet<String> {
         }
     }
     set
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    use super::build_upstream_headers;
+
+    #[test]
+    fn translated_headers_block_hop_by_hop_auth_and_framing_headers() {
+        let mut incoming = HeaderMap::new();
+        for (name, value) in [
+            ("X-Decky-Header-Host", "evil.example"),
+            ("X-Decky-Header-X-Decky-Auth", "secret-token"),
+            ("X-Decky-Header-Connection", "keep-alive"),
+            ("X-Decky-Header-Keep-Alive", "timeout=5"),
+            ("X-Decky-Header-Proxy-Authenticate", "Basic"),
+            ("X-Decky-Header-Proxy-Authorization", "Basic abc"),
+            ("X-Decky-Header-TE", "trailers"),
+            ("X-Decky-Header-Trailers", "X-Checksum"),
+            ("X-Decky-Header-Transfer-Encoding", "chunked"),
+            ("X-Decky-Header-Upgrade", "websocket"),
+            ("X-Decky-Header-Content-Length", "999"),
+            ("X-Decky-Header-Accept-Encoding", "gzip"),
+            ("X-Decky-Header-User-Agent", "ZeroDeckTest/1.0"),
+            ("X-Decky-Header-X-Custom", "allowed"),
+            ("X-Decky-Header-Cookie", "session=ok"),
+        ] {
+            incoming.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+
+        let upstream = build_upstream_headers(&incoming);
+
+        for blocked in [
+            "host",
+            "x-decky-auth",
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "transfer-encoding",
+            "upgrade",
+            "content-length",
+            "accept-encoding",
+        ] {
+            assert!(
+                upstream.get(blocked).is_none(),
+                "expected blocked translated header `{blocked}` to be stripped"
+            );
+        }
+
+        assert_eq!(
+            upstream.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("ZeroDeckTest/1.0")
+        );
+        assert_eq!(
+            upstream.get("x-custom").and_then(|v| v.to_str().ok()),
+            Some("allowed")
+        );
+        assert_eq!(
+            upstream.get("cookie").and_then(|v| v.to_str().ok()),
+            Some("session=ok")
+        );
+    }
 }

@@ -230,3 +230,231 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::sync::Notify;
+    use zerodeck_protocol::{WsCallPayload, WsServerMessage};
+
+    use super::WsSyncCache;
+
+    fn call_payload(id: u64) -> WsCallPayload {
+        WsCallPayload {
+            id,
+            route: "utilities/ping".to_owned(),
+            args: vec![json!(id)],
+        }
+    }
+
+    fn reply_frame(id: u64, tag: &str) -> WsServerMessage {
+        WsServerMessage::Reply {
+            id,
+            result: json!(tag),
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_eviction_drops_oldest_completed_and_preserves_in_flight() {
+        let cache = Arc::new(WsSyncCache::new(2, Duration::from_secs(60)));
+        let leader_started = Arc::new(Notify::new());
+        let leader_release = Arc::new(Notify::new());
+        let leader_runs = Arc::new(AtomicUsize::new(0));
+
+        let leader_handle = {
+            let cache = Arc::clone(&cache);
+            let started = Arc::clone(&leader_started);
+            let release = Arc::clone(&leader_release);
+            let runs = Arc::clone(&leader_runs);
+            tokio::spawn(async move {
+                cache
+                    .execute(call_payload(100), move |c| async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        release.notified().await;
+                        reply_frame(c.id, "in-flight-ok")
+                    })
+                    .await
+            })
+        };
+
+        leader_started.notified().await;
+
+        let waiter_runs = Arc::new(AtomicUsize::new(0));
+        let waiter_handle = {
+            let cache = Arc::clone(&cache);
+            let runs = Arc::clone(&waiter_runs);
+            tokio::spawn(async move {
+                cache
+                    .execute(call_payload(100), move |c| async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        reply_frame(c.id, "unexpected-waiter-run")
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // Insert capacity + 1 (3) completed entries while call 100 remains InFlight.
+        let completed_runs = Arc::new(AtomicUsize::new(0));
+        for id in 1..=3 {
+            let runs = Arc::clone(&completed_runs);
+            let frame = Arc::clone(&cache)
+                .execute(call_payload(id), move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "first")
+                })
+                .await;
+            assert_eq!(frame, reply_frame(id, "first"));
+        }
+        assert_eq!(completed_runs.load(Ordering::SeqCst), 3);
+
+        // Entries 2 and 3 remain cached; entry 1 (oldest seq) was evicted.
+        for id in [2, 3] {
+            let runs = Arc::clone(&completed_runs);
+            let frame = Arc::clone(&cache)
+                .execute(call_payload(id), move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "re-executed")
+                })
+                .await;
+            assert_eq!(frame, reply_frame(id, "first"));
+        }
+        assert_eq!(completed_runs.load(Ordering::SeqCst), 3);
+
+        let re_run = Arc::clone(&cache)
+            .execute(call_payload(1), {
+                let runs = Arc::clone(&completed_runs);
+                move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "re-executed")
+                }
+            })
+            .await;
+        assert_eq!(re_run, reply_frame(1, "re-executed"));
+        assert_eq!(completed_runs.load(Ordering::SeqCst), 4);
+
+        // InFlight entry 100 was never evicted; releasing it wakes both leader and waiter.
+        leader_release.notify_one();
+        let leader_frame = leader_handle.await.expect("leader join");
+        let waiter_frame = waiter_handle.await.expect("waiter join");
+        assert_eq!(leader_frame, reply_frame(100, "in-flight-ok"));
+        assert_eq!(waiter_frame, reply_frame(100, "in-flight-ok"));
+        assert_eq!(leader_runs.load(Ordering::SeqCst), 1);
+        assert_eq!(waiter_runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_drops_completed_entries_while_notifying_in_flight_waiters() {
+        let cache = Arc::new(WsSyncCache::new(0, Duration::from_secs(60)));
+        let leader_started = Arc::new(Notify::new());
+        let leader_release = Arc::new(Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let leader_handle = {
+            let cache = Arc::clone(&cache);
+            let started = Arc::clone(&leader_started);
+            let release = Arc::clone(&leader_release);
+            let runs = Arc::clone(&runs);
+            tokio::spawn(async move {
+                cache
+                    .execute(call_payload(7), move |c| async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        release.notified().await;
+                        reply_frame(c.id, "run-1")
+                    })
+                    .await
+            })
+        };
+
+        leader_started.notified().await;
+
+        let waiter_handle = {
+            let cache = Arc::clone(&cache);
+            let runs = Arc::clone(&runs);
+            tokio::spawn(async move {
+                cache
+                    .execute(call_payload(7), move |c| async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        reply_frame(c.id, "unexpected")
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        leader_release.notify_one();
+        assert_eq!(
+            leader_handle.await.expect("leader"),
+            reply_frame(7, "run-1")
+        );
+        assert_eq!(
+            waiter_handle.await.expect("waiter"),
+            reply_frame(7, "run-1")
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Completed entry must not be retained when capacity == 0.
+        let second = Arc::clone(&cache)
+            .execute(call_payload(7), {
+                let runs = Arc::clone(&runs);
+                move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "run-2")
+                }
+            })
+            .await;
+        assert_eq!(second, reply_frame(7, "run-2"));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn expired_entries_are_pruned_and_re_executed_after_ttl() {
+        let cache = Arc::new(WsSyncCache::new(8, Duration::from_millis(80)));
+        let runs = Arc::new(AtomicUsize::new(0));
+
+        let first = Arc::clone(&cache)
+            .execute(call_payload(42), {
+                let runs = Arc::clone(&runs);
+                move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "fresh-1")
+                }
+            })
+            .await;
+        assert_eq!(first, reply_frame(42, "fresh-1"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Before TTL expires, the cached frame is returned.
+        let cached = Arc::clone(&cache)
+            .execute(call_payload(42), {
+                let runs = Arc::clone(&runs);
+                move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "should-not-run")
+                }
+            })
+            .await;
+        assert_eq!(cached, reply_frame(42, "fresh-1"));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let after_ttl = Arc::clone(&cache)
+            .execute(call_payload(42), {
+                let runs = Arc::clone(&runs);
+                move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "fresh-2")
+                }
+            })
+            .await;
+        assert_eq!(after_ttl, reply_frame(42, "fresh-2"));
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+}

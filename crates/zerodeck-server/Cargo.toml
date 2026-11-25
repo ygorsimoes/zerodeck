@@ -12,7 +12,6 @@ workspace = true
 
 [dependencies]
 axum.workspace = true
-futures-util.workspace = true
 percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -31,6 +30,7 @@ zerodeck-plugin-host.workspace = true
 zerodeck-protocol.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 hex.workspace = true
 sha2.workspace = true
 tokio-tungstenite.workspace = true

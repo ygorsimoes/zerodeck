@@ -453,6 +453,25 @@ mod tests {
                 }),
             )
             .route(
+                "/echo-headers",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let hdr = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned)
+                    };
+                    axum::Json(serde_json::json!({
+                        "upgrade": hdr("upgrade"),
+                        "te": hdr("te"),
+                        "keep_alive": hdr("keep-alive"),
+                        "proxy_authorization": hdr("proxy-authorization"),
+                        "x_decky_auth": hdr("x-decky-auth"),
+                        "user_agent": hdr("user-agent"),
+                    }))
+                }),
+            )
+            .route(
                 "/redirect-loopback",
                 get(|| async {
                     axum::response::Response::builder()
@@ -569,6 +588,54 @@ mod tests {
             let (st, _, _) = call_get(&app, "GET", &invalid).await;
             assert_eq!(st, StatusCode::BAD_REQUEST, "{invalid}");
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_blocks_hop_by_hop_and_auth_translated_headers() {
+        let mock_addr = spawn_mock_upstream().await;
+        let policy = zerodeck_core::OutboundHttpPolicy::for_loopback_ports_for_testing(vec![
+            mock_addr.port(),
+        ]);
+        let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
+        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let token = state.csrf_token().to_owned();
+        let app = build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/fetch?fetch_url=http://127.0.0.1:{}/echo-headers",
+                        mock_addr.port()
+                    ))
+                    .header("X-Decky-Auth", &token)
+                    .header("X-Decky-Header-Upgrade", "websocket")
+                    .header("X-Decky-Header-TE", "trailers")
+                    .header("X-Decky-Header-Keep-Alive", "timeout=5")
+                    .header("X-Decky-Header-Proxy-Authorization", "Basic secret")
+                    .header("X-Decky-Header-X-Decky-Auth", "forged-token")
+                    .header("X-Decky-Header-User-Agent", "ZeroDeckFetch/1.0")
+                    .body(Body::empty())
+                    .expect("fetch req"),
+            )
+            .await
+            .expect("fetch resp");
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), 16 * 1024).await.unwrap())
+                .expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "upgrade": null,
+                "te": null,
+                "keep_alive": null,
+                "proxy_authorization": null,
+                "x_decky_auth": null,
+                "user_agent": "ZeroDeckFetch/1.0",
+            })
+        );
     }
 
     mod ws {

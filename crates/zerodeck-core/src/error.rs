@@ -115,3 +115,35 @@ pub enum CoreError {
     #[error("debug watcher error: {0}")]
     Watcher(String),
 }
+
+impl CoreError {
+    /// Returns `true` if this error represents a path-jail escape attempt.
+    #[must_use]
+    pub fn is_path_escape(&self) -> bool {
+        matches!(self, Self::Platform(PlatformError::PathEscape { .. }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use zerodeck_platform::PlatformError;
+
+    use super::CoreError;
+
+    #[test]
+    fn is_path_escape_matches_only_platform_path_escape() {
+        let escape = CoreError::Platform(PlatformError::PathEscape {
+            candidate: PathBuf::from("/etc/passwd"),
+            root: PathBuf::from("/srv/plugins"),
+        });
+        assert!(escape.is_path_escape());
+
+        let empty_roots = CoreError::Platform(PlatformError::EmptyRootSet);
+        assert!(!empty_roots.is_path_escape());
+
+        let other = CoreError::InvalidSetting("bad key".to_owned());
+        assert!(!other.is_path_escape());
+    }
+}

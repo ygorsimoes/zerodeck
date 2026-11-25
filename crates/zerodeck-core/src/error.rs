@@ -19,6 +19,10 @@ pub enum CoreError {
     #[error("plugin `{0}` is disabled")]
     PluginDisabled(String),
 
+    /// A plugin's manifest `name` is already owned by another plugin directory.
+    #[error("plugin name `{name}` is already used by directory `{directory}`")]
+    DuplicatePluginName { name: String, directory: String },
+
     /// A spawn preflight check refused to start the plugin's worker.
     #[error("plugin `{name}` cannot start: {reason}")]
     PluginBlocked { name: String, reason: String },

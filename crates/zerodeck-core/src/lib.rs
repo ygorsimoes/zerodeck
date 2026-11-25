@@ -2538,6 +2538,48 @@ class Plugin:
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn reload_rejects_rename_onto_another_directorys_name() {
+        let dir = TestDir::new("mgr-reload-dup-name");
+        let paths = manager_test_paths(&dir.0);
+        write_watcher_plugin(&paths.plugins_dir().join("alpha"), "Alpha", &[], "alpha");
+        let beta = paths.plugins_dir().join("beta");
+        write_watcher_plugin(&beta, "Beta", &[], "beta");
+
+        let manager = test_manager_open(&paths);
+        manager.start_all().await.expect("start_all");
+
+        // Beta's manifest now claims Alpha's name, which `alpha/` already owns.
+        fs::write(
+            beta.join("plugin.json"),
+            r#"{"name":"Alpha","author":"Alice","flags":[],"api_version":1}"#,
+        )
+        .expect("rename beta's manifest");
+        let err = manager
+            .reload_plugin("Beta")
+            .await
+            .expect_err("a rename onto another directory's name must be refused");
+        assert!(
+            matches!(err, CoreError::DuplicatePluginName { ref name, ref directory }
+                if name == "Alpha" && directory == "alpha"),
+            "{err}"
+        );
+
+        let mut names: Vec<_> = manager.list_plugins().into_iter().map(|p| p.name).collect();
+        names.sort();
+        assert_eq!(names, ["Alpha", "Beta"]);
+        assert_eq!(
+            call_plugin_ok(&manager, "Alpha", "version_tag").await,
+            serde_json::json!("alpha")
+        );
+        assert_eq!(
+            call_plugin_ok(&manager, "Beta", "version_tag").await,
+            serde_json::json!("beta")
+        );
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn debug_reload_runs_preflight() {
         let dir = TestDir::new("mgr-reload-preflight");
         let paths = manager_test_paths(&dir.0);

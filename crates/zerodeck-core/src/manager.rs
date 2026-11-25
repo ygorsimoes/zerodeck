@@ -261,6 +261,16 @@ impl PluginManager {
             )));
         }
         let refreshed = discover_single_plugin(&plugin_dir, existing.directory.clone())?;
+        // Workers are keyed by manifest name: refuse a rename onto a name another directory owns
+        // (as discovery does), leaving both plugins as they were.
+        if let Some(owner) = lock_unpoisoned(&self.plugins).iter().find(|p| {
+            p.directory != existing.directory && p.manifest.name == refreshed.manifest.name
+        }) {
+            return Err(CoreError::DuplicatePluginName {
+                name: refreshed.manifest.name,
+                directory: owner.directory.clone(),
+            });
+        }
         let metadata_changed = refreshed != existing;
 
         if existing.manifest.name != refreshed.manifest.name

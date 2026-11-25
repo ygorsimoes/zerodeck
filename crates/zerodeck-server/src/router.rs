@@ -1516,7 +1516,7 @@ fn parse_set_setting_args(args: &[Value]) -> Result<(String, Value), String> {
     Ok((key, val))
 }
 
-fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
+pub(crate) fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
     match err {
         CoreError::Host(HostError::WorkerStopped | HostError::StartupTimeout) => {
             WsServerMessage::Discard { id }
@@ -1552,6 +1552,9 @@ fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
         ),
         CoreError::PluginBlocked { .. } => {
             ws_error(id, "PluginBlockedError", err.to_string(), None)
+        }
+        CoreError::DuplicatePluginName { .. } => {
+            ws_error(id, "DuplicatePluginNameError", err.to_string(), None)
         }
         CoreError::Host(HostError::InvalidMethodName(method)) => ws_error(
             id,

@@ -61,9 +61,8 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
     // `read_dir` order is filesystem-dependent; sort so load order and listings are stable.
     plugins.sort_by(|a, b| a.directory.cmp(&b.directory));
 
-    // Workers are keyed by manifest name, so two directories declaring the same name would
-    // collide. Keep the first in sorted order and skip the rest.
-    // Maps each kept manifest name to the directory that owns it, for the duplicate warning.
+    // Workers are keyed by manifest name, so keep the first directory (sorted order) per name and
+    // skip the rest; `kept_dirs` maps each kept name to its owning directory for the warning.
     let mut kept_dirs: HashMap<String, String> = HashMap::new();
     let mut unique = Vec::with_capacity(plugins.len());
     for plugin in plugins {

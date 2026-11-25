@@ -305,6 +305,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn duplicate_plugin_name_maps_to_its_own_ws_error() {
+        let err = zerodeck_core::CoreError::DuplicatePluginName {
+            name: "Alpha".to_owned(),
+            directory: "alpha".to_owned(),
+        };
+        match crate::router::core_error_to_ws(7, err) {
+            zerodeck_protocol::WsServerMessage::Error { id, error } => {
+                assert_eq!(id, 7);
+                assert_eq!(error.name, "DuplicatePluginNameError");
+                assert!(error.error.contains("`alpha`"), "{}", error.error);
+            }
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn static_responses_send_nosniff_and_last_modified() {

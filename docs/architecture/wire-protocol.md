@@ -65,7 +65,7 @@ Implemented WS routes:
 - `loader/enable_plugin` / `loader/disable_plugin` with `args: [plugin_name]` (or `{ plugin_name }`) -> atomically updates `disabledPlugins`, starts or stops the plugin worker, emits `loader/plugins_changed`, and replies `true`.
 - `loader/set_plugin_order` with `args: [plugin_order: string[]]` (or `{ plugin_order | pluginOrder | order }`) -> atomically updates `pluginOrder`, emits `loader/plugins_changed`, and replies `true`.
 - `loader/get_settings` with `args: []` or `[dotted_key?]` (or `{ key? }`) -> returns the full `loader.json` object or dotted-path value (`null` if absent).
-- `loader/set_setting` with `args: [dotted_key, value]` (or `{ key, value }`) -> atomically writes a dotted key path in `loader.json` (rejecting direct writes to `pluginOrder`, `disabledPlugins`, and `disabled_plugins`, and any write that would set `developer.allow_unsafe_root_plugins`, whether as that key or inside a `developer` object, with `ValueError`) and replies `true`.
+- `loader/set_setting` with `args: [dotted_key, value]` (or `{ key, value }`) -> atomically writes a dotted key path in `loader.json` (rejecting direct writes to `pluginOrder`, `disabledPlugins`, and `disabled_plugins` with `ValueError`) and replies `true`.
 
 Server-to-client `EVENT` (`type: 5`) frames:
 - `loader/plugin_event`: `args` is `[{ "plugin": string, "event": string, "args": Value[] }]` emitted by a worker's `decky.emit(...)`, matching `WSRouter` listener spreading (`listener(...data.args)`).
@@ -126,8 +126,11 @@ The daemon spawns each active plugin over an anonymous Unix `socketpair()` FD (`
 - `pluginOrder`: optional array of `plugin.json` `name` strings; listed plugins appear first in that order, with remaining plugins sorted deterministically by directory name.
 - `disabledPlugins` (also accepts `disabled_plugins` on read, migrating on write): optional array of `plugin.json` `name` strings whose workers are not spawned and whose RPC calls return disabled errors.
 - `developer.allow_unverified_installs`: optional boolean (default `false`); when `false`, remote archive installs and `remote_binary` downloads fail closed without a valid SHA-256 digest.
-- `developer.allow_unsafe_root_plugins`: optional boolean (default `false`). When the daemon runs as root, every spawn of a `"root"` plugin (startup, enable, reload, install, debug hot-reload) first checks that `plugins/` itself and every entry of the plugin's directory are owned by uid 0, are not group- or world-writable, and are not symlinks; otherwise the plugin stays `Failed` with a `failure_reason` naming the path. `true` skips that check and logs a warning on each spawn. It is a development escape hatch that grants root to code a non-root user can edit, so it can only be set by editing `loader.json` on disk: `loader/set_setting` rejects it.
 - Managed lifecycle keys (`pluginOrder`, `disabledPlugins`, `disabled_plugins`) must be mutated via `loader/set_plugin_order`, `loader/enable_plugin`, and `loader/disable_plugin` rather than `loader/set_setting`.
+
+### Root Plugin Ownership Check
+- When the daemon runs as root, every spawn of a `"root"` plugin (startup, enable, reload, install, debug hot-reload) first checks that `plugins/` itself and every entry of the plugin's directory are owned by uid 0, are not group- or world-writable, and are not symlinks. Otherwise the plugin stays `Failed` with a `failure_reason` naming the path (`owned by uid N, not root`, `writable by group/others (mode 0oNNN)`, `symlink`, or `unreadable: ...`).
+- The daemon flag `--allow-unsafe-root-plugins` (env `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`, off by default) skips the check and logs a warning on each spawn. It is a development escape hatch that grants root to code a non-root user can edit, so it is read only from the daemon's own command line or environment, which only root controls. `loader.json` cannot enable it: `settings/` belongs to the unprivileged user.
 
 ### Python Worker Modules & Environment
 - `zerodeck-py-host` injects `decky` (and `decky_plugin` alias), `settings` (`SettingsManager` with `read()`, `commit()`, `getSetting()`, `setSetting()`, atomic writes, and corrupt-file preservation), and `helpers` (`get_ssl_context()`, `get_homebrew_path()`, `get_user()`).

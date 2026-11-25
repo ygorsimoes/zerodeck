@@ -15,8 +15,8 @@ pub(crate) struct PreflightInput<'a> {
 /// Returns the reason a plugin must not start, or `Ok` when it may.
 ///
 /// A missing Python host blocks every backend plugin. A `"root"` plugin started by a root daemon
-/// must pass `tree_check` unless `developer.allow_unsafe_root_plugins` is set, which only logs a
-/// warning.
+/// must pass `tree_check` unless the daemon runs with `--allow-unsafe-root-plugins`, which only
+/// logs a warning.
 pub(crate) fn preflight(
     input: &PreflightInput<'_>,
     tree_check: impl FnOnce() -> Result<(), OwnershipViolation>,
@@ -29,8 +29,8 @@ pub(crate) fn preflight(
     }
     if input.allow_unsafe_root_plugins {
         warn!(
-            "developer.allow_unsafe_root_plugins is set: starting a root plugin without checking \
-             that only root can modify its files"
+            "--allow-unsafe-root-plugins is set: starting a root plugin without checking that \
+             only root can modify its files"
         );
         return Ok(());
     }

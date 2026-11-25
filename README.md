@@ -168,6 +168,7 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 |---|---|---|---|
 | `--host` | `SERVER_HOST` | `127.0.0.1` | Address to bind the HTTP/WebSocket server to |
 | `--allow-non-loopback` | `ZERODECK_ALLOW_NON_LOOPBACK` | off | Allow binding to a non-loopback address (exposes the auth token to that network) |
+| `--allow-unsafe-root-plugins` | `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS` | off | Start `"root"` plugins whose files a non-root user can modify (development only; set it in a systemd drop-in, which only root can) |
 | `--port` | `SERVER_PORT` | `1337` | Port to listen on |
 | `--check-config` | | | Validate paths, settings and plugin manifests, then exit |
 | `--healthcheck` | | | Probe `/healthz` on a running daemon and exit `0` or `1` |
@@ -188,8 +189,10 @@ Plugins flagged `"root"` keep root privileges, so a root daemon only starts them
 only root can modify: `plugins/` and every file and directory of the plugin must be owned by root,
 must not be group- or world-writable, and must not be symlinks. Store installs already produce such
 trees. Otherwise the plugin shows as `Failed` with the offending path in `failure_reason`. For local
-development you can skip the check by adding `{"developer": {"allow_unsafe_root_plugins": true}}`
-to `settings/loader.json` by hand; the UI and `loader/set_setting` cannot set it.
+development you can skip the check with `--allow-unsafe-root-plugins` /
+`ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`, set in the daemon's own command line or a systemd drop-in.
+It is deliberately not a `loader.json` setting: `settings/` belongs to the unprivileged user, who
+must not be able to grant themselves root.
 
 </details>
 

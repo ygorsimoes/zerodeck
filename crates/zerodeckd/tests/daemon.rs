@@ -846,35 +846,47 @@ async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
         .join("../../hosts/python")
         .canonicalize()
         .expect("resolve hosts/python");
-    let start = |port: u16| {
+    let start = |port: u16, opt_in: bool| {
         let mut cmd = daemon_command(&home, "127.0.0.1", port);
         cmd.env("PYTHONPATH", &py_host)
             .env("DECKY_USER", &host_user);
+        if opt_in {
+            cmd.env("ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS", "1");
+        }
         Daemon(cmd.spawn().expect("spawn zerodeckd"))
+    };
+    let assert_blocked = |entry: &serde_json::Value| {
+        assert_eq!(entry["state"], "Failed", "{entry}");
+        let reason = entry["failure_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(&plug_dir.display().to_string()) && reason.contains("not root"),
+            "failure_reason must name the plugin path: {entry}"
+        );
     };
 
     let port = free_port("127.0.0.1");
-    let mut daemon = start(port);
+    let mut daemon = start(port, false);
     wait_until_healthy(&home, "127.0.0.1", port);
-    let entry = get_plugin_entry(port, "RootPlug").await;
-    assert_eq!(entry["state"], "Failed", "{entry}");
-    let reason = entry["failure_reason"].as_str().unwrap_or_default();
-    assert!(
-        reason.contains(&plug_dir.display().to_string()),
-        "failure_reason must name the plugin path: {entry}"
-    );
+    assert_blocked(&get_plugin_entry(port, "RootPlug").await);
     sigterm(&daemon);
     assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
 
+    // settings/ belongs to the host user, so loader.json must not be able to grant root.
     std::fs::create_dir_all(home.0.join("settings")).expect("create settings dir");
     std::fs::write(
         home.0.join("settings").join("loader.json"),
         r#"{"developer":{"allow_unsafe_root_plugins":true}}"#,
     )
-    .expect("write loader.json opt-in");
+    .expect("write loader.json");
+    let port = free_port("127.0.0.1");
+    let mut daemon = start(port, false);
+    wait_until_healthy(&home, "127.0.0.1", port);
+    assert_blocked(&get_plugin_entry(port, "RootPlug").await);
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
 
     let port = free_port("127.0.0.1");
-    let mut daemon = start(port);
+    let mut daemon = start(port, true);
     wait_until_healthy(&home, "127.0.0.1", port);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
@@ -23,9 +24,6 @@ use crate::{
 const DISABLED_PLUGINS_KEY: &str = "disabledPlugins";
 const LEGACY_DISABLED_PLUGINS_KEY: &str = "disabled_plugins";
 const PLUGIN_ORDER_KEY: &str = "pluginOrder";
-/// Developer opt-in that starts `"root"` plugins from trees a non-root user can modify. Only
-/// settable by editing `loader.json` on disk: [`PluginManager::set_setting`] rejects it.
-const ALLOW_UNSAFE_ROOT_PLUGINS_PATH: &str = "developer.allow_unsafe_root_plugins";
 
 /// Public snapshot of a discovered plugin and its runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +70,7 @@ pub struct PluginManager {
     lifecycle_lock: tokio::sync::Mutex<()>,
     loader_events_tx: broadcast::Sender<LoaderEvent>,
     daemon_is_root: bool,
+    allow_unsafe_root_plugins: AtomicBool,
     python_host_missing: Mutex<Option<String>>,
     /// Spawn preflight refusals by `manifest.name`, cleared when a later preflight passes.
     failure_reasons: Mutex<HashMap<String, String>>,
@@ -135,6 +134,7 @@ impl PluginManager {
             lifecycle_lock: tokio::sync::Mutex::new(()),
             loader_events_tx,
             daemon_is_root: daemon_is_root(),
+            allow_unsafe_root_plugins: AtomicBool::new(false),
             python_host_missing: Mutex::new(None),
             failure_reasons: Mutex::new(HashMap::new()),
         })
@@ -173,6 +173,21 @@ impl PluginManager {
     /// with that reason instead of retrying.
     pub fn set_python_host_missing(&self, reason: Option<String>) {
         *lock_unpoisoned(&self.python_host_missing) = reason;
+    }
+
+    /// Lets `"root"` plugins start from trees a non-root user can modify (logged on each spawn).
+    /// Only the daemon's own command line or environment may turn this on: anything the
+    /// unprivileged user can write, such as `loader.json`, must never grant root.
+    pub fn set_allow_unsafe_root_plugins(&self, allow: bool) {
+        self.allow_unsafe_root_plugins
+            .store(allow, Ordering::Relaxed);
+    }
+
+    /// Makes the spawn preflight behave as under a root daemon, so tests can exercise the tree
+    /// check without running as root.
+    #[cfg(test)]
+    pub(crate) fn assume_root_daemon_for_tests(&mut self) {
+        self.daemon_is_root = true;
     }
 
     /// Starts workers for all enabled, non-passive plugins in configured order.
@@ -482,14 +497,8 @@ impl PluginManager {
         }
     }
 
-    /// Atomically updates a dotted setting key in `loader.json`, rejecting lifecycle-managed keys
-    /// and any write that would set `developer.allow_unsafe_root_plugins`.
+    /// Atomically updates a dotted setting key in `loader.json`, rejecting lifecycle-managed keys.
     pub fn set_setting(&self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
-        if writes_setting_path(dotted_key, &value, ALLOW_UNSAFE_ROOT_PLUGINS_PATH) {
-            return Err(CoreError::InvalidSetting(format!(
-                "setting `{ALLOW_UNSAFE_ROOT_PLUGINS_PATH}` can only be changed by editing loader.json on disk"
-            )));
-        }
         let root_key = dotted_key.split('.').next().unwrap_or("");
         if matches!(
             root_key,
@@ -657,7 +666,7 @@ impl PluginManager {
         let input = PreflightInput {
             requires_root: plugin.manifest.requires_root(),
             daemon_is_root: self.daemon_is_root,
-            allow_unsafe_root_plugins: self.allow_unsafe_root_plugins(),
+            allow_unsafe_root_plugins: self.allow_unsafe_root_plugins.load(Ordering::Relaxed),
             python_host_missing: python_host_missing.as_deref(),
         };
         let plugins_dir = self.paths.plugins_dir();
@@ -678,14 +687,6 @@ impl PluginManager {
                 })
             }
         }
-    }
-
-    fn allow_unsafe_root_plugins(&self) -> bool {
-        let guard = lock_unpoisoned(&self.settings);
-        matches!(
-            guard.get_path(ALLOW_UNSAFE_ROOT_PLUGINS_PATH),
-            Some(Value::Bool(true))
-        )
     }
 
     fn failure_reason(&self, plugin_name: &str) -> Option<String> {
@@ -937,27 +938,6 @@ fn check_root_plugin_tree(plugins_dir: &Path, directory: &str) -> Result<(), Own
 #[cfg(not(unix))]
 fn check_root_plugin_tree(_: &Path, _: &str) -> Result<(), OwnershipViolation> {
     Ok(())
-}
-
-/// Returns `true` when setting `dotted_key` to `value` would write `protected` or anything under
-/// it, whether by naming it directly or by writing a parent object that contains it.
-fn writes_setting_path(dotted_key: &str, value: &Value, protected: &str) -> bool {
-    let key: Vec<&str> = dotted_key.split('.').collect();
-    let protected: Vec<&str> = protected.split('.').collect();
-    if key.len() >= protected.len() {
-        return key[..protected.len()] == protected[..];
-    }
-    if key[..] != protected[..key.len()] {
-        return false;
-    }
-    let mut current = value;
-    for segment in &protected[key.len()..] {
-        match current.get(segment) {
-            Some(next) => current = next,
-            None => return false,
-        }
-    }
-    true
 }
 
 async fn shutdown_worker_if_present(

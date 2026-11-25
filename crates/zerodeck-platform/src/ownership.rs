@@ -29,9 +29,22 @@ pub enum ViolationKind {
     Unreadable(String),
 }
 
+impl std::fmt::Display for ViolationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRootOwned { uid } => write!(f, "owned by uid {uid}, not root"),
+            Self::WritableByOthers { mode } => {
+                write!(f, "writable by group/others (mode {mode:#o})")
+            }
+            Self::Symlink => f.write_str("symlink"),
+            Self::Unreadable(err) => write!(f, "unreadable: {err}"),
+        }
+    }
+}
+
 /// The first entry of a tree that is not safe to run as root.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("`{path}` is not safe to run as root: {kind:?}")]
+#[error("`{path}` is not safe to run as root: {kind}")]
 pub struct OwnershipViolation {
     pub path: PathBuf,
     pub kind: ViolationKind,
@@ -195,11 +208,25 @@ mod tests {
             kind: ViolationKind::NotRootOwned { uid: 1000 },
         };
         let message = violation.to_string();
-        assert!(
-            message.contains("/home/deck/homebrew/plugins/demo/main.py"),
-            "{message}"
+        assert_eq!(
+            message,
+            "`/home/deck/homebrew/plugins/demo/main.py` is not safe to run as root: owned by uid \
+             1000, not root"
         );
-        assert!(message.contains("NotRootOwned"), "{message}");
+
+        for (kind, text) in [
+            (
+                ViolationKind::WritableByOthers { mode: 0o775 },
+                "writable by group/others (mode 0o775)",
+            ),
+            (ViolationKind::Symlink, "symlink"),
+            (
+                ViolationKind::Unreadable("Permission denied".to_owned()),
+                "unreadable: Permission denied",
+            ),
+        ] {
+            assert_eq!(kind.to_string(), text);
+        }
     }
 
     #[test]

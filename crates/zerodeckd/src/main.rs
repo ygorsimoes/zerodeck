@@ -20,6 +20,10 @@ use zerodeck_protocol::WsMessageType;
 use zerodeck_server::{AppState, ServerConfig, serve};
 
 #[derive(Debug, Parser)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent command-line switches, not a state machine"
+)]
 #[command(name = "zerodeckd", version, about = "ZeroDeck plugin loader daemon")]
 struct Cli {
     /// Validate environment paths, settings, and plugin manifests then exit.
@@ -46,6 +50,15 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     allow_non_loopback: bool,
+
+    /// Start `"root"` plugins even when a non-root user can modify their files. Development only:
+    /// it hands root to whoever can write the plugin tree.
+    #[arg(
+        long,
+        env = "ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_unsafe_root_plugins: bool,
 }
 
 fn init_tracing() {
@@ -372,6 +385,10 @@ async fn run_daemon(
     if let Some(reason) = python_host_missing {
         error!(reason = %reason, "Python worker host unavailable; backend plugins will not start");
         manager.set_python_host_missing(Some(reason));
+    }
+    if cli.allow_unsafe_root_plugins {
+        warn!("--allow-unsafe-root-plugins is set: root plugins skip the ownership check");
+        manager.set_allow_unsafe_root_plugins(true);
     }
     if let Err(err) = manager.start_all().await {
         warn!(error = %err, "one or more plugins failed during startup");

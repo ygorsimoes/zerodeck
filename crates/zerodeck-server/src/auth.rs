@@ -27,9 +27,19 @@ fn is_parent_segment(segment: &str) -> bool {
     segment.to_ascii_lowercase().replace("%2e", ".") == ".."
 }
 
+/// Returns `true` when the raw URI path contains traversal (`..` / `%2e%2e`), backslashes
+/// (`\` / `%5c`), or encoded null bytes (`%00`).
+fn has_unsafe_path_tokens(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains('\\')
+        || lower.contains("%5c")
+        || lower.contains("%00")
+        || path.split('/').any(is_parent_segment)
+}
+
 /// Returns `true` when the request path does not require the `X-Decky-Auth` header.
 fn is_csrf_exempt(method: &Method, path: &str) -> bool {
-    if path.split('/').any(is_parent_segment) {
+    if has_unsafe_path_tokens(path) {
         return false;
     }
 
@@ -49,6 +59,14 @@ fn is_csrf_exempt(method: &Method, path: &str) -> bool {
     }
 
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if segments.len() == 3
+        && segments[0] == "plugins"
+        && !segments[1].is_empty()
+        && segments[2] == "frontend_bundle"
+    {
+        return true;
+    }
+
     segments.len() >= 4
         && segments[0] == "plugins"
         && !segments[1].is_empty()
@@ -61,6 +79,10 @@ pub async fn csrf_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    if has_unsafe_path_tokens(request.uri().path()) {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+
     if request.method() == Method::OPTIONS || is_csrf_exempt(request.method(), request.uri().path())
     {
         return next.run(request).await;

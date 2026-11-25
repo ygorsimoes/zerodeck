@@ -43,6 +43,12 @@ impl SettingsManager {
         &self.path
     }
 
+    /// Returns a read-only view of all top-level settings entries.
+    #[must_use]
+    pub fn values(&self) -> &Map<String, Value> {
+        &self.values
+    }
+
     /// Reads and deserializes a setting value if present and compatible with `T`.
     #[must_use]
     pub fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
@@ -55,13 +61,106 @@ impl SettingsManager {
     /// Updates a setting key and atomically flushes the JSON file to disk.
     pub fn set<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), CoreError> {
         let encoded = serde_json::to_value(value)?;
-        self.values.insert(key.to_owned(), encoded);
-        self.commit()
+        let mut next = self.values.clone();
+        next.insert(key.to_owned(), encoded);
+        self.commit_map(&next)?;
+        self.values = next;
+        Ok(())
     }
 
-    fn commit(&self) -> Result<(), CoreError> {
-        let bytes = serde_json::to_vec_pretty(&Value::Object(self.values.clone()))?;
+    /// Reads a setting by dotted key path (e.g. `"developer.allow_unverified_installs"`).
+    ///
+    /// Returns `None` when the key is missing, contains empty segments, or traverses a non-object
+    /// intermediate value.
+    #[must_use]
+    pub fn get_path(&self, dotted_key: &str) -> Option<Value> {
+        let segments = parse_dotted_segments(dotted_key).ok()?;
+        let (last, parents) = segments.split_last()?;
+        let mut current = &self.values;
+        for segment in parents {
+            current = current.get(*segment)?.as_object()?;
+        }
+        current.get(*last).cloned()
+    }
+
+    /// Updates a setting by dotted key path, creating missing intermediate JSON objects.
+    ///
+    /// Rejects empty segments and non-object intermediate values without modifying on-disk state.
+    pub fn set_path(&mut self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
+        let segments = parse_dotted_segments(dotted_key)?;
+        let (last, parents) = segments.split_last().ok_or_else(|| {
+            CoreError::InvalidSetting("setting path must not be empty".to_owned())
+        })?;
+
+        let mut next = self.values.clone();
+        let mut current = &mut next;
+        for (idx, segment) in parents.iter().enumerate() {
+            if !current.contains_key(*segment) {
+                current.insert((*segment).to_owned(), Value::Object(Map::new()));
+            }
+            let entry = current.get_mut(*segment).ok_or_else(|| {
+                CoreError::InvalidSetting(format!("missing intermediate key `{segment}`"))
+            })?;
+            let Some(obj) = entry.as_object_mut() else {
+                let prefix = parents[..=idx].join(".");
+                return Err(CoreError::InvalidSetting(format!(
+                    "cannot traverse non-object setting `{prefix}` while setting `{dotted_key}`"
+                )));
+            };
+            current = obj;
+        }
+
+        current.insert((*last).to_owned(), value);
+        self.commit_map(&next)?;
+        self.values = next;
+        Ok(())
+    }
+
+    /// Removes a top-level setting key and atomically flushes changes to disk if it existed.
+    pub fn remove(&mut self, key: &str) -> Result<Option<Value>, CoreError> {
+        if !self.values.contains_key(key) {
+            return Ok(None);
+        }
+        let mut next = self.values.clone();
+        let removed = next.remove(key);
+        self.commit_map(&next)?;
+        self.values = next;
+        Ok(removed)
+    }
+
+    /// Atomically applies an in-memory settings mutation, flushing to disk only when `mutate`
+    /// returns `Ok(true)`.
+    pub(crate) fn update_map<F>(&mut self, mutate: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
+    {
+        let mut next = self.values.clone();
+        if !mutate(&mut next)? {
+            return Ok(());
+        }
+        self.commit_map(&next)?;
+        self.values = next;
+        Ok(())
+    }
+
+    fn commit_map(&self, values: &Map<String, Value>) -> Result<(), CoreError> {
+        let bytes = serde_json::to_vec_pretty(&Value::Object(values.clone()))?;
         atomic_write(&self.path, &bytes)?;
         Ok(())
     }
+}
+
+fn parse_dotted_segments(dotted_key: &str) -> Result<Vec<&str>, CoreError> {
+    if dotted_key.is_empty() {
+        return Err(CoreError::InvalidSetting(
+            "setting path must not be empty".to_owned(),
+        ));
+    }
+    let segments: Vec<&str> = dotted_key.split('.').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return Err(CoreError::InvalidSetting(format!(
+            "setting path `{dotted_key}` contains an empty segment"
+        )));
+    }
+    Ok(segments)
 }

@@ -52,7 +52,9 @@ plugin contracts, rebuilt from scratch as a native daemon.
 | Supervised plugin processes with restart, backoff, and crash-loop guard | ✅ |
 | Private plugin IPC over inherited `socketpair()` FDs (no `/tmp` sockets) | ✅ |
 | Plugins drop to the `deck` user unless they declare `"root"` | ✅ |
-| Plugin static, asset and data routes behind the path jail | 🚧 |
+| Plugin static, asset and data routes behind the path jail | ✅ |
+| SSRF-guarded `/fetch` CORS proxy, `FilePicker`, and staged ZIP/`remote_binary` installer | ✅ |
+| WebSocket `FULL_SYNC` deduplication and `"debug"` plugin hot-reload | ✅ |
 | Injection into Steam's UI and the Quick Access Menu | 🚧 |
 
 ✅ shipped and tested · 🚧 in progress (see [Roadmap](#roadmap))
@@ -170,6 +172,8 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | | `UNPRIVILEGED_PATH` (or `DECKY_HOME`) | `<user home>/homebrew` | Root for `settings/`, `data/` and `logs/` |
 | | `DECKY_USER_HOME` | `$HOME` | User home used for the default paths |
 | | `PRIVILEGED_PATH` | `UNPRIVILEGED_PATH` | Root for `plugins/` and `services/` |
+| | `ZERODECK_FRONTEND_DIR` | auto-detected | Directory containing the `@zerodeck/frontend` bundle |
+| | `PYTHONPATH` | auto-detected | Override search path containing `zerodeck_py_host` |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
 </details>
@@ -208,9 +212,9 @@ frames, IPC messages, manifests and environment variables) is documented in
 
 | Path | What it does |
 |---|---|
-| [`crates/zerodeckd`](crates/zerodeckd) | The daemon binary: CLI, logging, graceful shutdown |
-| [`crates/zerodeck-server`](crates/zerodeck-server) | HTTP/WebSocket server, auth token, CORS, `/healthz` |
-| [`crates/zerodeck-core`](crates/zerodeck-core) | Settings, plugin discovery, archive extraction and verification |
+| [`crates/zerodeckd`](crates/zerodeckd) | The daemon binary: CLI, logging, debug watcher, graceful shutdown |
+| [`crates/zerodeck-server`](crates/zerodeck-server) | HTTP/WebSocket server, auth token, CORS, `/fetch` proxy, static/plugin routes, `FULL_SYNC` cache |
+| [`crates/zerodeck-core`](crates/zerodeck-core) | Settings, plugin lifecycle, installer, `FilePicker`, outbound HTTP policy, debug hot-reload |
 | [`crates/zerodeck-plugin-host`](crates/zerodeck-plugin-host) | Plugin runtime trait and Python worker launcher |
 | [`crates/zerodeck-cef`](crates/zerodeck-cef) | Chrome DevTools Protocol client for Steam's UI |
 | [`crates/zerodeck-platform`](crates/zerodeck-platform) | Paths, `SafePath` jail, atomic writes, process identity |
@@ -232,8 +236,8 @@ frames, IPC messages, manifests and environment variables) is documented in
   safe archive extraction, plugin discovery, HTTP/WebSocket server, CI and releases
 - [x] **Phase 2 · Plugin host:** privilege drop, `socketpair()` IPC, process supervisor,
   `zerodeck-py-host` parity (`settings`, `helpers`, v0/v1), and async `/ws` RPC wiring
-- [ ] **Phase 3 · Full server:** `FULL_SYNC`, `/fetch` proxy, plugin static and data routes, file
-  picker, store installer
+- [x] **Phase 3 · Full server:** `FULL_SYNC`, `/fetch` proxy, plugin static and data routes, file
+  picker, staged ZIP/`remote_binary` installer, and debug hot-reload
 - [ ] **Phase 4 · Steam integration:** CEF injection, crash recovery, Quick Access Menu UI,
   one-command install and update on Steam Deck
 
@@ -265,8 +269,8 @@ should also read [`AGENTS.md`](AGENTS.md).
 <summary><strong>Will my Decky plugins work?</strong></summary>
 <br />
 
-That's the goal: existing plugins, unmodified. ZeroDeck already discovers and reads them, but it
-can't run them inside Steam until [Phase 4](#roadmap).
+ZeroDeck already discovers plugins, runs their Python backends, and serves their routes locally,
+though injecting plugins into Steam's UI lands in [Phase 4](#roadmap).
 
 </details>
 

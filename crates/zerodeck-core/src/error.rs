@@ -78,4 +78,72 @@ pub enum CoreError {
     /// Computed SHA-256 digest does not match expected value.
     #[error("SHA-256 mismatch: expected {expected}, got {actual}")]
     Sha256Mismatch { expected: String, actual: String },
+
+    /// Outbound HTTP request was blocked by the SSRF policy.
+    #[error("outbound HTTP request blocked by policy: {0}")]
+    HttpPolicy(String),
+
+    /// Outbound HTTP request failed at transport or protocol level.
+    #[error("outbound HTTP request failed: {0}")]
+    HttpRequest(String),
+
+    /// Remote download exceeded the configured maximum byte budget.
+    #[error("download exceeded maximum allowed size of {max_bytes} bytes")]
+    DownloadSizeExceeded { max_bytes: usize },
+
+    /// Plugin install source URI or path could not be parsed.
+    #[error("invalid install source: {0}")]
+    InvalidInstallSource(String),
+
+    /// Installed plugin manifest metadata did not match caller expectations.
+    #[error("plugin manifest {field} mismatch: expected `{expected}`, got `{actual}`")]
+    ManifestMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+
+    /// Extracted plugin archive does not contain a top-level `plugin.json`.
+    #[error("archive does not contain a top-level plugin.json manifest")]
+    MissingPluginManifest,
+
+    /// Dotted setting path or protected lifecycle setting write is invalid.
+    #[error("invalid setting: {0}")]
+    InvalidSetting(String),
+
+    /// Debug hot-reload watcher failed.
+    #[error("debug watcher error: {0}")]
+    Watcher(String),
+}
+
+impl CoreError {
+    /// Returns `true` if this error represents a path-jail escape attempt.
+    #[must_use]
+    pub fn is_path_escape(&self) -> bool {
+        matches!(self, Self::Platform(PlatformError::PathEscape { .. }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use zerodeck_platform::PlatformError;
+
+    use super::CoreError;
+
+    #[test]
+    fn is_path_escape_matches_only_platform_path_escape() {
+        let escape = CoreError::Platform(PlatformError::PathEscape {
+            candidate: PathBuf::from("/etc/passwd"),
+            root: PathBuf::from("/srv/plugins"),
+        });
+        assert!(escape.is_path_escape());
+
+        let empty_roots = CoreError::Platform(PlatformError::EmptyRootSet);
+        assert!(!empty_roots.is_path_escape());
+
+        let other = CoreError::InvalidSetting("bad key".to_owned());
+        assert!(!other.is_path_escape());
+    }
 }

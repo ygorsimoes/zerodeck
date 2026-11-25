@@ -28,3 +28,4 @@ zerodeck-server.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
 tokio-tungstenite.workspace = true
+zip.workspace = true

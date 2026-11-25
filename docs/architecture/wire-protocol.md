@@ -10,9 +10,26 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 - CORS origin allowlist: `https://steamloopback.host` with `allow_credentials = true`.
 - `Host` allowlist (DNS-rebinding defense): every request carrying a `Host` header must name a loopback host (`localhost`, `127.0.0.0/8`, or `[::1]`, any port); anything else gets `403 Forbidden`.
 - The `?auth=` token is redacted from HTTP request trace spans.
-- `/ws` and `/fetch` are **not** public. `/fetch` accepts the token as `?auth=<token>` or the header; `/ws` requires `?auth=<token>` (browsers cannot set headers on a WebSocket upgrade).
-- Token comparison is constant-time, and `..` path segments (including percent-encoded `%2e%2e`) are never treated as public.
-- Public/allowlisted paths (`GET`/`HEAD` only, except the first two): `/auth/token`, `/healthz`, `/frontend/*`, `/static/*`, `/locales/*`, `/steam_resource/*`, `/plugins/load_main/*`, `/plugins/*/assets/*`, `/plugins/*/data/*`, `/plugins/*/dist/*`.
+- `/ws` and `/fetch` are **not** public. `/fetch` accepts the token as `?auth=<token>` or `X-Decky-Auth`; `/ws` requires `?auth=<token>` (browsers cannot set headers on a WebSocket upgrade).
+- Token comparison is constant-time, and `..` path segments (including percent-encoded `%2e%2e`), backslashes (`\` / `%5c`), and encoded null bytes (`%00`) are rejected with `403 Forbidden` and never treated as public.
+- Public/allowlisted paths (`GET`/`HEAD` only, except `/auth/token` and `/healthz`): `/auth/token`, `/healthz`, `/frontend/*`, `/static/*`, `/locales/*`, `/steam_resource/*` (CSRF-exempt; handler reserved for Phase 4), `/plugins/load_main/*`, `/plugins/{name}/frontend_bundle`, `/plugins/{name}/assets/*`, `/plugins/{name}/data/*`, `/plugins/{name}/dist/*`.
+
+### Static, Plugin Asset & Frontend Bundle Routes
+All file routes percent-decode path segments, reject empty/`..`/backslash/null-byte segments, canonicalize against per-root `SafePath` jails, and stream bytes with extension-based `Content-Type` (`js`/`mjs` -> `text/javascript; charset=utf-8`, `css`, `json`, `html`, `svg`, `png`, `jpg`/`jpeg`, `webp`, `woff2`, `wasm`, fallback `application/octet-stream`):
+- `GET /frontend/{*path}`: serves from resolved `frontend_dir` (`ZERODECK_FRONTEND_DIR` -> `/opt/zerodeck/frontend` -> `<exe_dir>/../frontend` -> `frontend/dist` -> `<CARGO_MANIFEST_DIR>/../../frontend/dist`).
+- `GET /static/{*path}`: serves from `<frontend_dir>/static`.
+- `GET /locales/{*path}`: serves from `<frontend_dir>/locales`.
+- `GET /plugins/load_main/{name}` and `GET /plugins/{name}/frontend_bundle`: resolve `{name}` (`manifest.name` first, falling back to directory name) and serve `<plugins_dir>/<dir>/dist/index.js` with `Content-Type: text/javascript; charset=utf-8` and `Cache-Control: no-store`.
+- `GET /plugins/{name}/dist/{*path}`: serves from `<plugins_dir>/<dir>/dist`.
+- `GET /plugins/{name}/assets/{*path}`: serves from `<plugins_dir>/<dir>/assets`.
+- `GET /plugins/{name}/data/{*path}`: serves from `<data_dir>/<dir>`.
+
+### `/fetch` Streaming CORS Proxy
+- `ANY /fetch?fetch_url=<url>` (authenticated via `?auth=<token>` or `X-Decky-Auth`):
+  - Requires non-empty `fetch_url` (`400 Bad Request` if missing/invalid or non-`http`/`https` scheme) and caps inbound request bodies at `16 MiB` (`413 Payload Too Large`).
+  - **SSRF & Redirect Policy:** Allows `http`/`https` only. Rejects loopback (`127.0.0.0/8`, `::1`, `localhost`, `*.localhost`), unspecified (`0.0.0.0/8`, `::`), multicast, and link-local/metadata (`169.254.0.0/16`, `fe80::/10`, including IPv4-mapped IPv6 forms) across initial URL validation, DNS resolution, and up to `5` manual HTTP redirect hops (`403 Forbidden`), stripping `Authorization`, `Cookie`, `Cookie2`, `Host`, `Proxy-Authorization`, and `WWW-Authenticate` across cross-origin redirects. Default upstream timeouts: `10 s` connect (`fetch_connect_timeout`), `60 s` response (`fetch_response_timeout`). Permits private RFC1918 / ULA LAN ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`) for local-network plugins.
+  - **Header Translation:** Strips `host`, `x-decky-auth`, `x-decky-fetch-excluded-headers`, hop-by-hop headers, `content-length`, `accept-encoding`, `cookie`, and any comma-separated header names in `X-Decky-Fetch-Excluded-Headers`. Unwraps `X-Decky-Header-<Target>` into `<Target>` on the upstream request (blocking `host`, `x-decky-auth`, `content-length`, `accept-encoding`, and all hop-by-hop headers: `connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `te`, `trailers`, `transfer-encoding`, `upgrade`).
+  - **Response Streaming:** Streams upstream status, non-hop-by-hop response headers (stripping upstream `Access-Control-*` headers so daemon CORS policy stays authoritative), and body bytes. Upstream timeouts return `504 Gateway Timeout`; other transport errors return `502 Bad Gateway`.
 
 ### Legacy HTTP Methods (`POST /methods/{method_name}`)
 - `POST /methods/ping`: returns `200 OK` `{ "success": true, "result": "pong" }`.
@@ -37,15 +54,32 @@ Messages are JSON objects keyed by integer `type`:
 
 Implemented WS routes:
 - `utilities/ping` -> `REPLY` `"pong"`.
+- `utilities/filepicker` with positional `[path?, include_files?, filter?, extensions?, show_hidden?, max_entries?, include_folders?]` or 1-element options object -> lists entries within `SafePathSet` (`$DECKY_USER_HOME`/`$HOME`, `/run/media`, `$UNPRIVILEGED_PATH`/`$DECKY_HOME`), returning `{ path, realpath, files: [{ name, path, realpath, isdir, size, modified }], truncated }`. Symlink targets escaping allowed roots are omitted; invalid root paths fail with `PathEscapeError`.
 - `loader/get_plugins` -> `REPLY` array of `{ "name", "version", "load_type", "disabled", "passive", "state" }` ordered by `pluginOrder`.
 - `loader/call_plugin_method` with `args: [plugin_name, method_name, ...positional_args]` -> dispatches `legacy: false`. Private `_`-prefixed methods are rejected with `PermissionError`.
 - `loader/call_legacy_plugin_method` with `args: [plugin_name, method_name, kwargs_object?]` -> dispatches `legacy: true` (defaults omitted kwargs to `{}`).
 - `loader/reload_plugin` with `args: [plugin_name]` -> restarts the plugin worker cleanly and replies `true`.
-- `loader/plugin_event` (`EVENT = 5` server -> client): `args` is a 1-element array `[{ "plugin": string, "event": string, "args": Value[] }]` matching `WSRouter` listener spreading (`listener(...data.args)`).
+- `loader/install_plugin` & `utilities/install_plugin` with positional `[url_or_path, name?, version?, sha256?, install_type?, user_confirmed?, directory?]` or 1-element spec object `{ url_or_path (aliases: url, artifact, path), name?, version?, sha256 (alias: hash)?, install_type?, user_confirmed?, directory (alias: directory_hint)? }` -> stages and verifies ZIP archives (up to `128 MiB` by default; `http(s)://` subject to SSRF policy + mandatory SHA-256 unless `developer.allow_unverified_installs` is `true`; `file://`/local paths via `SafePathSet` requiring SHA-256 or `user_confirmed: true`), downloads `package.json` `remote_binary` assets into `<plugin_dir>/bin/<name>` (`0755`, up to `256 MiB` each by default), swaps atomically, starts the worker if enabled and non-passive, emits `loader/plugins_changed`, and replies `{ name, directory, version, sha256, replaced_existing }`.
+- `loader/uninstall_plugin` with `args: [plugin_name, purge_data?]` (or `{ plugin_name, purge_data? }`) -> runs `_unload` + `_uninstall`, deletes `plugins/<dir>`, preserves `settings/` and `data/` unless `purge_data: true`, strips `pluginOrder` / `disabledPlugins`, emits `loader/plugins_changed`, and replies `true`.
+- `loader/enable_plugin` / `loader/disable_plugin` with `args: [plugin_name]` (or `{ plugin_name }`) -> atomically updates `disabledPlugins`, starts or stops the plugin worker, emits `loader/plugins_changed`, and replies `true`.
+- `loader/set_plugin_order` with `args: [plugin_order: string[]]` (or `{ plugin_order | pluginOrder | order }`) -> atomically updates `pluginOrder`, emits `loader/plugins_changed`, and replies `true`.
+- `loader/get_settings` with `args: []` or `[dotted_key?]` (or `{ key? }`) -> returns the full `loader.json` object or dotted-path value (`null` if absent).
+- `loader/set_setting` with `args: [dotted_key, value]` (or `{ key, value }`) -> atomically writes a dotted key path in `loader.json` (rejecting direct writes to `pluginOrder`, `disabledPlugins`, and `disabled_plugins` with `ValueError`) and replies `true`.
+
+Server-to-client `EVENT` (`type: 5`) frames:
+- `loader/plugin_event`: `args` is `[{ "plugin": string, "event": string, "args": Value[] }]` emitted by a worker's `decky.emit(...)`, matching `WSRouter` listener spreading (`listener(...data.args)`).
+- `loader/plugins_changed`: `args` is `[PluginSummary[]]` broadcast after plugin install, uninstall, enable, disable, order changes, or debug manifest updates.
+- `zerodeck/plugin_reloaded`: `args` is `[{ "plugin": string, "directory": string }]` broadcast when the debug watcher reloads a `"debug"` plugin backend.
+- `zerodeck/frontend_reloaded`: `args` is `[{ "plugin": string, "directory": string }]` broadcast when the debug watcher detects changes under a `"debug"` plugin's `dist/` directory.
 
 If a plugin worker crashes or stops while a call is in flight (or is in `BackingOff`/`StartupTimeout`), the server responds with `DISCARD` (`2`) for that call ID.
 
-`FULL_SYNC` replays in-flight `CALL` messages upon WebSocket reconnection so pending calls recover seamlessly. Each inbound `CALL` and replayed call runs in its own spawned task so slow plugin calls never starve WebSocket keepalive `pong` handling. (There is no cross-connection reply cache yet, so replayed calls must be safe to repeat.)
+`FULL_SYNC` and `RECEIVED_RESPONSE` semantics (`WsSyncCache`, default capacity `256`, TTL `300 s`):
+- Inbound `CALL (0)` and `FULL_SYNC (4)` replays are keyed by `(call.id, call.route, canonical_args_json)`.
+- If an identical call is already in flight, the replay joins the active execution and receives its single result without spawning duplicate work.
+- If an identical call has completed and has not yet been acknowledged, the cached `REPLY`/`ERROR`/`DISCARD` frame is returned immediately without re-executing the call.
+- `RECEIVED_RESPONSE (3)` evicts completed cached entries matching `id`.
+- Each inbound `CALL` and replayed call runs in its own spawned task so slow plugin calls never starve WebSocket keepalive `pong` handling.
 
 Connection limits:
 - Inbound messages and frames above 16 MiB (`ServerConfig::ws_max_message_bytes`) close the connection.
@@ -88,7 +122,9 @@ The daemon spawns each active plugin over an anonymous Unix `socketpair()` FD (`
 
 ### `settings/loader.json`
 - `pluginOrder`: optional array of `plugin.json` `name` strings; listed plugins appear first in that order, with remaining plugins sorted deterministically by directory name.
-- `disabledPlugins` (also accepts `disabled_plugins` on read): optional array of `plugin.json` `name` strings whose workers are not spawned and whose RPC calls return disabled errors.
+- `disabledPlugins` (also accepts `disabled_plugins` on read, migrating on write): optional array of `plugin.json` `name` strings whose workers are not spawned and whose RPC calls return disabled errors.
+- `developer.allow_unverified_installs`: optional boolean (default `false`); when `false`, remote archive installs and `remote_binary` downloads fail closed without a valid SHA-256 digest.
+- Managed lifecycle keys (`pluginOrder`, `disabledPlugins`, `disabled_plugins`) must be mutated via `loader/set_plugin_order`, `loader/enable_plugin`, and `loader/disable_plugin` rather than `loader/set_setting`.
 
 ### Python Worker Modules & Environment
 - `zerodeck-py-host` injects `decky` (and `decky_plugin` alias), `settings` (`SettingsManager` with `read()`, `commit()`, `getSetting()`, `setSetting()`, atomic writes, and corrupt-file preservation), and `helpers` (`get_ssl_context()`, `get_homebrew_path()`, `get_user()`).

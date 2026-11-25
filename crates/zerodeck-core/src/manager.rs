@@ -1,15 +1,26 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::sync::broadcast;
-use zerodeck_platform::PlatformPaths;
+use zerodeck_platform::{PlatformError, PlatformPaths, SafePath};
 use zerodeck_plugin_host::{
-    PluginEvent, PluginSpawnSpec, PluginState, PluginSupervisor, SupervisorConfig,
+    HostError, PluginEvent, PluginSpawnSpec, PluginState, PluginSupervisor, SupervisorConfig,
 };
 use zerodeck_protocol::PluginLoadType;
 
-use crate::{CoreError, DiscoveredPlugin, SettingsManager, discover_plugins};
+use crate::discovery::discover_single_plugin;
+use crate::{
+    CheckedHttpClient, CoreError, DiscoveredPlugin, FilePicker, FilePickerListing, FilePickerQuery,
+    InstallOutcome, InstallPluginRequest, InstallerLimits, OutboundHttpPolicy, SettingsManager,
+    commit_staged_plugin, discover_plugins, prepare_staged_plugin,
+};
+
+const DISABLED_PLUGINS_KEY: &str = "disabledPlugins";
+const LEGACY_DISABLED_PLUGINS_KEY: &str = "disabled_plugins";
+const PLUGIN_ORDER_KEY: &str = "pluginOrder";
 
 /// Public snapshot of a discovered plugin and its runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +34,25 @@ pub struct PluginSummary {
     pub state: PluginState,
 }
 
-/// Coordinates discovered plugins, `loader.json` settings, and worker supervision.
+/// Target subdirectory scope when resolving static files inside an installed plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PluginFileScope {
+    Dist,
+    Assets,
+    Data,
+    FrontendBundle,
+}
+
+/// Top-level lifecycle and hot-reload events broadcast by [`PluginManager`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoaderEvent {
+    PluginsChanged(Vec<PluginSummary>),
+    PluginReloaded { plugin: String, directory: String },
+    FrontendReloaded { plugin: String, directory: String },
+}
+
+/// Coordinates discovered plugins, `loader.json` settings, plugin installation, and worker
+/// supervision.
 #[derive(Debug)]
 pub struct PluginManager {
     paths: PlatformPaths,
@@ -31,6 +60,10 @@ pub struct PluginManager {
     plugins: Mutex<Vec<DiscoveredPlugin>>,
     supervisor: PluginSupervisor,
     loader_version: String,
+    http_client: CheckedHttpClient,
+    installer_limits: InstallerLimits,
+    lifecycle_lock: tokio::sync::Mutex<()>,
+    loader_events_tx: broadcast::Sender<LoaderEvent>,
 }
 
 impl PluginManager {
@@ -46,7 +79,8 @@ impl PluginManager {
         Self::from_parts(paths, settings, plugins, config, loader_version)
     }
 
-    /// Constructs a [`PluginManager`] from already-loaded settings and discovered plugins.
+    /// Constructs a [`PluginManager`] from already-loaded settings and discovered plugins using the
+    /// production outbound HTTP policy and default installer limits.
     pub fn from_parts(
         paths: PlatformPaths,
         settings: SettingsManager,
@@ -54,18 +88,76 @@ impl PluginManager {
         config: SupervisorConfig,
         loader_version: impl Into<String>,
     ) -> Result<Self, CoreError> {
+        let http_client = CheckedHttpClient::new(OutboundHttpPolicy::production())?;
+        Self::with_http_config(
+            paths,
+            settings,
+            plugins,
+            config,
+            loader_version,
+            http_client,
+            InstallerLimits::default(),
+        )
+    }
+
+    /// Constructs a [`PluginManager`] with an explicit [`CheckedHttpClient`] and
+    /// [`InstallerLimits`].
+    pub fn with_http_config(
+        paths: PlatformPaths,
+        settings: SettingsManager,
+        plugins: Vec<DiscoveredPlugin>,
+        config: SupervisorConfig,
+        loader_version: impl Into<String>,
+        http_client: CheckedHttpClient,
+        installer_limits: InstallerLimits,
+    ) -> Result<Self, CoreError> {
         let supervisor = PluginSupervisor::new(paths.clone(), config)?;
+        let (loader_events_tx, _) = broadcast::channel(256);
         Ok(Self {
             paths,
             settings: Mutex::new(settings),
             plugins: Mutex::new(plugins),
             supervisor,
             loader_version: loader_version.into(),
+            http_client,
+            installer_limits,
+            lifecycle_lock: tokio::sync::Mutex::new(()),
+            loader_events_tx,
         })
+    }
+
+    /// Returns the resolved [`PlatformPaths`] hierarchy used by this manager.
+    #[must_use]
+    pub fn paths(&self) -> &PlatformPaths {
+        &self.paths
+    }
+
+    /// Returns the shared SSRF-guarded [`CheckedHttpClient`] configured on this manager.
+    #[must_use]
+    pub fn http_client(&self) -> &CheckedHttpClient {
+        &self.http_client
+    }
+
+    /// Returns the configured installer size and redirect limits.
+    #[must_use]
+    pub fn installer_limits(&self) -> &InstallerLimits {
+        &self.installer_limits
+    }
+
+    /// Returns `true` only when `developer.allow_unverified_installs` is explicitly `true` in
+    /// `loader.json`.
+    #[must_use]
+    pub fn allow_unverified_installs(&self) -> bool {
+        let guard = lock_unpoisoned(&self.settings);
+        matches!(
+            guard.get_path("developer.allow_unverified_installs"),
+            Some(Value::Bool(true))
+        )
     }
 
     /// Starts workers for all enabled, non-passive plugins in configured order.
     pub async fn start_all(&self) -> Result<(), CoreError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let disabled = self.disabled_set();
         let ordered = self.ordered_plugins();
         for plugin in ordered {
@@ -86,19 +178,17 @@ impl PluginManager {
         args: Value,
         legacy: bool,
     ) -> Result<Value, CoreError> {
-        let plugin = self.find_plugin(plugin_name).ok_or_else(|| {
-            CoreError::Host(zerodeck_plugin_host::HostError::PluginNotFound(
-                plugin_name.to_owned(),
-            ))
-        })?;
+        let plugin = self
+            .find_plugin(plugin_name)
+            .ok_or_else(|| CoreError::Host(HostError::PluginNotFound(plugin_name.to_owned())))?;
 
         if self.disabled_set().contains(&plugin.manifest.name) {
             return Err(CoreError::PluginDisabled(plugin.manifest.name));
         }
         if plugin.passive {
-            return Err(CoreError::Host(
-                zerodeck_plugin_host::HostError::PassivePlugin(plugin.manifest.name),
-            ));
+            return Err(CoreError::Host(HostError::PassivePlugin(
+                plugin.manifest.name,
+            )));
         }
 
         let res = self
@@ -108,31 +198,323 @@ impl PluginManager {
         Ok(res)
     }
 
-    /// Restarts an enabled, active plugin worker cleanly.
+    /// Restarts an enabled, active plugin worker cleanly after refreshing its on-disk manifests.
     pub async fn reload_plugin(&self, plugin_name: &str) -> Result<(), CoreError> {
-        let plugin = self.find_plugin(plugin_name).ok_or_else(|| {
-            CoreError::Host(zerodeck_plugin_host::HostError::PluginNotFound(
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let existing = self
+            .find_plugin(plugin_name)
+            .ok_or_else(|| CoreError::Host(HostError::PluginNotFound(plugin_name.to_owned())))?;
+
+        if self.disabled_set().contains(&existing.manifest.name) {
+            return Err(CoreError::PluginDisabled(existing.manifest.name));
+        }
+
+        let plugin_dir = self.paths.plugins_dir().join(&existing.directory);
+        if !plugin_dir.is_dir() {
+            return Err(CoreError::Host(HostError::PluginNotFound(
                 plugin_name.to_owned(),
-            ))
-        })?;
-
-        if self.disabled_set().contains(&plugin.manifest.name) {
-            return Err(CoreError::PluginDisabled(plugin.manifest.name));
+            )));
         }
-        if plugin.passive {
-            return Err(CoreError::Host(
-                zerodeck_plugin_host::HostError::PassivePlugin(plugin.manifest.name),
-            ));
+        let refreshed = discover_single_plugin(&plugin_dir, existing.directory.clone())?;
+        let metadata_changed = refreshed != existing;
+
+        if existing.manifest.name != refreshed.manifest.name
+            && self
+                .supervisor
+                .plugin_state(&existing.manifest.name)
+                .is_some()
+        {
+            shutdown_worker_if_present(&self.supervisor, &existing.manifest.name, false).await?;
         }
 
-        if self.supervisor.plugin_state(plugin_name).is_some() {
-            self.supervisor.reload_plugin(plugin_name).await?;
+        if metadata_changed {
+            self.replace_plugin_entry(&existing.directory, refreshed.clone());
+        }
+
+        let is_disabled = self.disabled_set().contains(&refreshed.manifest.name);
+        if refreshed.passive || is_disabled {
+            if self
+                .supervisor
+                .plugin_state(&refreshed.manifest.name)
+                .is_some()
+            {
+                shutdown_worker_if_present(&self.supervisor, &refreshed.manifest.name, false)
+                    .await?;
+            }
+            if metadata_changed {
+                self.emit_plugins_changed();
+            }
+            if is_disabled {
+                return Err(CoreError::PluginDisabled(refreshed.manifest.name));
+            }
+            return Err(CoreError::Host(HostError::PassivePlugin(
+                refreshed.manifest.name,
+            )));
+        }
+
+        if metadata_changed
+            || self
+                .supervisor
+                .plugin_state(&refreshed.manifest.name)
+                .is_none()
+        {
+            self.supervisor
+                .spawn_plugin(self.spawn_spec_for(&refreshed))
+                .await?;
         } else {
             self.supervisor
-                .spawn_plugin(self.spawn_spec_for(&plugin))
+                .reload_plugin(&refreshed.manifest.name)
                 .await?;
         }
+
+        if metadata_changed {
+            self.emit_plugins_changed();
+        }
+        let _ = self.loader_events_tx.send(LoaderEvent::PluginReloaded {
+            plugin: refreshed.manifest.name,
+            directory: refreshed.directory,
+        });
         Ok(())
+    }
+
+    /// Stages and atomically installs (or upgrades) a plugin from a remote or local ZIP archive.
+    ///
+    /// Download, SHA-256 verification, ZIP extraction, and `remote_binary` staging run before
+    /// acquiring the lifecycle lock, leaving any running worker untouched if staging fails.
+    #[allow(clippy::needless_pass_by_value)]
+    pub async fn install_plugin(
+        &self,
+        req: InstallPluginRequest,
+    ) -> Result<InstallOutcome, CoreError> {
+        let allow_unverified = self.allow_unverified_installs();
+        let staged = prepare_staged_plugin(
+            &self.paths,
+            &self.http_client,
+            &self.installer_limits,
+            &req,
+            allow_unverified,
+        )
+        .await?;
+
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let existing = self.find_plugin(&staged.manifest().name);
+        let plugins_dir = self.paths.plugins_dir();
+        let target_dir_name = match &existing {
+            Some(plugin) => plugin.directory.clone(),
+            None => self.disambiguate_directory(&plugins_dir, &staged.suggested_directory()),
+        };
+        let target_path = plugins_dir.join(&target_dir_name);
+
+        let had_running_worker = if let Some(prev) = &existing {
+            let was_active = self.supervisor.plugin_state(&prev.manifest.name).is_some();
+            if was_active {
+                shutdown_worker_if_present(&self.supervisor, &prev.manifest.name, false).await?;
+            }
+            was_active
+        } else {
+            false
+        };
+
+        let outcome = match commit_staged_plugin(staged, &target_path) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if had_running_worker
+                    && let Some(prev) = &existing
+                    && !prev.passive
+                    && !self.disabled_set().contains(&prev.manifest.name)
+                {
+                    let _ = self
+                        .supervisor
+                        .spawn_plugin(self.spawn_spec_for(prev))
+                        .await;
+                }
+                return Err(err);
+            }
+        };
+
+        let discovered = discover_single_plugin(&target_path, outcome.directory.clone())?;
+        self.upsert_plugin_entry(discovered.clone());
+
+        let is_disabled = self.disabled_set().contains(&discovered.manifest.name);
+        let spawn_result = if !discovered.passive && !is_disabled {
+            self.supervisor
+                .spawn_plugin(self.spawn_spec_for(&discovered))
+                .await
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+
+        self.emit_plugins_changed();
+        spawn_result?;
+        Ok(outcome)
+    }
+
+    /// Stops and removes an installed plugin, optionally deleting its settings and runtime data.
+    pub async fn uninstall_plugin(
+        &self,
+        plugin_name: &str,
+        purge_data: bool,
+    ) -> Result<(), CoreError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let plugin = self
+            .find_plugin(plugin_name)
+            .ok_or_else(|| CoreError::Host(HostError::PluginNotFound(plugin_name.to_owned())))?;
+
+        shutdown_worker_if_present(&self.supervisor, &plugin.manifest.name, true).await?;
+
+        remove_path_if_exists(&self.paths.plugins_dir().join(&plugin.directory))?;
+        if purge_data {
+            remove_path_if_exists(&self.paths.settings_dir().join(&plugin.directory))?;
+            remove_path_if_exists(&self.paths.data_dir().join(&plugin.directory))?;
+        }
+
+        self.remove_plugin_entry(&plugin.directory);
+        self.strip_plugin_from_loader_settings(&plugin.manifest.name)?;
+        self.emit_plugins_changed();
+        Ok(())
+    }
+
+    /// Enables a plugin in `loader.json` and starts its worker when non-passive.
+    pub async fn enable_plugin(&self, plugin_name: &str) -> Result<(), CoreError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let plugin = self
+            .find_plugin(plugin_name)
+            .ok_or_else(|| CoreError::Host(HostError::PluginNotFound(plugin_name.to_owned())))?;
+
+        self.mutate_disabled_plugins(|list| {
+            let before = list.len();
+            list.retain(|entry| entry != &plugin.manifest.name);
+            list.len() != before
+        })?;
+
+        if !plugin.passive {
+            let needs_spawn = !matches!(
+                self.supervisor.plugin_state(&plugin.manifest.name),
+                Some(PluginState::Running | PluginState::Starting)
+            );
+            if needs_spawn {
+                self.supervisor
+                    .spawn_plugin(self.spawn_spec_for(&plugin))
+                    .await?;
+            }
+        }
+
+        self.emit_plugins_changed();
+        Ok(())
+    }
+
+    /// Persists a plugin's disabled state in `loader.json` and stops any active worker.
+    pub async fn disable_plugin(&self, plugin_name: &str) -> Result<(), CoreError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let plugin = self
+            .find_plugin(plugin_name)
+            .ok_or_else(|| CoreError::Host(HostError::PluginNotFound(plugin_name.to_owned())))?;
+
+        self.mutate_disabled_plugins(|list| {
+            if list.iter().any(|entry| entry == &plugin.manifest.name) {
+                false
+            } else {
+                list.push(plugin.manifest.name.clone());
+                true
+            }
+        })?;
+
+        shutdown_worker_if_present(&self.supervisor, &plugin.manifest.name, false).await?;
+        self.emit_plugins_changed();
+        Ok(())
+    }
+
+    /// Persists `pluginOrder` in `loader.json` and notifies subscribers.
+    pub async fn set_plugin_order(&self, order: Vec<String>) -> Result<(), CoreError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        {
+            let mut guard = lock_unpoisoned(&self.settings);
+            guard.set(PLUGIN_ORDER_KEY, order)?;
+        }
+        self.emit_plugins_changed();
+        Ok(())
+    }
+
+    /// Reads either the full `loader.json` map (`None`) or a dotted setting key (`Some(key)`).
+    #[must_use]
+    pub fn get_setting(&self, dotted_key: Option<&str>) -> Value {
+        let guard = lock_unpoisoned(&self.settings);
+        match dotted_key {
+            None => Value::Object(guard.values().clone()),
+            Some(key) => guard.get_path(key).unwrap_or(Value::Null),
+        }
+    }
+
+    /// Atomically updates a dotted setting key in `loader.json`, rejecting lifecycle-managed keys.
+    pub fn set_setting(&self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
+        let root_key = dotted_key.split('.').next().unwrap_or("");
+        if matches!(
+            root_key,
+            PLUGIN_ORDER_KEY | DISABLED_PLUGINS_KEY | LEGACY_DISABLED_PLUGINS_KEY
+        ) {
+            return Err(CoreError::InvalidSetting(format!(
+                "setting `{dotted_key}` is managed by loader lifecycle methods; use set_plugin_order / enable_plugin / disable_plugin"
+            )));
+        }
+        let mut guard = lock_unpoisoned(&self.settings);
+        guard.set_path(dotted_key, value)
+    }
+
+    /// Lists files inside the path-jailed filepicker roots.
+    pub fn list_files(&self, query: FilePickerQuery) -> Result<FilePickerListing, CoreError> {
+        FilePicker::list(&self.paths, query)
+    }
+
+    /// Resolves a plugin-scoped static file (`dist/`, `assets/`, `data/`, or `dist/index.js`),
+    /// matching `plugin_id` by `manifest.name` first and falling back to `directory`.
+    pub fn resolve_plugin_file(
+        &self,
+        plugin_id: &str,
+        scope: PluginFileScope,
+        rel_path: &str,
+    ) -> Result<PathBuf, CoreError> {
+        let plugin = self
+            .find_plugin_by_id(plugin_id)
+            .ok_or_else(|| CoreError::Host(HostError::PluginNotFound(plugin_id.to_owned())))?;
+
+        let (base_root, scope_root, effective_rel) = match scope {
+            PluginFileScope::Dist => {
+                let plugin_root = self.paths.plugins_dir().join(&plugin.directory);
+                (plugin_root.clone(), plugin_root.join("dist"), rel_path)
+            }
+            PluginFileScope::Assets => {
+                let plugin_root = self.paths.plugins_dir().join(&plugin.directory);
+                (plugin_root.clone(), plugin_root.join("assets"), rel_path)
+            }
+            PluginFileScope::Data => (
+                self.paths.data_dir(),
+                self.paths.data_dir().join(&plugin.directory),
+                rel_path,
+            ),
+            PluginFileScope::FrontendBundle => {
+                let plugin_root = self.paths.plugins_dir().join(&plugin.directory);
+                (plugin_root.clone(), plugin_root.join("dist"), "index.js")
+            }
+        };
+
+        validate_rel_path_components(&scope_root, effective_rel)?;
+        let base_jail = SafePath::new(&base_root)?;
+        let scope_jail = SafePath::new(&scope_root)?;
+        if !scope_jail.root().starts_with(base_jail.root()) {
+            return Err(CoreError::Platform(PlatformError::PathEscape {
+                candidate: scope_jail.root().to_path_buf(),
+                root: base_jail.root().to_path_buf(),
+            }));
+        }
+
+        resolve_static_file(&scope_root, effective_rel)
+    }
+
+    /// Resolves a relative file path inside `root` through [`SafePath`] and ensures it points to a
+    /// regular file.
+    pub fn resolve_static_file(root: &Path, rel_path: &str) -> Result<PathBuf, CoreError> {
+        resolve_static_file(root, rel_path)
     }
 
     /// Returns plugins ordered by `loader.json`'s `pluginOrder` with unlisted plugins appended
@@ -174,9 +556,41 @@ impl PluginManager {
         self.supervisor.subscribe_events()
     }
 
+    /// Subscribes to top-level [`LoaderEvent`] notifications (`PluginsChanged`, `PluginReloaded`,
+    /// `FrontendReloaded`).
+    #[must_use]
+    pub fn subscribe_loader_events(&self) -> broadcast::Receiver<LoaderEvent> {
+        self.loader_events_tx.subscribe()
+    }
+
     /// Shuts down all running plugin workers gracefully.
     pub async fn shutdown_all(&self) {
         self.supervisor.shutdown_all().await;
+    }
+
+    pub(crate) fn debug_plugins_snapshot(&self) -> Vec<DiscoveredPlugin> {
+        let disabled = self.disabled_set();
+        let guard = lock_unpoisoned(&self.plugins);
+        guard
+            .iter()
+            .filter(|plugin| {
+                plugin.manifest.is_debug() && !disabled.contains(&plugin.manifest.name)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn emit_frontend_reloaded(&self, plugin: &str, directory: &str) {
+        let _ = self.loader_events_tx.send(LoaderEvent::FrontendReloaded {
+            plugin: plugin.to_owned(),
+            directory: directory.to_owned(),
+        });
+    }
+
+    fn emit_plugins_changed(&self) {
+        let _ = self
+            .loader_events_tx
+            .send(LoaderEvent::PluginsChanged(self.list_plugins()));
     }
 
     fn spawn_spec_for(&self, plugin: &DiscoveredPlugin) -> PluginSpawnSpec {
@@ -203,11 +617,100 @@ impl PluginManager {
             .cloned()
     }
 
+    fn find_plugin_by_id(&self, plugin_id: &str) -> Option<DiscoveredPlugin> {
+        let guard = lock_unpoisoned(&self.plugins);
+        guard
+            .iter()
+            .find(|plugin| plugin.manifest.name == plugin_id)
+            .or_else(|| guard.iter().find(|plugin| plugin.directory == plugin_id))
+            .cloned()
+    }
+
+    fn upsert_plugin_entry(&self, plugin: DiscoveredPlugin) {
+        let mut guard = lock_unpoisoned(&self.plugins);
+        if let Some(slot) = guard
+            .iter_mut()
+            .find(|p| p.directory == plugin.directory || p.manifest.name == plugin.manifest.name)
+        {
+            *slot = plugin;
+        } else {
+            guard.push(plugin);
+        }
+        guard.sort_by(|a, b| a.directory.cmp(&b.directory));
+    }
+
+    fn replace_plugin_entry(&self, directory: &str, plugin: DiscoveredPlugin) {
+        let mut guard = lock_unpoisoned(&self.plugins);
+        if let Some(slot) = guard.iter_mut().find(|p| p.directory == directory) {
+            *slot = plugin;
+        } else {
+            guard.push(plugin);
+        }
+        guard.sort_by(|a, b| a.directory.cmp(&b.directory));
+    }
+
+    fn remove_plugin_entry(&self, directory: &str) {
+        let mut guard = lock_unpoisoned(&self.plugins);
+        guard.retain(|p| p.directory != directory);
+    }
+
+    fn disambiguate_directory(&self, plugins_dir: &Path, base: &str) -> String {
+        let known_dirs: HashSet<String> = {
+            let guard = lock_unpoisoned(&self.plugins);
+            guard.iter().map(|p| p.directory.clone()).collect()
+        };
+        let is_occupied = |candidate: &str| -> bool {
+            known_dirs.contains(candidate)
+                || fs::symlink_metadata(plugins_dir.join(candidate)).is_ok()
+        };
+
+        if !is_occupied(base) {
+            return base.to_owned();
+        }
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if !is_occupied(&candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn mutate_disabled_plugins<F>(&self, update: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(&mut Vec<String>) -> bool,
+    {
+        let mut guard = lock_unpoisoned(&self.settings);
+        guard.update_map(|map| {
+            let mut list = read_disabled_list(map);
+            let list_changed = update(&mut list);
+            let had_legacy = map.remove(LEGACY_DISABLED_PLUGINS_KEY).is_some();
+            if !list_changed && !had_legacy {
+                return Ok(false);
+            }
+            let encoded = serde_json::to_value(list)?;
+            map.insert(DISABLED_PLUGINS_KEY.to_owned(), encoded);
+            Ok(true)
+        })
+    }
+
+    fn strip_plugin_from_loader_settings(&self, manifest_name: &str) -> Result<(), CoreError> {
+        let mut guard = lock_unpoisoned(&self.settings);
+        guard.update_map(|map| {
+            let mut changed = false;
+            changed |= strip_name_from_array_key(map, PLUGIN_ORDER_KEY, manifest_name);
+            changed |= strip_name_from_array_key(map, DISABLED_PLUGINS_KEY, manifest_name);
+            changed |= strip_name_from_array_key(map, LEGACY_DISABLED_PLUGINS_KEY, manifest_name);
+            Ok(changed)
+        })
+    }
+
     fn disabled_set(&self) -> HashSet<String> {
         let guard = lock_unpoisoned(&self.settings);
         let list = guard
-            .get::<Vec<String>>("disabledPlugins")
-            .or_else(|| guard.get::<Vec<String>>("disabled_plugins"))
+            .get::<Vec<String>>(DISABLED_PLUGINS_KEY)
+            .or_else(|| guard.get::<Vec<String>>(LEGACY_DISABLED_PLUGINS_KEY))
             .unwrap_or_default();
         list.into_iter().collect()
     }
@@ -215,7 +718,9 @@ impl PluginManager {
     fn ordered_plugins(&self) -> Vec<DiscoveredPlugin> {
         let order = {
             let guard = lock_unpoisoned(&self.settings);
-            guard.get::<Vec<String>>("pluginOrder").unwrap_or_default()
+            guard
+                .get::<Vec<String>>(PLUGIN_ORDER_KEY)
+                .unwrap_or_default()
         };
         let plugins = lock_unpoisoned(&self.plugins).clone();
 
@@ -240,6 +745,117 @@ impl PluginManager {
         sorted.extend(remaining);
         sorted
     }
+}
+
+/// Resolves a relative file path inside `root` through [`SafePath`] and verifies it refers to a
+/// regular file.
+pub fn resolve_static_file(root: &Path, rel_path: &str) -> Result<PathBuf, CoreError> {
+    validate_rel_path_components(root, rel_path)?;
+    let jail = SafePath::new(root)?;
+    if rel_path.is_empty() {
+        return Err(CoreError::Io {
+            path: jail.root().to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "requested static path is empty",
+            ),
+        });
+    }
+
+    let canonical = jail.resolve(rel_path)?;
+    let meta = fs::metadata(&canonical).map_err(|source| CoreError::Io {
+        path: canonical.clone(),
+        source,
+    })?;
+    if !meta.is_file() {
+        return Err(CoreError::Io {
+            path: canonical,
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "requested static path is not a regular file",
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
+fn validate_rel_path_components(root: &Path, rel_path: &str) -> Result<(), CoreError> {
+    if rel_path.contains('\0') || rel_path.contains('\\') {
+        return Err(CoreError::Platform(PlatformError::PathEscape {
+            candidate: PathBuf::from(rel_path),
+            root: root.to_path_buf(),
+        }));
+    }
+    for component in Path::new(rel_path).components() {
+        if matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        ) {
+            return Err(CoreError::Platform(PlatformError::PathEscape {
+                candidate: PathBuf::from(rel_path),
+                root: root.to_path_buf(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+async fn shutdown_worker_if_present(
+    supervisor: &PluginSupervisor,
+    plugin_name: &str,
+    uninstall: bool,
+) -> Result<(), CoreError> {
+    match supervisor.shutdown_plugin(plugin_name, uninstall).await {
+        Ok(()) | Err(HostError::PluginNotFound(_)) => Ok(()),
+        Err(err) => Err(CoreError::Host(err)),
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<(), CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => fs::remove_dir_all(path)
+            .map_err(|source| CoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        Ok(_) => fs::remove_file(path).map_err(|source| CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn read_disabled_list(map: &Map<String, Value>) -> Vec<String> {
+    let raw = map
+        .get(DISABLED_PLUGINS_KEY)
+        .or_else(|| map.get(LEGACY_DISABLED_PLUGINS_KEY));
+    let Some(Value::Array(items)) = raw else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut list = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(name) = item.as_str()
+            && seen.insert(name.to_owned())
+        {
+            list.push(name.to_owned());
+        }
+    }
+    list
+}
+
+fn strip_name_from_array_key(map: &mut Map<String, Value>, key: &str, name: &str) -> bool {
+    let Some(Value::Array(items)) = map.get_mut(key) else {
+        return false;
+    };
+    let before = items.len();
+    items.retain(|entry| entry.as_str() != Some(name));
+    items.len() != before
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

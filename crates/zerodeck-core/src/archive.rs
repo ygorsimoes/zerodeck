@@ -145,12 +145,12 @@ pub fn extract_zip_safely_with_limits(
         source,
     })?;
 
-    let written = write_entries(&mut archive, entries, &staging, limits.max_total_bytes).and_then(
-        |relative| {
+    let written = set_dir_permissions(&staging)
+        .and_then(|()| write_entries(&mut archive, entries, &staging, limits.max_total_bytes))
+        .and_then(|relative| {
             swap_into_place(&staging, &final_dest, &parent, &dest_name)?;
             Ok(relative)
-        },
-    );
+        });
     match written {
         Ok(relative) => Ok(relative
             .into_iter()
@@ -229,20 +229,14 @@ fn write_entries(
         let out_path = root.join(&rel_path);
 
         if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|source| CoreError::Io {
-                path: out_path.clone(),
-                source,
-            })?;
-            ensure_inside_canonical_root(&out_path, root, &entry_name)?;
+            create_dir_all_normalized(&rel_path, root, &entry_name)?;
             continue;
         }
 
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| CoreError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-            ensure_inside_canonical_root(parent, root, &entry_name)?;
+        if let Some(rel_parent) = rel_path.parent()
+            && !rel_parent.as_os_str().is_empty()
+        {
+            create_dir_all_normalized(rel_parent, root, &entry_name)?;
         }
         if let Ok(meta) = fs::symlink_metadata(&out_path)
             && meta.file_type().is_symlink()
@@ -269,21 +263,82 @@ fn write_entries(
         }
 
         #[cfg(unix)]
-        if let Some(mode) = unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
-            fs::set_permissions(&out_path, fs::Permissions::from_mode(perms)).map_err(
-                |source| CoreError::Io {
-                    path: out_path.clone(),
-                    source,
-                },
-            )?;
+        {
+            let perms = if unix_mode.is_some_and(|mode| mode & 0o111 != 0) {
+                0o755
+            } else {
+                0o644
+            };
+            set_unix_mode(&out_path, perms)?;
         }
+        #[cfg(not(unix))]
+        let _ = unix_mode;
 
         extracted.push(rel_path);
     }
 
     Ok(extracted)
+}
+
+fn set_dir_permissions(path: &Path) -> Result<(), CoreError> {
+    #[cfg(unix)]
+    {
+        set_unix_mode(path, 0o755)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) -> Result<(), CoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn create_dir_all_normalized(
+    rel_dir: &Path,
+    root: &Path,
+    entry_name: &str,
+) -> Result<(), CoreError> {
+    let mut cur = root.to_path_buf();
+    for component in rel_dir.components() {
+        if let std::path::Component::Normal(part) = component {
+            cur.push(part);
+            match fs::symlink_metadata(&cur) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(CoreError::UnsafeArchiveEntry {
+                        entry: entry_name.to_owned(),
+                    });
+                }
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    return Err(CoreError::Io {
+                        path: cur.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "archive directory path collides with existing non-directory",
+                        ),
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&cur).map_err(|source| CoreError::Io {
+                        path: cur.clone(),
+                        source,
+                    })?;
+                }
+                Err(source) => {
+                    return Err(CoreError::Io { path: cur, source });
+                }
+            }
+            set_dir_permissions(&cur)?;
+        }
+    }
+    ensure_inside_canonical_root(&cur, root, entry_name)
 }
 
 /// Moves `staging` to `final_dest`, parking any previous `final_dest` aside and restoring it if

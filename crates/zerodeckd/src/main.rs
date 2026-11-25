@@ -8,7 +8,10 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use zerodeck_cef::CefConfig;
-use zerodeck_core::{PluginManager, SettingsManager, discover_plugins};
+use zerodeck_core::{
+    InstallerLimits, OutboundHttpPolicy, PluginManager, SettingsManager, discover_plugins,
+    start_debug_watcher,
+};
 use zerodeck_platform::PlatformPaths;
 use zerodeck_plugin_host::{PythonHostConfig, SupervisorConfig};
 use zerodeck_protocol::WsMessageType;
@@ -64,6 +67,35 @@ fn resolve_python_host_path() -> Option<String> {
         .into_iter()
         .find(|dir| dir.join("zerodeck_py_host").is_dir())
         .map(|dir| dir.canonicalize().unwrap_or(dir).display().to_string())
+}
+
+/// Resolves the packaged `@zerodeck/frontend` directory from `ZERODECK_FRONTEND_DIR` or standard
+/// install/repo locations.
+fn resolve_frontend_path() -> Option<PathBuf> {
+    if let Ok(env_dir) = std::env::var("ZERODECK_FRONTEND_DIR")
+        && !env_dir.is_empty()
+    {
+        let dir = PathBuf::from(&env_dir);
+        if dir.is_dir() {
+            return Some(dir.canonicalize().unwrap_or(dir));
+        }
+        warn!(path = %env_dir, "ZERODECK_FRONTEND_DIR does not point to a directory");
+        return None;
+    }
+
+    let mut candidates = vec![PathBuf::from("/opt/zerodeck/frontend")];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("../frontend"));
+    }
+    candidates.push(PathBuf::from("frontend/dist"));
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../frontend/dist"));
+
+    candidates
+        .into_iter()
+        .find(|dir| dir.is_dir())
+        .map(|dir| dir.canonicalize().unwrap_or(dir))
 }
 
 /// Resolves `host:port` (IP literal or hostname) to socket addresses.
@@ -151,6 +183,99 @@ async fn shutdown_signal() {
     info!("received shutdown signal, draining ZeroDeck server");
 }
 
+async fn run_daemon(
+    cli: Cli,
+    paths: PlatformPaths,
+    settings: SettingsManager,
+    plugins: Vec<zerodeck_core::DiscoveredPlugin>,
+) -> Result<()> {
+    let python_host = PythonHostConfig {
+        host_module_path: resolve_python_host_path(),
+        ..PythonHostConfig::default()
+    };
+    let config = ServerConfig {
+        host: cli.host,
+        port: cli.port,
+        cef: CefConfig::default(),
+        python_host: python_host.clone(),
+        frontend_dir: resolve_frontend_path(),
+        ..ServerConfig::default()
+    };
+    let http_client = OutboundHttpPolicy::production()
+        .with_timeouts(
+            Some(config.fetch_connect_timeout),
+            Some(config.fetch_response_timeout),
+        )
+        .build_checked_client()
+        .context("initialize outbound HTTP client")?;
+    let installer_limits = InstallerLimits {
+        max_zip_download_bytes: config.max_zip_download_bytes,
+        max_remote_binary_bytes: config.max_remote_binary_bytes,
+        ..InstallerLimits::default()
+    };
+    let sup_config = SupervisorConfig {
+        python_host,
+        ..SupervisorConfig::default()
+    };
+    let manager = Arc::new(
+        PluginManager::with_http_config(
+            paths,
+            settings,
+            plugins,
+            sup_config,
+            env!("CARGO_PKG_VERSION"),
+            http_client,
+            installer_limits,
+        )
+        .context("initialize plugin manager")?,
+    );
+    if let Err(err) = manager.start_all().await {
+        warn!(error = %err, "one or more plugins failed during startup");
+    }
+
+    let listener = match resolve(&config.host, config.port).await {
+        Ok(addrs) => match bind_first(&addrs).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                manager.shutdown_all().await;
+                return Err(err);
+            }
+        },
+        Err(err) => {
+            manager.shutdown_all().await;
+            return Err(err);
+        }
+    };
+    let addr = listener.local_addr().context("read bound address")?;
+    let watcher = match start_debug_watcher(Arc::clone(&manager)) {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            warn!(error = %err, "failed to start debug hot-reload watcher");
+            None
+        }
+    };
+    let frontend_dir = config
+        .frontend_dir
+        .as_ref()
+        .map(|p| p.display().to_string());
+    let state = AppState::with_manager_and_http(
+        config,
+        Arc::clone(&manager),
+        manager.http_client().clone(),
+    );
+
+    info!(listen = %addr, frontend_dir = ?frontend_dir, "ZeroDeck daemon listening");
+    let serve_result = serve(listener, state, shutdown_signal())
+        .await
+        .context("serve HTTP/WS");
+
+    if let Some(watcher) = watcher {
+        watcher.stop().await;
+    }
+    manager.shutdown_all().await;
+    serve_result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -178,44 +303,5 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let python_host = PythonHostConfig {
-        host_module_path: resolve_python_host_path(),
-        ..PythonHostConfig::default()
-    };
-    let sup_config = SupervisorConfig {
-        python_host: python_host.clone(),
-        ..SupervisorConfig::default()
-    };
-    let manager = Arc::new(
-        PluginManager::from_parts(
-            paths,
-            settings,
-            plugins,
-            sup_config,
-            env!("CARGO_PKG_VERSION"),
-        )
-        .context("initialize plugin manager")?,
-    );
-    if let Err(err) = manager.start_all().await {
-        warn!(error = %err, "one or more plugins failed during startup");
-    }
-
-    let config = ServerConfig {
-        host: cli.host,
-        port: cli.port,
-        cef: CefConfig::default(),
-        python_host,
-        ..ServerConfig::default()
-    };
-    let listener = bind_first(&resolve(&config.host, config.port).await?).await?;
-    let addr = listener.local_addr().context("read bound address")?;
-    let state = AppState::with_manager(config, Arc::clone(&manager));
-
-    info!(listen = %addr, "ZeroDeck daemon listening");
-    let serve_result = serve(listener, state, shutdown_signal())
-        .await
-        .context("serve HTTP/WS");
-
-    manager.shutdown_all().await;
-    serve_result
+    run_daemon(cli, paths, settings, plugins).await
 }

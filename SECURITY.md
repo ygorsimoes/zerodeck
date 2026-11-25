@@ -34,15 +34,16 @@ Please include as much of the following as possible:
 ZeroDeck enforces defense-in-depth across the following areas.
 
 **In place today** (covered by tests and CI):
-- Path-jail canonicalization (`SafePath`): canonicalized paths that cannot escape their root, symlinks included
+- Path-jail canonicalization (`SafePath`): canonicalized paths that cannot escape their root, symlinks included (across plugin `dist/`, `assets/`, `data/`, frontend static bundles, `file://` sideloads, and `FilePicker` roots)
 - Atomic settings writes (temp file + `fsync` + rename)
-- Zip-Slip (`enclosed_name()`), symlink and size checks during archive extraction, with all-or-nothing installs
-- Fail-closed SHA-256 verification for downloads
-- Ephemeral auth token (`X-Decky-Auth` / `?auth=`) on mutating, IPC, `/ws` and `/fetch` endpoints, compared in constant time, plus strict `https://steamloopback.host` CORS and DNS-rebinding protection
+- Zip-Slip (`enclosed_name()`), symlink, size, and `UMask=0077` permission (`0755`/`0644`) checks during archive extraction, with staged atomic swaps and rollback on failed installs/upgrades
+- Fail-closed SHA-256 verification for remote plugin archives and `remote_binary` downloads (unless explicitly disabled via `developer.allow_unverified_installs`)
+- Out-of-process plugin workers with explicit `uid`/`gid` privilege dropping for plugins without the `"root"` flag
+- Private plugin IPC over inherited `socketpair()` FDs with sanitized `env_clear()` worker environments (no predictable `/tmp` socket paths)
+- Ephemeral auth token (`X-Decky-Auth` / `?auth=`) on mutating, IPC, `/ws` and `/fetch` endpoints, compared in constant time, plus strict `https://steamloopback.host` CORS and loopback `Host` DNS-rebinding protection
+- SSRF-hardened outbound HTTP policy (`OutboundHttpPolicy` + `CheckedHttpClient`): blocks loopback and link-local/metadata addresses (including DNS-rebinding pinning, IPv4-mapped IPv6 forms, and up to 5 redirect hops), strips sensitive headers across cross-origin redirects, and blocks hop-by-hop / auth `X-Decky-Header-*` translations on `/fetch`
 - Fuzzing of the untrusted-input parsers (WebSocket frames, worker IPC, manifests, ZIP extraction) on every pull request
 - Supply chain: `cargo-deny` license, advisory and source policy (`deny.toml`); GitHub Actions pinned by commit SHA and audited with `zizmor`; toolchain binaries pinned by SHA-256; release images and tarballs ship with signed build-provenance attestations and an SBOM
 
 **Planned** (see the [roadmap](README.md#roadmap)):
-- Out-of-process plugin workers with explicit `uid`/`gid` privilege dropping for plugins without the `"root"` flag
-- Private plugin IPC over inherited `socketpair()` FDs or per-plugin `0700` runtime directories (never predictable `/tmp` socket paths)
-- Path-jailed plugin static, asset and data routes and file-picker roots
+- Steam CEF debugging hardening and crash recovery ([Phase 4](README.md#roadmap))

@@ -207,6 +207,25 @@ mod tests {
     }
 
     #[test]
+    fn discover_plugins_skips_duplicate_names_keeping_first_directory() {
+        let dir = TestDir::new("discover-duplicate-name");
+        for directory in ["b-orig", "a-copy"] {
+            let plugin = dir.0.join(directory);
+            fs::create_dir_all(&plugin).expect("create plugin dir");
+            fs::write(
+                plugin.join("plugin.json"),
+                r#"{"name": "Same", "author": "Alice"}"#,
+            )
+            .expect("write plugin.json");
+        }
+
+        let plugins = discover_plugins(&dir.0).expect("discover plugins");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].manifest.name, "Same");
+        assert_eq!(plugins[0].directory, "a-copy");
+    }
+
+    #[test]
     fn discover_plugins_ignores_hidden_staging_directories() {
         let dir = TestDir::new("discover-hidden");
         for name in ["visible", ".visible.staging-1234"] {

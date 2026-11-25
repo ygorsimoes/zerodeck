@@ -5,13 +5,15 @@ use std::sync::Mutex;
 
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
-use zerodeck_platform::{PlatformError, PlatformPaths, SafePath};
+use tracing::{info_span, warn};
+use zerodeck_platform::{OwnershipViolation, PlatformError, PlatformPaths, SafePath};
 use zerodeck_plugin_host::{
     HostError, PluginEvent, PluginSpawnSpec, PluginState, PluginSupervisor, SupervisorConfig,
 };
 use zerodeck_protocol::PluginLoadType;
 
 use crate::discovery::discover_single_plugin;
+use crate::preflight::{PreflightInput, preflight};
 use crate::{
     CheckedHttpClient, CoreError, DiscoveredPlugin, FilePicker, FilePickerListing, FilePickerQuery,
     InstallOutcome, InstallPluginRequest, InstallerLimits, OutboundHttpPolicy, SettingsManager,
@@ -21,6 +23,9 @@ use crate::{
 const DISABLED_PLUGINS_KEY: &str = "disabledPlugins";
 const LEGACY_DISABLED_PLUGINS_KEY: &str = "disabled_plugins";
 const PLUGIN_ORDER_KEY: &str = "pluginOrder";
+/// Developer opt-in that starts `"root"` plugins from trees a non-root user can modify. Only
+/// settable by editing `loader.json` on disk: [`PluginManager::set_setting`] rejects it.
+const ALLOW_UNSAFE_ROOT_PLUGINS_PATH: &str = "developer.allow_unsafe_root_plugins";
 
 /// Public snapshot of a discovered plugin and its runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +37,8 @@ pub struct PluginSummary {
     pub disabled: bool,
     pub passive: bool,
     pub state: PluginState,
+    /// Why the plugin's worker was refused at spawn; `state` is `Failed` while this is set.
+    pub failure_reason: Option<String>,
 }
 
 /// Target subdirectory scope when resolving static files inside an installed plugin.
@@ -64,6 +71,10 @@ pub struct PluginManager {
     installer_limits: InstallerLimits,
     lifecycle_lock: tokio::sync::Mutex<()>,
     loader_events_tx: broadcast::Sender<LoaderEvent>,
+    daemon_is_root: bool,
+    python_host_missing: Mutex<Option<String>>,
+    /// Spawn preflight refusals by `manifest.name`, cleared when a later preflight passes.
+    failure_reasons: Mutex<HashMap<String, String>>,
 }
 
 impl PluginManager {
@@ -123,6 +134,9 @@ impl PluginManager {
             installer_limits,
             lifecycle_lock: tokio::sync::Mutex::new(()),
             loader_events_tx,
+            daemon_is_root: daemon_is_root(),
+            python_host_missing: Mutex::new(None),
+            failure_reasons: Mutex::new(HashMap::new()),
         })
     }
 
@@ -155,6 +169,12 @@ impl PluginManager {
         )
     }
 
+    /// Records why the Python worker host cannot run; while set, every backend plugin spawn fails
+    /// with that reason instead of retrying.
+    pub fn set_python_host_missing(&self, reason: Option<String>) {
+        *lock_unpoisoned(&self.python_host_missing) = reason;
+    }
+
     /// Starts workers for all enabled, non-passive plugins in configured order.
     pub async fn start_all(&self) -> Result<(), CoreError> {
         let _lifecycle = self.lifecycle_lock.lock().await;
@@ -164,8 +184,12 @@ impl PluginManager {
             if plugin.passive || disabled.contains(&plugin.manifest.name) {
                 continue;
             }
-            let spec = self.spawn_spec_for(&plugin);
-            self.supervisor.spawn_plugin(spec).await?;
+            match self.spawn_checked(&plugin).await {
+                Err(err @ CoreError::PluginBlocked { .. }) => {
+                    warn!(error = %err, "plugin not started");
+                }
+                other => other?,
+            }
         }
         Ok(())
     }
@@ -189,6 +213,12 @@ impl PluginManager {
             return Err(CoreError::Host(HostError::PassivePlugin(
                 plugin.manifest.name,
             )));
+        }
+        if let Some(reason) = self.failure_reason(&plugin.manifest.name) {
+            return Err(CoreError::PluginBlocked {
+                name: plugin.manifest.name,
+                reason,
+            });
         }
 
         let res = self
@@ -241,6 +271,7 @@ impl PluginManager {
                 shutdown_worker_if_present(&self.supervisor, &refreshed.manifest.name, false)
                     .await?;
             }
+            self.clear_failure_reason(&refreshed.manifest.name);
             if metadata_changed {
                 self.emit_plugins_changed();
             }
@@ -251,6 +282,16 @@ impl PluginManager {
                 refreshed.manifest.name,
             )));
         }
+
+        let cleared_failure = match self.preflight_plugin(&refreshed) {
+            Ok(cleared) => cleared,
+            Err(err) => {
+                shutdown_worker_if_present(&self.supervisor, &refreshed.manifest.name, false)
+                    .await?;
+                self.emit_plugins_changed();
+                return Err(err);
+            }
+        };
 
         if metadata_changed
             || self
@@ -267,7 +308,7 @@ impl PluginManager {
                 .await?;
         }
 
-        if metadata_changed {
+        if metadata_changed || cleared_failure {
             self.emit_plugins_changed();
         }
         let _ = self.loader_events_tx.send(LoaderEvent::PluginReloaded {
@@ -323,10 +364,7 @@ impl PluginManager {
                     && !prev.passive
                     && !self.disabled_set().contains(&prev.manifest.name)
                 {
-                    let _ = self
-                        .supervisor
-                        .spawn_plugin(self.spawn_spec_for(prev))
-                        .await;
+                    let _ = self.spawn_checked(prev).await;
                 }
                 return Err(err);
             }
@@ -337,10 +375,7 @@ impl PluginManager {
 
         let is_disabled = self.disabled_set().contains(&discovered.manifest.name);
         let spawn_result = if !discovered.passive && !is_disabled {
-            self.supervisor
-                .spawn_plugin(self.spawn_spec_for(&discovered))
-                .await
-                .map(|_| ())
+            self.spawn_checked(&discovered).await
         } else {
             Ok(())
         };
@@ -370,6 +405,7 @@ impl PluginManager {
         }
 
         self.remove_plugin_entry(&plugin.directory);
+        self.clear_failure_reason(&plugin.manifest.name);
         self.strip_plugin_from_loader_settings(&plugin.manifest.name)?;
         self.emit_plugins_changed();
         Ok(())
@@ -388,20 +424,19 @@ impl PluginManager {
             list.len() != before
         })?;
 
-        if !plugin.passive {
-            let needs_spawn = !matches!(
+        let needs_spawn = !plugin.passive
+            && !matches!(
                 self.supervisor.plugin_state(&plugin.manifest.name),
                 Some(PluginState::Running | PluginState::Starting)
             );
-            if needs_spawn {
-                self.supervisor
-                    .spawn_plugin(self.spawn_spec_for(&plugin))
-                    .await?;
-            }
-        }
+        let spawn_result = if needs_spawn {
+            self.spawn_checked(&plugin).await
+        } else {
+            Ok(())
+        };
 
         self.emit_plugins_changed();
-        Ok(())
+        spawn_result
     }
 
     /// Persists a plugin's disabled state in `loader.json` and stops any active worker.
@@ -421,6 +456,7 @@ impl PluginManager {
         })?;
 
         shutdown_worker_if_present(&self.supervisor, &plugin.manifest.name, false).await?;
+        self.clear_failure_reason(&plugin.manifest.name);
         self.emit_plugins_changed();
         Ok(())
     }
@@ -446,8 +482,14 @@ impl PluginManager {
         }
     }
 
-    /// Atomically updates a dotted setting key in `loader.json`, rejecting lifecycle-managed keys.
+    /// Atomically updates a dotted setting key in `loader.json`, rejecting lifecycle-managed keys
+    /// and any write that would set `developer.allow_unsafe_root_plugins`.
     pub fn set_setting(&self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
+        if writes_setting_path(dotted_key, &value, ALLOW_UNSAFE_ROOT_PLUGINS_PATH) {
+            return Err(CoreError::InvalidSetting(format!(
+                "setting `{ALLOW_UNSAFE_ROOT_PLUGINS_PATH}` can only be changed by editing loader.json on disk"
+            )));
+        }
         let root_key = dotted_key.split('.').next().unwrap_or("");
         if matches!(
             root_key,
@@ -526,10 +568,14 @@ impl PluginManager {
             .into_iter()
             .map(|plugin| {
                 let is_disabled = disabled.contains(&plugin.manifest.name);
-                let state = self
-                    .supervisor
-                    .plugin_state(&plugin.manifest.name)
-                    .unwrap_or(PluginState::Stopped);
+                let failure_reason = self.failure_reason(&plugin.manifest.name);
+                let state = if failure_reason.is_some() {
+                    PluginState::Failed
+                } else {
+                    self.supervisor
+                        .plugin_state(&plugin.manifest.name)
+                        .unwrap_or(PluginState::Stopped)
+                };
                 PluginSummary {
                     name: plugin.manifest.name,
                     directory: plugin.directory,
@@ -538,6 +584,7 @@ impl PluginManager {
                     disabled: is_disabled,
                     passive: plugin.passive,
                     state,
+                    failure_reason,
                 }
             })
             .collect()
@@ -591,6 +638,64 @@ impl PluginManager {
         let _ = self
             .loader_events_tx
             .send(LoaderEvent::PluginsChanged(self.list_plugins()));
+    }
+
+    /// Runs the spawn preflight and, when it passes, starts the plugin's worker.
+    async fn spawn_checked(&self, plugin: &DiscoveredPlugin) -> Result<(), CoreError> {
+        self.preflight_plugin(plugin)?;
+        self.supervisor
+            .spawn_plugin(self.spawn_spec_for(plugin))
+            .await?;
+        Ok(())
+    }
+
+    /// Records a refusal as the plugin's failure reason, or clears a recorded one when the
+    /// preflight passes; `Ok(true)` means a recorded reason was cleared.
+    fn preflight_plugin(&self, plugin: &DiscoveredPlugin) -> Result<bool, CoreError> {
+        let name = &plugin.manifest.name;
+        let python_host_missing = lock_unpoisoned(&self.python_host_missing).clone();
+        let input = PreflightInput {
+            requires_root: plugin.manifest.requires_root(),
+            daemon_is_root: self.daemon_is_root,
+            allow_unsafe_root_plugins: self.allow_unsafe_root_plugins(),
+            python_host_missing: python_host_missing.as_deref(),
+        };
+        let plugins_dir = self.paths.plugins_dir();
+        let result = info_span!("spawn_preflight", plugin = %name).in_scope(|| {
+            preflight(&input, || {
+                check_root_plugin_tree(&plugins_dir, &plugin.directory)
+            })
+        });
+        match result {
+            Ok(()) => Ok(lock_unpoisoned(&self.failure_reasons)
+                .remove(name)
+                .is_some()),
+            Err(reason) => {
+                lock_unpoisoned(&self.failure_reasons).insert(name.clone(), reason.clone());
+                Err(CoreError::PluginBlocked {
+                    name: name.clone(),
+                    reason,
+                })
+            }
+        }
+    }
+
+    fn allow_unsafe_root_plugins(&self) -> bool {
+        let guard = lock_unpoisoned(&self.settings);
+        matches!(
+            guard.get_path(ALLOW_UNSAFE_ROOT_PLUGINS_PATH),
+            Some(Value::Bool(true))
+        )
+    }
+
+    fn failure_reason(&self, plugin_name: &str) -> Option<String> {
+        lock_unpoisoned(&self.failure_reasons)
+            .get(plugin_name)
+            .cloned()
+    }
+
+    fn clear_failure_reason(&self, plugin_name: &str) {
+        lock_unpoisoned(&self.failure_reasons).remove(plugin_name);
     }
 
     fn spawn_spec_for(&self, plugin: &DiscoveredPlugin) -> PluginSpawnSpec {
@@ -798,6 +903,61 @@ fn validate_rel_path_components(root: &Path, rel_path: &str) -> Result<(), CoreE
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn daemon_is_root() -> bool {
+    zerodeck_platform::current_process_identity().euid == 0
+}
+
+#[cfg(not(unix))]
+fn daemon_is_root() -> bool {
+    false
+}
+
+/// Checks `plugins_dir` itself (not its other plugins) and every entry of the plugin's
+/// `directory` below it.
+#[cfg(unix)]
+fn check_root_plugin_tree(plugins_dir: &Path, directory: &str) -> Result<(), OwnershipViolation> {
+    let violation = |kind| OwnershipViolation {
+        path: plugins_dir.to_path_buf(),
+        kind,
+    };
+    let meta = fs::symlink_metadata(plugins_dir).map_err(|err| {
+        violation(zerodeck_platform::ViolationKind::Unreadable(
+            err.to_string(),
+        ))
+    })?;
+    if let Some(kind) = zerodeck_platform::check_entry(zerodeck_platform::entry_meta(&meta)) {
+        return Err(violation(kind));
+    }
+    zerodeck_platform::check_root_only_tree(&plugins_dir.join(directory))
+}
+
+#[cfg(not(unix))]
+fn check_root_plugin_tree(_: &Path, _: &str) -> Result<(), OwnershipViolation> {
+    Ok(())
+}
+
+/// Returns `true` when setting `dotted_key` to `value` would write `protected` or anything under
+/// it, whether by naming it directly or by writing a parent object that contains it.
+fn writes_setting_path(dotted_key: &str, value: &Value, protected: &str) -> bool {
+    let key: Vec<&str> = dotted_key.split('.').collect();
+    let protected: Vec<&str> = protected.split('.').collect();
+    if key.len() >= protected.len() {
+        return key[..protected.len()] == protected[..];
+    }
+    if key[..] != protected[..key.len()] {
+        return false;
+    }
+    let mut current = value;
+    for segment in &protected[key.len()..] {
+        match current.get(segment) {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+    true
 }
 
 async fn shutdown_worker_if_present(

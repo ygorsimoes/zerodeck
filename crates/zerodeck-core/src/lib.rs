@@ -7,6 +7,7 @@ pub mod filepicker;
 pub mod http_policy;
 pub mod installer;
 mod manager;
+mod preflight;
 mod settings;
 pub mod watcher;
 
@@ -2375,6 +2376,173 @@ class Plugin:
                 zerodeck_platform::PlatformError::PathEscape { .. }
             ))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_setting_rejects_unsafe_root_plugins_opt_in() {
+        let dir = TestDir::new("mgr-unsafe-root-opt-in");
+        let paths = manager_test_paths(&dir.0);
+        let manager = crate::PluginManager::open(
+            paths,
+            zerodeck_plugin_host::SupervisorConfig::default(),
+            "0.1.0",
+        )
+        .expect("open manager");
+
+        for (key, value) in [
+            (
+                "developer.allow_unsafe_root_plugins",
+                serde_json::json!(true),
+            ),
+            (
+                "developer",
+                serde_json::json!({"allow_unsafe_root_plugins": true}),
+            ),
+        ] {
+            let err = manager
+                .set_setting(key, value)
+                .expect_err(&format!("must reject the root opt-in via `{key}`"));
+            assert!(matches!(err, CoreError::InvalidSetting(_)), "{err}");
+        }
+        assert_eq!(
+            manager.get_setting(Some("developer.allow_unsafe_root_plugins")),
+            serde_json::Value::Null
+        );
+
+        manager
+            .set_setting(
+                "developer.allow_unverified_installs",
+                serde_json::json!(true),
+            )
+            .expect("allow_unverified_installs stays UI-settable");
+    }
+
+    /// Writes a backend plugin and a fake `python3` that leaves `marker` behind if it ever runs.
+    #[cfg(unix)]
+    fn write_spawn_marker_plugin(
+        paths: &zerodeck_platform::PlatformPaths,
+        root: &std::path::Path,
+        marker: &std::path::Path,
+    ) -> zerodeck_plugin_host::SupervisorConfig {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plugin = paths.plugins_dir().join("blocked");
+        fs::create_dir_all(&plugin).expect("create plugin dir");
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"name":"Blocked","author":"Tester","api_version":1}"#,
+        )
+        .expect("write plugin.json");
+        fs::write(plugin.join("main.py"), "class Plugin:\n    pass\n").expect("write main.py");
+
+        let fake_python = root.join("fake-python3");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("write fake python3");
+        fs::set_permissions(&fake_python, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python3");
+        zerodeck_plugin_host::SupervisorConfig {
+            python_host: zerodeck_plugin_host::PythonHostConfig {
+                python_bin: fake_python.display().to_string(),
+                host_module_path: None,
+            },
+            ..zerodeck_plugin_host::SupervisorConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn python_host_missing_marks_plugins_failed_with_reason() {
+        let dir = TestDir::new("mgr-py-missing");
+        let paths = manager_test_paths(&dir.0);
+        let marker = dir.0.join("spawned");
+        let config = write_spawn_marker_plugin(&paths, &dir.0, &marker);
+
+        let manager = crate::PluginManager::open(paths, config, "0.1.0").expect("open manager");
+        manager.set_python_host_missing(Some("zerodeck_py_host is not importable".to_owned()));
+        manager
+            .start_all()
+            .await
+            .expect("start_all continues past blocked plugins");
+
+        let list = manager.list_plugins();
+        let blocked = list.iter().find(|p| p.name == "Blocked").expect("plugin");
+        assert_eq!(blocked.state, zerodeck_plugin_host::PluginState::Failed);
+        assert_eq!(
+            blocked.failure_reason.as_deref(),
+            Some("zerodeck_py_host is not importable")
+        );
+
+        let err = manager
+            .call_plugin_method("Blocked", "ping", serde_json::json!([]), false)
+            .await
+            .expect_err("a blocked plugin cannot be called");
+        assert!(
+            matches!(err, CoreError::PluginBlocked { ref name, .. } if name == "Blocked"),
+            "{err}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "no worker may be spawned");
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn debug_reload_runs_preflight() {
+        let dir = TestDir::new("mgr-reload-preflight");
+        let paths = manager_test_paths(&dir.0);
+        let plugin = paths.plugins_dir().join("hot");
+        write_watcher_plugin(&plugin, "Hot", &["debug"], "v1");
+
+        let manager = test_manager_open(&paths);
+        manager.start_all().await.expect("start_all");
+        assert_eq!(
+            call_plugin_ok(&manager, "Hot", "version_tag").await,
+            serde_json::json!("v1")
+        );
+
+        let mut events = manager.subscribe_loader_events();
+        manager.set_python_host_missing(Some("zerodeck_py_host is not importable".to_owned()));
+        let err = manager
+            .reload_plugin("Hot")
+            .await
+            .expect_err("reload must run the spawn preflight");
+        assert!(
+            matches!(err, CoreError::PluginBlocked { ref name, ref reason }
+                if name == "Hot" && reason == "zerodeck_py_host is not importable"),
+            "{err}"
+        );
+        wait_for_loader_event(&mut events, std::time::Duration::from_secs(5), |ev| {
+            matches!(ev, crate::LoaderEvent::PluginsChanged(list)
+                if list.iter().any(|p| p.name == "Hot" && p.failure_reason.is_some()))
+        })
+        .await;
+
+        let hot = manager
+            .list_plugins()
+            .into_iter()
+            .find(|p| p.name == "Hot")
+            .expect("plugin");
+        assert_eq!(hot.state, zerodeck_plugin_host::PluginState::Failed);
+
+        // Clearing the condition lets the next spawn through and clears the recorded reason.
+        manager.set_python_host_missing(None);
+        manager
+            .reload_plugin("Hot")
+            .await
+            .expect("reload after fix");
+        let hot = manager
+            .list_plugins()
+            .into_iter()
+            .find(|p| p.name == "Hot")
+            .expect("plugin");
+        assert_eq!(hot.failure_reason, None);
+        assert_ne!(hot.state, zerodeck_plugin_host::PluginState::Failed);
+        manager.shutdown_all().await;
     }
 
     #[cfg(unix)]

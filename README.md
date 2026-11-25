@@ -178,6 +178,13 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | | `PYTHONPATH` | auto-detected | Override search path containing `zerodeck_py_host` |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
+Plugins flagged `"root"` keep root privileges, so a root daemon only starts them from a tree that
+only root can modify: `plugins/` and every file and directory of the plugin must be owned by root,
+must not be group- or world-writable, and must not be symlinks. Store installs already produce such
+trees. Otherwise the plugin shows as `Failed` with the offending path in `failure_reason`. For local
+development you can skip the check by adding `{"developer": {"allow_unsafe_root_plugins": true}}`
+to `settings/loader.json` by hand; the UI and `loader/set_setting` cannot set it.
+
 </details>
 
 ## On Steam Deck

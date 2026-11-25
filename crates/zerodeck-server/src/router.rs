@@ -703,6 +703,7 @@ async fn handle_http_call_plugin_method(state: &AppState, body: &[u8]) -> Respon
             .into_response(),
         Err(
             err @ (CoreError::PluginDisabled(_)
+            | CoreError::PluginBlocked { .. }
             | CoreError::Host(
                 HostError::PassivePlugin(_)
                 | HostError::PluginFailed(_)
@@ -943,6 +944,7 @@ fn serialize_plugin_summaries(plugins: &[PluginSummary]) -> Value {
                     "disabled": p.disabled,
                     "passive": p.passive,
                     "state": format!("{:?}", p.state),
+                    "failure_reason": p.failure_reason,
                 })
             })
             .collect(),
@@ -1468,6 +1470,9 @@ fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
             format!("plugin `{name}` is disabled"),
             None,
         ),
+        CoreError::PluginBlocked { .. } => {
+            ws_error(id, "PluginBlockedError", err.to_string(), None)
+        }
         CoreError::Host(HostError::InvalidMethodName(method)) => ws_error(
             id,
             "PermissionError",

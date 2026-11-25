@@ -19,6 +19,10 @@ pub enum CoreError {
     #[error("plugin `{0}` is disabled")]
     PluginDisabled(String),
 
+    /// A spawn preflight check refused to start the plugin's worker.
+    #[error("plugin `{name}` cannot start: {reason}")]
+    PluginBlocked { name: String, reason: String },
+
     /// Filesystem I/O error.
     #[error("I/O error at `{path}`: {source}")]
     Io {

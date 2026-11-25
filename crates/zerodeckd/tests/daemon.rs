@@ -788,3 +788,107 @@ fn check_config_accepts_env_opt_in_for_non_loopback_host() {
         "--check-config must report the bind policy"
     );
 }
+
+/// Reads the `loader/get_plugins` entry for `name` over a fresh WebSocket session.
+#[cfg(target_os = "linux")]
+async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
+    let token = fetch_auth_token(&reqwest::Client::new(), port).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws?auth={token}"))
+            .await
+            .expect("connect ws");
+    let reply = ws_call_reply(
+        &mut ws,
+        1,
+        "loader/get_plugins",
+        serde_json::json!([]),
+        Duration::from_secs(5),
+    )
+    .await;
+    reply["result"]
+        .as_array()
+        .expect("get_plugins returns an array")
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("plugin {name} missing from {reply}"))
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root; run with just test-privileged"]
+async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    let host_user = std::env::var("ZERODECK_TEST_HOST_USER")
+        .expect("ZERODECK_TEST_HOST_USER names the unprivileged host user");
+
+    let home = TempHome::new("root-plugin-owner");
+    let plug_dir = home.0.join("plugins").join("root_plug");
+    std::fs::create_dir_all(&plug_dir).expect("create plugin dir");
+    std::fs::write(
+        plug_dir.join("plugin.json"),
+        r#"{"name":"RootPlug","author":"Tester","flags":["root"],"api_version":1}"#,
+    )
+    .expect("write plugin.json");
+    std::fs::write(
+        plug_dir.join("main.py"),
+        "class Plugin:\n    async def _main(self):\n        pass\n",
+    )
+    .expect("write main.py");
+    let chown = Command::new("chown")
+        .args(["-R", &host_user])
+        .arg(&plug_dir)
+        .status()
+        .expect("run chown");
+    assert!(chown.success(), "chown the plugin to the host user");
+
+    let py_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../hosts/python")
+        .canonicalize()
+        .expect("resolve hosts/python");
+    let start = |port: u16| {
+        let mut cmd = daemon_command(&home, "127.0.0.1", port);
+        cmd.env("PYTHONPATH", &py_host)
+            .env("DECKY_USER", &host_user);
+        Daemon(cmd.spawn().expect("spawn zerodeckd"))
+    };
+
+    let port = free_port("127.0.0.1");
+    let mut daemon = start(port);
+    wait_until_healthy(&home, "127.0.0.1", port);
+    let entry = get_plugin_entry(port, "RootPlug").await;
+    assert_eq!(entry["state"], "Failed", "{entry}");
+    let reason = entry["failure_reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains(&plug_dir.display().to_string()),
+        "failure_reason must name the plugin path: {entry}"
+    );
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+
+    std::fs::create_dir_all(home.0.join("settings")).expect("create settings dir");
+    std::fs::write(
+        home.0.join("settings").join("loader.json"),
+        r#"{"developer":{"allow_unsafe_root_plugins":true}}"#,
+    )
+    .expect("write loader.json opt-in");
+
+    let port = free_port("127.0.0.1");
+    let mut daemon = start(port);
+    wait_until_healthy(&home, "127.0.0.1", port);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let entry = get_plugin_entry(port, "RootPlug").await;
+        if entry["state"] == "Running" {
+            assert_eq!(entry["failure_reason"], serde_json::Value::Null, "{entry}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "opted-in root plugin never reached Running: {entry}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+}

@@ -214,6 +214,29 @@ async fn shutdown_signal() {
     info!("received shutdown signal, draining ZeroDeck server");
 }
 
+/// Warns once when a root daemon runs plugins from below directories a non-root user can modify:
+/// that user can swap the tree between the spawn ownership check and the spawn itself.
+#[cfg(unix)]
+fn warn_about_writable_ancestors(paths: &PlatformPaths) {
+    if zerodeck_platform::current_process_identity().euid != 0 {
+        return;
+    }
+    let flagged = zerodeck_platform::non_root_writable_ancestors(paths.privileged_root());
+    if flagged.is_empty() {
+        return;
+    }
+    let flagged = flagged
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    warn!(
+        paths = %flagged,
+        "PRIVILEGED_PATH or its parents are writable by a non-root user, who could replace root \
+         plugins after their ownership check"
+    );
+}
+
 async fn run_daemon(
     cli: Cli,
     paths: PlatformPaths,
@@ -222,6 +245,8 @@ async fn run_daemon(
 ) -> Result<()> {
     let addrs = resolve(&cli.host, cli.port).await?;
     check_bind_policy(&addrs, cli.allow_non_loopback)?;
+    #[cfg(unix)]
+    warn_about_writable_ancestors(&paths);
 
     let python_host = PythonHostConfig {
         host_module_path: resolve_python_host_path(),

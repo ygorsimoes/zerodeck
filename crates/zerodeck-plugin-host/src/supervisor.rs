@@ -775,9 +775,14 @@ fn build_isolated_command(
         cmd.gid(ctx.host_user.gid);
     }
 
+    #[cfg(target_os = "linux")]
+    let daemon_pid = rustix::process::getpid();
+
     // SAFETY: `pre_exec` runs after `fork` and before `execve` in a single-threaded child process.
     // All captured descriptors and IDs are pre-computed before `fork`, and the closure invokes
-    // only async-signal-safe syscalls without allocating or locking.
+    // only async-signal-safe syscalls without allocating or locking. The parent-death signal is
+    // set after the uid/gid change because Linux clears it on credential changes; the `getppid`
+    // check then catches a daemon that died before the signal was armed.
     #[allow(unsafe_code)]
     unsafe {
         cmd.pre_exec(move || {
@@ -788,9 +793,6 @@ fn build_isolated_command(
             let _ = rustix::process::setpgid(None, None);
             #[cfg(target_os = "linux")]
             {
-                let _ = rustix::process::set_parent_process_death_signal(Some(
-                    rustix::process::Signal::TERM,
-                ));
                 if drop_privs {
                     rustix::thread::set_thread_groups(&target_groups)
                         .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
@@ -798,6 +800,14 @@ fn build_isolated_command(
                         .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
                     rustix::thread::set_thread_res_uid(user_id, user_id, user_id)
                         .map_err(|err| std::io::Error::from_raw_os_error(err.raw_os_error()))?;
+                }
+                let _ = rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::TERM,
+                ));
+                if rustix::process::getppid() != Some(daemon_pid) {
+                    return Err(std::io::Error::from_raw_os_error(
+                        rustix::io::Errno::SRCH.raw_os_error(),
+                    ));
                 }
             }
             Ok(())

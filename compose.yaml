@@ -4,6 +4,7 @@
 #   dev        pinned toolchain, checkout bind-mounted   just check / just shell / just fmt ...
 #   daemon     zerodeckd built and run from source       just dev
 #   fuzz       dev + nightly + cargo-fuzz                just fuzz <target>
+#   privileged-test  dev as root (the only root container)  just test-privileged
 #
 # Optional host variables (also read from a `.env` file): ZERODECK_PORT (default 1337), RUST_LOG.
 name: zerodeck
@@ -98,6 +99,20 @@ services:
     image: zerodeck-fuzz:local
     profiles: ["fuzz"]
 
+  # Root-only tests (`privileged_*`): the daemon runs as root and drops workers to the `dev` user.
+  # The only root container; it keeps just the capabilities the privilege drop needs.
+  privileged-test:
+    <<: *dev
+    profiles: ["privileged"]
+    user: root
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE, FOWNER]
+    volumes:  # separate target/cargo-home: root-owned build files must not land in the dev volumes
+      - .:/workspace
+      - ${ZERODECK_PRIV_TARGET:-privileged-target}:/workspace/target
+      - ${ZERODECK_PRIV_CARGO_HOME:-privileged-cargo-home}:/home/dev/.cargo
+    environment: [CI, CARGO_INCREMENTAL, ZERODECK_TEST_HOST_USER=dev, RUST_BACKTRACE=1]
+
 volumes:
   cargo-target:
   cargo-home:
@@ -105,3 +120,5 @@ volumes:
   node-modules:
   frontend-node-modules:
   pnpm-store:
+  privileged-target:
+  privileged-cargo-home:

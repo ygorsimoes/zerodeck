@@ -143,6 +143,20 @@ jobs:
       - name: Package release tarball (dry run)
         run: just dist ci-${{ github.run_number }}
 
+  # Root-only tests (`privileged_*`: privilege drop, parent-death signal) in the compose
+  # `privileged-test` container (not a required check).
+  privileged:
+    name: privileged
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/dev-image
+      - name: Root-only tests
+        run: just test-privileged
+
   # Smoke-fuzzes every target for 30s (not a required check). Run longer locally with
   # `just fuzz <target> <seconds>`.
   fuzz:

@@ -290,6 +290,187 @@ async fn daemon_runs_python_plugin_over_ws_and_shuts_down_worker_on_sigterm() {
     );
 }
 
+/// Kills a worker that outlived its daemon, so a failing test does not leak it.
+#[cfg(target_os = "linux")]
+struct Worker(u32);
+
+#[cfg(target_os = "linux")]
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &self.0.to_string()])
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// `kill -0` also succeeds on a zombie that is still waiting to be reaped, which already exited.
+#[cfg(target_os = "linux")]
+fn process_running(pid: u32) -> bool {
+    let signalable = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill -0")
+        .success();
+    signalable
+        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_worker_pid(pid_file: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "worker never wrote its pid file");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A plugin whose `_main` records the worker pid, then blocks the worker's event loop for good.
+/// The worker then never sees EOF on its IPC socket when the daemon dies, so only the parent-death
+/// signal (default SIGTERM action) can end it: exactly what the tests below observe.
+#[cfg(target_os = "linux")]
+fn write_blocking_plugin(home: &TempHome, pid_file: &std::path::Path) {
+    let plug_dir = home.0.join("plugins").join("blocking_plug");
+    std::fs::create_dir_all(&plug_dir).expect("create plugin dir");
+    std::fs::write(
+        plug_dir.join("plugin.json"),
+        r#"{"name":"BlockingPlug","author":"Tester","api_version":1}"#,
+    )
+    .expect("write plugin.json");
+    std::fs::write(
+        plug_dir.join("main.py"),
+        format!(
+            r#"import os, signal, time
+from pathlib import Path
+
+class Plugin:
+    async def _main(self):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        Path({pid:?}).write_text(str(os.getpid()), encoding="utf-8")
+        time.sleep(3600)
+"#,
+            pid = pid_file.display().to_string(),
+        ),
+    )
+    .expect("write main.py");
+}
+
+/// Starts the daemon with the blocking plugin, SIGKILLs the daemon (no graceful shutdown) and
+/// asserts the worker follows it within 5 s. `run_dir` must be writable by the worker's user.
+#[cfg(target_os = "linux")]
+fn assert_worker_exits_when_daemon_is_killed(
+    home: &TempHome,
+    run_dir: &std::path::Path,
+    configure: impl FnOnce(&mut Command),
+    inspect_worker: impl FnOnce(u32),
+) {
+    let pid_file = run_dir.join("worker.pid");
+    write_blocking_plugin(home, &pid_file);
+
+    let py_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../hosts/python")
+        .canonicalize()
+        .expect("resolve hosts/python");
+    let port = free_port("127.0.0.1");
+    let mut cmd = daemon_command(home, "127.0.0.1", port);
+    cmd.env("PYTHONPATH", py_host);
+    configure(&mut cmd);
+    let mut daemon = Daemon(cmd.spawn().expect("spawn zerodeckd"));
+
+    wait_until_healthy(home, "127.0.0.1", port);
+    let worker = Worker(wait_for_worker_pid(&pid_file));
+    assert!(process_running(worker.0), "worker is not running");
+    inspect_worker(worker.0);
+
+    let status = Command::new("kill")
+        .args(["-KILL", &daemon.0.id().to_string()])
+        .status()
+        .expect("send SIGKILL");
+    assert!(status.success());
+    wait_for_exit(&mut daemon, Duration::from_secs(5));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_running(worker.0) {
+        assert!(
+            Instant::now() < deadline,
+            "worker {} still alive 5 s after the daemon was killed",
+            worker.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_exits_when_daemon_is_killed() {
+    let home = TempHome::new("pdeathsig");
+    assert_worker_exits_when_daemon_is_killed(&home, &home.0, |_| {}, |_| {});
+}
+
+#[cfg(target_os = "linux")]
+fn id_of(flag: &str, user: &str) -> u32 {
+    let out = Command::new("id")
+        .args([flag, user])
+        .output()
+        .expect("run id");
+    assert!(out.status.success(), "unknown host user {user}");
+    String::from_utf8(out.stdout)
+        .expect("utf-8 id output")
+        .trim()
+        .parse()
+        .expect("numeric id")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root; run with just test-privileged"]
+fn privileged_worker_exits_when_root_daemon_is_killed() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    let host_user = std::env::var("ZERODECK_TEST_HOST_USER")
+        .expect("ZERODECK_TEST_HOST_USER names the unprivileged host user");
+
+    let home = TempHome::new("pdeathsig-root");
+    // The worker drops to the host user, so it writes its pid where that user owns the directory.
+    let run_dir = home.0.join("run");
+    std::fs::create_dir_all(&run_dir).expect("create run dir");
+    std::os::unix::fs::chown(
+        &run_dir,
+        Some(id_of("-u", &host_user)),
+        Some(id_of("-g", &host_user)),
+    )
+    .expect("chown run dir to the host user");
+
+    assert_worker_exits_when_daemon_is_killed(
+        &home,
+        &run_dir,
+        |cmd| {
+            cmd.env("DECKY_USER", &host_user);
+        },
+        |pid| {
+            let status =
+                std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read worker status");
+            let uids = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .expect("Uid: line in /proc/<pid>/status");
+            assert!(
+                uids.split_whitespace().all(|uid| uid != "0"),
+                "worker kept root ids after the drop: Uid:{uids}"
+            );
+        },
+    );
+}
+
 fn build_sideload_zip(uninstall_marker: &std::path::Path) -> Vec<u8> {
     use std::io::{Cursor, Write};
     use zip::ZipWriter;

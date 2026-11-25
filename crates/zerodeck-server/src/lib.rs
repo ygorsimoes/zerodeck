@@ -260,6 +260,136 @@ mod tests {
         (status, headers, String::from_utf8_lossy(&body).into_owned())
     }
 
+    async fn call_get_with(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in extra {
+            builder = builder.header(*k, *v);
+        }
+        let res = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("call router");
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[test]
+    fn mime_for_path_covers_common_asset_types() {
+        for (ext, mime) in [
+            ("gif", "image/gif"),
+            ("ico", "image/x-icon"),
+            ("avif", "image/avif"),
+            ("ttf", "font/ttf"),
+            ("otf", "font/otf"),
+            ("woff", "font/woff"),
+            ("map", "application/json"),
+            ("txt", "text/plain; charset=utf-8"),
+            ("mp3", "audio/mpeg"),
+            ("ogg", "audio/ogg"),
+            ("wav", "audio/wav"),
+            ("mp4", "video/mp4"),
+            ("webm", "video/webm"),
+        ] {
+            let path = std::path::PathBuf::from(format!("file.{ext}"));
+            assert_eq!(crate::router::mime_for_path(&path), mime, "{ext}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_responses_send_nosniff_and_last_modified() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-hdr-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        for method in ["GET", "HEAD"] {
+            let (st, hdrs, _) = call_get(&app, method, "/plugins/Demo/assets/a.png").await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(hdrs.get("x-content-type-options").unwrap(), "nosniff");
+            assert!(hdrs.get("last-modified").is_some(), "{method}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_if_modified_since_returns_304() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-ims-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        let uri = "/plugins/Demo/assets/a.png";
+        let (_, hdrs, _) = call_get(&app, "GET", uri).await;
+        let lm = hdrs
+            .get("last-modified")
+            .expect("last-modified")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let (st, hdrs, body) = call_get_with(&app, "GET", uri, &[("if-modified-since", &lm)]).await;
+        assert_eq!(st, StatusCode::NOT_MODIFIED);
+        assert_eq!(body, "");
+        assert_eq!(hdrs.get("x-content-type-options").unwrap(), "nosniff");
+        // An older validator yields the full body.
+        let (st, _, body) = call_get_with(
+            &app,
+            "GET",
+            uri,
+            &[("if-modified-since", "Thu, 01 Jan 1970 00:00:00 GMT")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, "png");
+        // Garbage validators are ignored.
+        let (st, _, _) =
+            call_get_with(&app, "GET", uri, &[("if-modified-since", "nonsense")]).await;
+        assert_eq!(st, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frontend_bundle_never_returns_304() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-bundle-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        for uri in ["/plugins/Demo/frontend_bundle", "/plugins/load_main/Demo"] {
+            let (_, hdrs, _) = call_get(&app, "GET", uri).await;
+            let lm = hdrs
+                .get("last-modified")
+                .expect("last-modified")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (st, hdrs, body) =
+                call_get_with(&app, "GET", uri, &[("if-modified-since", &lm)]).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+            assert_eq!(hdrs.get("cache-control").unwrap(), "no-store");
+            assert_eq!(body, "export default 1;");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_paths_with_home(root: &std::path::Path) -> zerodeck_platform::PlatformPaths {
         let root_str = root.display().to_string();
         let home_str = root.join("home").display().to_string();
@@ -299,6 +429,7 @@ mod tests {
         .expect("plugin.json");
         std::fs::write(plug.join("dist/index.js"), "export default 1;").expect("dist/index.js");
         std::fs::write(plug.join("assets/icon.svg"), "<svg/>").expect("icon.svg");
+        std::fs::write(plug.join("assets/a.png"), "png").expect("a.png");
         std::fs::write(paths.data_dir().join("demo/cache.json"), r#"{"n":1}"#).expect("cache.json");
 
         let outside = dir.join("outside.txt");

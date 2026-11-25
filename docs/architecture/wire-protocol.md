@@ -16,14 +16,15 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 - Public/allowlisted paths (`GET`/`HEAD` only, except `/auth/token` and `/healthz`): `/auth/token`, `/healthz`, `/frontend/*`, `/static/*`, `/locales/*`, `/steam_resource/*` (CSRF-exempt; handler reserved for Phase 4), `/plugins/load_main/*`, `/plugins/{name}/frontend_bundle`, `/plugins/{name}/assets/*`, `/plugins/{name}/data/*`, `/plugins/{name}/dist/*`.
 
 ### Static, Plugin Asset & Frontend Bundle Routes
-All file routes percent-decode path segments, reject empty/`..`/backslash/null-byte segments, canonicalize against per-root `SafePath` jails, and stream bytes with extension-based `Content-Type` (`js`/`mjs` -> `text/javascript; charset=utf-8`, `css`, `json`, `html`, `svg`, `png`, `jpg`/`jpeg`, `webp`, `woff2`, `wasm`, fallback `application/octet-stream`):
+All file routes percent-decode path segments, reject empty/`..`/backslash/null-byte segments, canonicalize against per-root `SafePath` jails, and stream bytes with extension-based `Content-Type` (`js`/`mjs` -> `text/javascript; charset=utf-8`, `css`, `json`, `html`, `svg`, `png`, `jpg`/`jpeg`, `webp`, `woff2`, `wasm`, `gif`, `ico`, `avif`, `ttf`, `otf`, `woff`, `map`, `txt`, `mp3`, `ogg`, `wav`, `mp4`, `webm`, fallback `application/octet-stream`):
+- Every file response (`200` and `304`) carries `X-Content-Type-Options: nosniff` and a second-precision `Last-Modified`. A `GET`/`HEAD` with `If-Modified-Since` at or after the file's mtime gets `304 Not Modified` with no body; unparsable validators are ignored. The frontend bundle routes (`/plugins/load_main/{name}`, `/plugins/{name}/frontend_bundle`) are exempt: they always send `Cache-Control: no-store` and never answer `304`.
 - `GET /frontend/{*path}`: serves from resolved `frontend_dir` (`ZERODECK_FRONTEND_DIR` -> `/opt/zerodeck/frontend` -> `<exe_dir>/../frontend` -> `frontend/dist` -> `<CARGO_MANIFEST_DIR>/../../frontend/dist`).
 - `GET /static/{*path}`: serves from `<frontend_dir>/static`.
 - `GET /locales/{*path}`: serves from `<frontend_dir>/locales`.
 - `GET /plugins/load_main/{name}` and `GET /plugins/{name}/frontend_bundle`: resolve `{name}` (`manifest.name` first, falling back to directory name) and serve `<plugins_dir>/<dir>/dist/index.js` with `Content-Type: text/javascript; charset=utf-8` and `Cache-Control: no-store`.
 - `GET /plugins/{name}/dist/{*path}`: serves from `<plugins_dir>/<dir>/dist`.
 - `GET /plugins/{name}/assets/{*path}`: serves from `<plugins_dir>/<dir>/assets`.
-- `GET /plugins/{name}/data/{*path}`: serves from `<data_dir>/<dir>`.
+- `GET /plugins/{name}/data/{*path}`: serves from `<data_dir>/<dir>`. This route stays public (no auth token), a Phase 3 decision kept for Decky parity: plugin frontends load their own data files by plain URL. Files are served read-only and every path goes through the `SafePath` jail, so traversal and symlink escapes are rejected.
 
 ### `/fetch` Streaming CORS Proxy
 - `ANY /fetch?fetch_url=<url>` (authenticated via `?auth=<token>` or `X-Decky-Auth`):

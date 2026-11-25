@@ -84,6 +84,7 @@ services:
       - PRIVILEGED_PATH=/workspace/.dev-homebrew
       - PYTHONPATH=/workspace/hosts/python
       - SERVER_HOST=0.0.0.0
+      - ZERODECK_ALLOW_NON_LOOPBACK=1
       - SERVER_PORT=1337
     ports:
       - "127.0.0.1:${ZERODECK_PORT:-1337}:1337"

@@ -97,6 +97,7 @@ docker compose up -d --build            # or: just up
 curl http://127.0.0.1:1337/healthz      # {"status":"ok"}
 ```
 
+- **Network exposure:** the container binds `0.0.0.0` internally (`ZERODECK_ALLOW_NON_LOOPBACK=1`), so always publish the port on loopback only (`-p 127.0.0.1:1337:1337`, as `compose.yaml` does); publishing it on all interfaces would expose the auth token to your network.
 - **Update:** `git pull && docker compose up -d --build`
 - **Stop:** `docker compose down` (or `just down`)
 - **Logs:** `docker compose logs -f zerodeckd` (or `just logs`)
@@ -166,6 +167,7 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | Flag | Environment variable | Default | Description |
 |---|---|---|---|
 | `--host` | `SERVER_HOST` | `127.0.0.1` | Address to bind the HTTP/WebSocket server to |
+| `--allow-non-loopback` | `ZERODECK_ALLOW_NON_LOOPBACK` | off | Allow binding to a non-loopback address (exposes the auth token to that network) |
 | `--port` | `SERVER_PORT` | `1337` | Port to listen on |
 | `--check-config` | | | Validate paths, settings and plugin manifests, then exit |
 | `--healthcheck` | | | Probe `/healthz` on a running daemon and exit `0` or `1` |

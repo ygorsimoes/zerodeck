@@ -35,6 +35,15 @@ struct Cli {
     /// Bind port for HTTP/WebSocket server.
     #[arg(long, env = "SERVER_PORT", default_value_t = 1337)]
     port: u16,
+
+    /// Allow binding to a non-loopback address. This exposes the auth token endpoint to that
+    /// network; only enable it behind a trusted port mapping or firewall.
+    #[arg(
+        long,
+        env = "ZERODECK_ALLOW_NON_LOOPBACK",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    allow_non_loopback: bool,
 }
 
 fn init_tracing() {
@@ -108,6 +117,28 @@ async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         bail!("listen address {host}:{port} resolved to no addresses");
     }
     Ok(addrs)
+}
+
+/// Refuses to bind anything but loopback addresses unless the operator opted in explicitly.
+fn check_bind_policy(addrs: &[SocketAddr], allow_non_loopback: bool) -> Result<()> {
+    let exposed: Vec<String> = addrs
+        .iter()
+        .filter(|addr| !addr.ip().is_loopback())
+        .map(ToString::to_string)
+        .collect();
+    if exposed.is_empty() {
+        return Ok(());
+    }
+    let exposed = exposed.join(", ");
+    if allow_non_loopback {
+        warn!(addresses = %exposed, "binding to a non-loopback address; the auth token is reachable from that network");
+        return Ok(());
+    }
+    bail!(
+        "refusing to bind non-loopback address(es) {exposed}: the daemon serves its auth token \
+         over HTTP, so exposing it to a network allows remote code execution. Pass \
+         --allow-non-loopback (or set ZERODECK_ALLOW_NON_LOOPBACK=1) to override"
+    )
 }
 
 /// Maps a wildcard bind address (`0.0.0.0` / `::`) to the matching loopback address to probe.
@@ -189,6 +220,9 @@ async fn run_daemon(
     settings: SettingsManager,
     plugins: Vec<zerodeck_core::DiscoveredPlugin>,
 ) -> Result<()> {
+    let addrs = resolve(&cli.host, cli.port).await?;
+    check_bind_policy(&addrs, cli.allow_non_loopback)?;
+
     let python_host = PythonHostConfig {
         host_module_path: resolve_python_host_path(),
         ..PythonHostConfig::default()
@@ -233,14 +267,8 @@ async fn run_daemon(
         warn!(error = %err, "one or more plugins failed during startup");
     }
 
-    let listener = match resolve(&config.host, config.port).await {
-        Ok(addrs) => match bind_first(&addrs).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                manager.shutdown_all().await;
-                return Err(err);
-            }
-        },
+    let listener = match bind_first(&addrs).await {
+        Ok(listener) => listener,
         Err(err) => {
             manager.shutdown_all().await;
             return Err(err);
@@ -300,8 +328,60 @@ async fn main() -> Result<()> {
     );
 
     if cli.check_config {
+        let addrs = resolve(&cli.host, cli.port).await?;
+        check_bind_policy(&addrs, cli.allow_non_loopback)?;
         return Ok(());
     }
 
     run_daemon(cli, paths, settings, plugins).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter()
+            .map(|a| a.parse().expect("socket addr"))
+            .collect()
+    }
+
+    #[test]
+    fn bind_policy_accepts_loopback_addresses() {
+        for list in [
+            &["127.0.0.1:1337"][..],
+            &["[::1]:1337"],
+            &["127.0.0.1:1337", "[::1]:1337"],
+        ] {
+            check_bind_policy(&addrs(list), false).expect("loopback is allowed");
+        }
+    }
+
+    #[test]
+    fn bind_policy_rejects_unspecified_and_lan_without_opt_in() {
+        for list in [
+            &["0.0.0.0:1337"][..],
+            &["[::]:1337"],
+            &["192.168.1.10:1337"],
+            &["127.0.0.1:1337", "192.168.1.10:1337"],
+        ] {
+            let err = check_bind_policy(&addrs(list), false)
+                .expect_err("non-loopback must be refused")
+                .to_string();
+            assert!(err.contains("--allow-non-loopback"), "{err}");
+            assert!(err.contains("ZERODECK_ALLOW_NON_LOOPBACK"), "{err}");
+        }
+    }
+
+    #[test]
+    fn bind_policy_allows_any_address_with_opt_in() {
+        for list in [
+            &["0.0.0.0:1337"][..],
+            &["[::]:1337"],
+            &["192.168.1.10:1337"],
+            &["127.0.0.1:1337", "192.168.1.10:1337"],
+        ] {
+            check_bind_policy(&addrs(list), true).expect("opt-in allows any address");
+        }
+    }
 }

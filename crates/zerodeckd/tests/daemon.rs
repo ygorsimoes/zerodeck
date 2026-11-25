@@ -746,3 +746,45 @@ async fn daemon_serves_frontend_sideloads_plugin_assets_and_uninstalls() {
         "daemon must exit cleanly"
     );
 }
+
+#[test]
+fn refuses_non_loopback_bind_without_opt_in() {
+    let home = TempHome::new("non-loopback");
+    let port = free_port("127.0.0.1");
+    let mut cmd = daemon_command(&home, "127.0.0.1", port);
+    cmd.args(["--host", "0.0.0.0", "--port", &port.to_string()])
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn zerodeckd");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut daemon = Daemon(child);
+
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(5));
+    assert!(!status.success(), "daemon must refuse, got {status}");
+
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut { stderr }, &mut output).expect("read stderr");
+    assert!(output.contains("--allow-non-loopback"), "stderr: {output}");
+}
+
+#[test]
+fn check_config_accepts_env_opt_in_for_non_loopback_host() {
+    let home = TempHome::new("opt-in-env");
+    let status = daemon_command(&home, "0.0.0.0", 1)
+        .env("ZERODECK_ALLOW_NON_LOOPBACK", "1")
+        .arg("--check-config")
+        .status()
+        .expect("run --check-config");
+    assert!(
+        status.success(),
+        "ZERODECK_ALLOW_NON_LOOPBACK=1 must be accepted"
+    );
+
+    let refused = daemon_command(&home, "0.0.0.0", 1)
+        .arg("--check-config")
+        .status()
+        .expect("run --check-config");
+    assert!(
+        !refused.success(),
+        "--check-config must report the bind policy"
+    );
+}

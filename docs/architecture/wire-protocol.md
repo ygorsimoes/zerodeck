@@ -9,6 +9,7 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 - Protected HTTP endpoints require header `X-Decky-Auth: <token>` (or `?auth=<token>` on `/ws` and `/fetch`).
 - CORS origin allowlist: `https://steamloopback.host` with `allow_credentials = true`.
 - `Host` allowlist (DNS-rebinding defense): every request carrying a `Host` header must name a loopback host (`localhost`, `127.0.0.0/8`, or `[::1]`, any port); anything else gets `403 Forbidden`.
+- Bind policy: the daemon refuses to start when `SERVER_HOST`/`--host` resolves to any non-loopback address (e.g. `0.0.0.0`, `::`, a LAN IP), because `/auth/token` would become reachable from that network and the `Host` check can be spoofed by a remote client. `--allow-non-loopback` / `ZERODECK_ALLOW_NON_LOOPBACK=1` opts in (a warning is logged); the runtime container image sets it and relies on a loopback-only port mapping (`127.0.0.1:1337:1337`).
 - The `?auth=` token is redacted from HTTP request trace spans.
 - `/ws` and `/fetch` are **not** public. `/fetch` accepts the token as `?auth=<token>` or `X-Decky-Auth`; `/ws` requires `?auth=<token>` (browsers cannot set headers on a WebSocket upgrade).
 - Token comparison is constant-time, and `..` path segments (including percent-encoded `%2e%2e`), backslashes (`\` / `%5c`), and encoded null bytes (`%00`) are rejected with `403 Forbidden` and never treated as public.

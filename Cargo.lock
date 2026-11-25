@@ -2503,6 +2503,7 @@ dependencies = [
  "zerodeck-plugin-host",
  "zerodeck-protocol",
  "zerodeck-server",
+ "zip",
 ]
 
 [[package]]

@@ -52,7 +52,7 @@ plugin contracts, rebuilt from scratch as a native daemon.
 | Supervised plugin processes with restart, backoff, and crash-loop guard | ✅ |
 | Private plugin IPC over inherited `socketpair()` FDs (no `/tmp` sockets) | ✅ |
 | Plugins drop to the `deck` user unless they declare `"root"` | ✅ |
-| Plugin static, asset and data routes behind the path jail | 🚧 |
+| Plugin static, asset and data routes behind the path jail | ✅ |
 | Injection into Steam's UI and the Quick Access Menu | 🚧 |
 
 ✅ shipped and tested · 🚧 in progress (see [Roadmap](#roadmap))
@@ -170,6 +170,7 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | | `UNPRIVILEGED_PATH` (or `DECKY_HOME`) | `<user home>/homebrew` | Root for `settings/`, `data/` and `logs/` |
 | | `DECKY_USER_HOME` | `$HOME` | User home used for the default paths |
 | | `PRIVILEGED_PATH` | `UNPRIVILEGED_PATH` | Root for `plugins/` and `services/` |
+| | `ZERODECK_FRONTEND_DIR` | auto-detected | Directory containing the `@zerodeck/frontend` bundle |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
 </details>
@@ -232,7 +233,7 @@ frames, IPC messages, manifests and environment variables) is documented in
   safe archive extraction, plugin discovery, HTTP/WebSocket server, CI and releases
 - [x] **Phase 2 · Plugin host:** privilege drop, `socketpair()` IPC, process supervisor,
   `zerodeck-py-host` parity (`settings`, `helpers`, v0/v1), and async `/ws` RPC wiring
-- [ ] **Phase 3 · Full server:** `FULL_SYNC`, `/fetch` proxy, plugin static and data routes, file
+- [x] **Phase 3 · Full server:** `FULL_SYNC`, `/fetch` proxy, plugin static and data routes, file
   picker, store installer
 - [ ] **Phase 4 · Steam integration:** CEF injection, crash recovery, Quick Access Menu UI,
   one-command install and update on Steam Deck

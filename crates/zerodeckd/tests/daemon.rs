@@ -289,3 +289,279 @@ async fn daemon_runs_python_plugin_over_ws_and_shuts_down_worker_on_sigterm() {
         "clean"
     );
 }
+
+fn build_sideload_zip(uninstall_marker: &std::path::Path) -> Vec<u8> {
+    use std::io::{Cursor, Write};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut writer = ZipWriter::new(&mut buf);
+        let opts = SimpleFileOptions::default();
+
+        writer
+            .start_file("plugin.json", opts)
+            .expect("start plugin.json");
+        writer
+            .write_all(br#"{"name":"SideloadPlug","author":"Tester","api_version":1}"#)
+            .expect("write plugin.json");
+
+        writer
+            .start_file("package.json", opts)
+            .expect("start package.json");
+        writer
+            .write_all(br#"{"version":"1.2.3","type":"module"}"#)
+            .expect("write package.json");
+
+        writer
+            .start_file("assets/hello.txt", opts)
+            .expect("start assets/hello.txt");
+        writer
+            .write_all(b"hello from plugin asset")
+            .expect("write assets/hello.txt");
+
+        writer.start_file("main.py", opts).expect("start main.py");
+        let main_py = format!(
+            r#"from pathlib import Path
+
+class Plugin:
+    async def _main(self):
+        pass
+
+    async def _unload(self):
+        pass
+
+    async def _uninstall(self):
+        Path({marker:?}).write_text("uninstalled", encoding="utf-8")
+
+    async def greet(self, who):
+        return f"hi {{who}}"
+"#,
+            marker = uninstall_marker.display().to_string(),
+        );
+        writer.write_all(main_py.as_bytes()).expect("write main.py");
+
+        writer.finish().expect("finish zip");
+    }
+    buf.into_inner()
+}
+
+async fn ws_next_json<S>(ws: &mut S, timeout: Duration) -> serde_json::Value
+where
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::StreamExt;
+    let frame = tokio::time::timeout(timeout, ws.next())
+        .await
+        .expect("ws frame timeout")
+        .expect("ws open")
+        .expect("ws frame");
+    serde_json::from_str(frame.to_text().expect("text")).expect("json")
+}
+
+async fn ws_call_reply<S>(
+    ws: &mut S,
+    id: u64,
+    route: &str,
+    args: serde_json::Value,
+    timeout: Duration,
+) -> serde_json::Value
+where
+    S: futures_util::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::SinkExt;
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+
+    ws.send(Message::Text(
+        json!({ "type": 0, "id": id, "route": route, "args": args })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send ws call");
+
+    loop {
+        let parsed = ws_next_json(ws, timeout).await;
+        if parsed["type"] == json!(1) && parsed["id"] == json!(id) {
+            return parsed;
+        }
+    }
+}
+
+async fn fetch_auth_token(client: &reqwest::Client, port: u16) -> String {
+    client
+        .get(format!("http://127.0.0.1:{port}/auth/token"))
+        .send()
+        .await
+        .expect("GET /auth/token")
+        .text()
+        .await
+        .expect("token text")
+        .trim()
+        .to_owned()
+}
+
+async fn ws_install_zip<S>(
+    ws: &mut S,
+    zip_path: &std::path::Path,
+    timeout: Duration,
+) -> serde_json::Value
+where
+    S: futures_util::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    use futures_util::SinkExt;
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let file_uri = format!("file://{}", zip_path.display());
+    ws.send(Message::Text(
+        json!({
+            "type": 0,
+            "id": 1,
+            "route": "loader/install_plugin",
+            "args": [{ "url_or_path": file_uri, "user_confirmed": true }]
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send loader/install_plugin");
+
+    let (mut install_reply, mut saw_plugins_changed): (Option<Value>, bool) = (None, false);
+    while install_reply.is_none() || !saw_plugins_changed {
+        let parsed = ws_next_json(ws, timeout).await;
+        if parsed["type"] == json!(1) && parsed["id"] == json!(1) {
+            install_reply = Some(parsed["result"].clone());
+        } else if parsed["type"] == json!(5) && parsed["event"] == json!("loader/plugins_changed") {
+            saw_plugins_changed = true;
+        }
+    }
+    install_reply.expect("install reply")
+}
+
+#[tokio::test]
+async fn daemon_serves_frontend_sideloads_plugin_assets_and_uninstalls() {
+    use serde_json::json;
+
+    let home = TempHome::new("full-e2e");
+    let frontend_dir = home.0.join("frontend-dist");
+    std::fs::create_dir_all(&frontend_dir).expect("create frontend dir");
+    std::fs::write(
+        frontend_dir.join("index.js"),
+        "console.log('zerodeck-frontend');\n",
+    )
+    .expect("write frontend index.js");
+
+    let uninstall_marker = home.0.join("plugin.uninstalled");
+    let zip_path = home.0.join("sideload-plug.zip");
+    std::fs::write(&zip_path, build_sideload_zip(&uninstall_marker)).expect("write sideload zip");
+
+    let py_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../hosts/python")
+        .canonicalize()
+        .expect("resolve hosts/python");
+    let port = free_port("127.0.0.1");
+    let mut daemon = Daemon(
+        daemon_command(&home, "127.0.0.1", port)
+            .env("PYTHONPATH", py_host)
+            .env("ZERODECK_FRONTEND_DIR", &frontend_dir)
+            .spawn()
+            .expect("spawn zerodeckd"),
+    );
+
+    wait_until_healthy(&home, "127.0.0.1", port);
+
+    let client = reqwest::Client::new();
+    let fe_resp = client
+        .get(format!("http://127.0.0.1:{port}/frontend/index.js"))
+        .send()
+        .await
+        .expect("GET /frontend/index.js");
+    assert_eq!(fe_resp.status(), reqwest::StatusCode::OK);
+    let ct = fe_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("text/javascript"), "unexpected ct: {ct}");
+    assert_eq!(
+        fe_resp.text().await.expect("frontend body"),
+        "console.log('zerodeck-frontend');\n"
+    );
+
+    let token = fetch_auth_token(&client, port).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws?auth={token}"))
+            .await
+            .expect("connect ws");
+
+    let outcome = ws_install_zip(&mut ws, &zip_path, Duration::from_secs(10)).await;
+    assert_eq!(outcome["name"], json!("SideloadPlug"));
+    assert_eq!(outcome["version"], json!("1.2.3"));
+    assert_eq!(outcome["replaced_existing"], json!(false));
+
+    let asset_url = format!("http://127.0.0.1:{port}/plugins/SideloadPlug/assets/hello.txt");
+    let asset_resp = client.get(&asset_url).send().await.expect("GET asset");
+    assert_eq!(asset_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        asset_resp.text().await.expect("asset text"),
+        "hello from plugin asset"
+    );
+
+    let call = ws_call_reply(
+        &mut ws,
+        2,
+        "loader/call_plugin_method",
+        json!(["SideloadPlug", "greet", "ZeroDeck"]),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(call["result"], json!("hi ZeroDeck"));
+
+    let uninstall = ws_call_reply(
+        &mut ws,
+        3,
+        "loader/uninstall_plugin",
+        json!(["SideloadPlug"]),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(uninstall["result"], json!(true));
+    assert_eq!(
+        std::fs::read_to_string(&uninstall_marker).expect("marker"),
+        "uninstalled"
+    );
+    assert_eq!(
+        client.get(&asset_url).send().await.expect("404").status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    sigterm(&daemon);
+    assert!(
+        wait_for_exit(&mut daemon, Duration::from_secs(10)).success(),
+        "daemon must exit cleanly"
+    );
+}

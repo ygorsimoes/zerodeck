@@ -134,11 +134,13 @@ Docs that describe a changed behavior (`docs/architecture/wire-protocol.md`, `RE
     uid 0 and none is group- or world-writable; symlinks are not followed. The check also covers
     `plugins_dir` itself. On failure the plugin does not start: its state is `Failed` with a reason
     that names the offending path, and the reason reaches `loader/get_plugins` / logs.
-  - Opt-in for development: `developer.allow_unsafe_root_plugins: true` in `loader.json` skips the
-    check (logged as a warning on each spawn). It is off by default and, unlike
-    `developer.allow_unverified_installs` (which stays UI-settable, as today), `loader/set_setting`
-    rejects it: a key that grants root to `deck`-writable code must only be set by editing
-    `loader.json` on disk.
+  - Opt-in for development: the daemon flag `--allow-unsafe-root-plugins` / env
+    `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1` skips the check (logged as a warning on each spawn). It
+    is off by default and lives only in the daemon's own command line/environment (e.g. a systemd
+    drop-in), which only root controls. *(Correction during implementation:* the first version put
+    it in `loader.json`, but `settings/` is owned by `deck`, so `deck` could grant itself root; the
+    owner's intent — never settable from the UI or by the unprivileged user — requires a
+    root-controlled source.)
   - Plugins without the `"root"` flag are unaffected; no ownership is changed automatically.
   - The installer already produces root-owned `0755`/`0644` trees, so store installs pass.
   - Ancestors of `PRIVILEGED_PATH` writable by a non-root user only produce one startup warning
@@ -146,7 +148,7 @@ Docs that describe a changed behavior (`docs/architecture/wire-protocol.md`, `RE
     below.
 - Tests: pure-function tests for the tree check (owner, mode bits, symlink, nested file) with
   injected metadata; manager test that a failing check yields `Failed` and the opt-in bypasses it;
-  test that `set_setting` rejects the opt-in key; a privileged test exercises real ownership.
+  a privileged test exercises real ownership and proves a `loader.json` edit cannot unblock it.
 
 **S6. Two plugins with the same `name` collide.**
 - Evidence: `discover_plugins` accepts duplicate `plugin.json` names in different directories; the

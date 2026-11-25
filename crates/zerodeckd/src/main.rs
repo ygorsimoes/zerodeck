@@ -569,6 +569,12 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bind_policy_accepts_resolved_localhost() {
+        let resolved = resolve("localhost", 1337).await.expect("resolve localhost");
+        check_bind_policy(&resolved, false).expect("localhost resolves to loopback only");
+    }
+
     #[test]
     fn bind_policy_rejects_unspecified_and_lan_without_opt_in() {
         for list in [

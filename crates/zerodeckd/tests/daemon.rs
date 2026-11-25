@@ -467,6 +467,14 @@ fn privileged_worker_exits_when_root_daemon_is_killed() {
                 uids.split_whitespace().all(|uid| uid != "0"),
                 "worker kept root ids after the drop: Uid:{uids}"
             );
+            let gids = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Gid:"))
+                .expect("Gid: line in /proc/<pid>/status");
+            assert!(
+                gids.split_whitespace().all(|gid| gid != "0"),
+                "worker kept root group ids after the drop: Gid:{gids}"
+            );
         },
     );
 }
@@ -787,6 +795,23 @@ fn check_config_accepts_env_opt_in_for_non_loopback_host() {
         !refused.success(),
         "--check-config must report the bind policy"
     );
+}
+
+#[test]
+fn check_config_refuses_non_loopback_host_when_env_opt_in_is_falsy() {
+    let home = TempHome::new("opt-in-env-falsy");
+    let output = daemon_command(&home, "127.0.0.1", 1)
+        .env("ZERODECK_ALLOW_NON_LOOPBACK", "0")
+        .args(["--check-config", "--host", "0.0.0.0"])
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run --check-config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "ZERODECK_ALLOW_NON_LOOPBACK=0 must not opt in"
+    );
+    assert!(stderr.contains("refusing to bind"), "stderr: {stderr}");
 }
 
 /// Copies `zerodeck_py_host` (without `__pycache__`) under `home`: a root worker importing it from

@@ -1591,6 +1591,21 @@ class Plugin:
             }
         }
 
+        #[tokio::test]
+        async fn ws_rejects_bad_token_before_validating_session() {
+            let (addr, _token) = spawn_server(ServerConfig::default()).await;
+            let url = format!("ws://{addr}/ws?auth=wrong&session=../x");
+            let err = tokio_tungstenite::connect_async(url)
+                .await
+                .expect_err("a bad token must be rejected");
+            match err {
+                tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                    assert_eq!(resp.status().as_u16(), 403);
+                }
+                other => panic!("expected HTTP 403, got {other:?}"),
+            }
+        }
+
         #[cfg(unix)]
         fn setup_lifecycle_fixtures(
             dir: &std::path::Path,

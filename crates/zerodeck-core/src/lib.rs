@@ -2400,6 +2400,10 @@ class Plugin:
     #[cfg(unix)]
     #[tokio::test]
     async fn unsafe_root_plugins_opt_in_bypasses_tree_check() {
+        if running_as_root() {
+            eprintln!("skipping: the temp tree is root-owned when tests run as root");
+            return;
+        }
         let dir = TestDir::new("mgr-unsafe-root-opt-in");
         let paths = manager_test_paths(&dir.0);
         write_watcher_plugin(
@@ -2408,7 +2412,7 @@ class Plugin:
             &["root"],
             "v1",
         );
-        // A root daemon would also honor a loader.json key; only the daemon setter may opt in.
+        // loader.json must be ignored; only the daemon setter may opt in.
         fs::create_dir_all(paths.settings_dir()).expect("settings dir");
         fs::write(
             paths.settings_dir().join("loader.json"),
@@ -2462,6 +2466,11 @@ class Plugin:
             .expect("plugin");
         assert_eq!(rooted.failure_reason, None);
         manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        zerodeck_platform::current_process_identity().euid == 0
     }
 
     /// Writes a backend plugin and a fake `python3` that leaves `marker` behind if it ever runs.

@@ -48,7 +48,7 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
             continue;
         }
 
-        match load_plugin(&dir_path, directory) {
+        match discover_single_plugin(&dir_path, directory) {
             Ok(plugin) => plugins.push(plugin),
             Err(err) => {
                 warn!(plugin_dir = %dir_path.display(), error = %err, "skipping invalid plugin");
@@ -61,7 +61,10 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
     Ok(plugins)
 }
 
-fn load_plugin(dir_path: &Path, directory: String) -> Result<DiscoveredPlugin, CoreError> {
+pub(crate) fn discover_single_plugin(
+    dir_path: &Path,
+    directory: String,
+) -> Result<DiscoveredPlugin, CoreError> {
     let plugin_json_path = dir_path.join("plugin.json");
     let plugin_raw = fs::read_to_string(&plugin_json_path).map_err(|source| CoreError::Io {
         path: plugin_json_path.clone(),

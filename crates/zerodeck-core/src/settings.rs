@@ -128,6 +128,21 @@ impl SettingsManager {
         Ok(removed)
     }
 
+    /// Atomically applies an in-memory settings mutation, flushing to disk only when `mutate`
+    /// returns `Ok(true)`.
+    pub(crate) fn update_map<F>(&mut self, mutate: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
+    {
+        let mut next = self.values.clone();
+        if !mutate(&mut next)? {
+            return Ok(());
+        }
+        self.commit_map(&next)?;
+        self.values = next;
+        Ok(())
+    }
+
     fn commit_map(&self, values: &Map<String, Value>) -> Result<(), CoreError> {
         let bytes = serde_json::to_vec_pretty(&Value::Object(values.clone()))?;
         atomic_write(&self.path, &bytes)?;

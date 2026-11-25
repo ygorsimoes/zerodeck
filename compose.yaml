@@ -112,7 +112,13 @@ services:
       - .:/workspace
       - ${ZERODECK_PRIV_TARGET:-privileged-target}:/workspace/target
       - ${ZERODECK_PRIV_CARGO_HOME:-privileged-cargo-home}:/home/dev/.cargo
-    environment: [CI, CARGO_INCREMENTAL, ZERODECK_TEST_HOST_USER=dev, RUST_BACKTRACE=1]
+    environment:
+      - CI
+      - CARGO_INCREMENTAL
+      - ZERODECK_TEST_HOST_USER=dev
+      - RUST_BACKTRACE=1
+      # No `__pycache__`: root-owned bytecode would land in the bind-mounted checkout.
+      - PYTHONDONTWRITEBYTECODE=1
 
 volumes:
   cargo-target:

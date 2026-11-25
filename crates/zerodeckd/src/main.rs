@@ -123,6 +123,8 @@ async fn probe_python_host(cfg: &PythonHostConfig) -> Option<String> {
         // `-c` puts the working directory on `sys.path`: probe from `/` so a planted module in a
         // user-writable working directory is never imported by a root daemon.
         .current_dir("/")
+        // A root daemon must not leave root-owned `__pycache__` in the worker host's directory.
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

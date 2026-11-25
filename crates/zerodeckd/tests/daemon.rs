@@ -789,6 +789,24 @@ fn check_config_accepts_env_opt_in_for_non_loopback_host() {
     );
 }
 
+/// Copies `zerodeck_py_host` (without `__pycache__`) under `home`: a root worker importing it from
+/// the bind-mounted checkout would leave root-owned bytecode there.
+#[cfg(target_os = "linux")]
+fn copy_python_host(home: &TempHome) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hosts/python/zerodeck_py_host");
+    let root = home.0.join("python");
+    let dest = root.join("zerodeck_py_host");
+    std::fs::create_dir_all(&dest).expect("create python host copy");
+    for entry in std::fs::read_dir(&src).expect("read hosts/python/zerodeck_py_host") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|ext| ext == "py") {
+            std::fs::copy(&path, dest.join(path.file_name().expect("file name")))
+                .expect("copy python host module");
+        }
+    }
+    root
+}
+
 /// Reads the `loader/get_plugins` entry for `name` over a fresh WebSocket session.
 #[cfg(target_os = "linux")]
 async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
@@ -842,10 +860,7 @@ async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
         .expect("run chown");
     assert!(chown.success(), "chown the plugin to the host user");
 
-    let py_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../hosts/python")
-        .canonicalize()
-        .expect("resolve hosts/python");
+    let py_host = copy_python_host(&home);
     let start = |port: u16, opt_in: bool| {
         let mut cmd = daemon_command(&home, "127.0.0.1", port);
         cmd.env("PYTHONPATH", &py_host)

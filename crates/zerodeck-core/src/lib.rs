@@ -2650,4 +2650,71 @@ class Plugin:
         drop(watcher);
         manager.shutdown_all().await;
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn debug_watcher_inotify_replaces_moved_aside_dist_directory() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = TestDir::new("watcher-move-self");
+        let paths = manager_test_paths(&dir.0);
+        let plugin_dir = paths.plugins_dir().join("move_plug");
+        write_watcher_plugin(&plugin_dir, "MovePlug", &["debug"], "v1");
+        fs::create_dir_all(plugin_dir.join("dist/sub")).expect("create dist/sub");
+        fs::write(plugin_dir.join("dist/sub/chunk.js"), b"export const c = 1;")
+            .expect("write dist/sub/chunk.js");
+
+        let manager = test_manager_open(&paths);
+        manager.start_all().await.expect("start_all");
+
+        let mut events = manager.subscribe_loader_events();
+        let watcher = crate::start_debug_watcher(Arc::clone(&manager)).expect("start watcher");
+
+        // Move `dist` aside (`MOVE_SELF`) and create a replacement `dist/sub` directory at the
+        // original path.
+        let dist_dir = plugin_dir.join("dist");
+        let bak_dir = plugin_dir.join("dist.bak");
+        fs::rename(&dist_dir, &bak_dir).expect("move dist to dist.bak");
+        fs::create_dir_all(dist_dir.join("sub")).expect("recreate dist/sub");
+        fs::write(dist_dir.join("index.js"), b"export const v = 2;").expect("write new dist");
+        fs::write(dist_dir.join("sub/chunk.js"), b"export const c = 2;").expect("write new chunk");
+
+        wait_for_loader_event(&mut events, Duration::from_secs(2), |ev| {
+            matches!(
+                ev,
+                crate::LoaderEvent::FrontendReloaded { plugin, directory }
+                if plugin == "MovePlug" && directory == "move_plug"
+            )
+        })
+        .await;
+        // Let any remaining bursts settle before testing moved-away vs replacement watches.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        while events.try_recv().is_ok() {}
+
+        // Edits in the moved-away `dist.bak` (root or nested `sub/`) must NOT trigger reloads.
+        fs::write(bak_dir.join("index.js"), b"export const v = 99;").expect("edit bak index");
+        fs::write(bak_dir.join("sub/chunk.js"), b"export const c = 99;").expect("edit bak chunk");
+        let stale_ev = tokio::time::timeout(Duration::from_millis(800), events.recv()).await;
+        assert!(
+            stale_ev.is_err(),
+            "moved-away dist.bak edit must not emit FrontendReloaded: {stale_ev:?}"
+        );
+
+        // Edits in the new `dist` (and `dist/sub`) must fire promptly via fresh inotify watches
+        // (< 1.1s, strictly faster than the 2s Linux fallback mtime sweep).
+        fs::write(dist_dir.join("sub/chunk.js"), b"export const c = 3;")
+            .expect("edit new dist/sub/chunk.js");
+        wait_for_loader_event(&mut events, Duration::from_millis(1100), |ev| {
+            matches!(
+                ev,
+                crate::LoaderEvent::FrontendReloaded { plugin, directory }
+                if plugin == "MovePlug" && directory == "move_plug"
+            )
+        })
+        .await;
+
+        watcher.stop().await;
+        manager.shutdown_all().await;
+    }
 }

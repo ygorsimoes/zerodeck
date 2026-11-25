@@ -316,69 +316,100 @@ async fn run_watcher_loop(
             () = debounce_sleep => {
                 let due = state.take_due(Instant::now());
                 state.flush_due(due).await;
-                let changed = state.sync_with_manager(false);
-                #[cfg(target_os = "linux")]
-                if changed && let Some(stream) = inotify_stream.as_ref() {
-                    let mut watches = stream.watches();
-                    linux_watches.sync(&mut watches, &state.plugins_dir, &state.tracked);
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = changed;
+                sync_state_and_watches(
+                    &mut state,
+                    false,
+                    #[cfg(target_os = "linux")]
+                    inotify_stream.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    &mut linux_watches,
+                );
             }
             _ = sweep_interval.tick() => {
-                let changed = state.sync_with_manager(true);
-                #[cfg(target_os = "linux")]
-                if changed && let Some(stream) = inotify_stream.as_ref() {
-                    let mut watches = stream.watches();
-                    linux_watches.sync(&mut watches, &state.plugins_dir, &state.tracked);
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = changed;
+                sync_state_and_watches(
+                    &mut state,
+                    true,
+                    #[cfg(target_os = "linux")]
+                    inotify_stream.as_ref(),
+                    #[cfg(target_os = "linux")]
+                    &mut linux_watches,
+                );
             }
             ev = loader_events.recv() => {
                 match ev {
                     Ok(LoaderEvent::PluginsChanged(_)) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let changed = state.sync_with_manager(false);
-                        #[cfg(target_os = "linux")]
-                        if changed && let Some(stream) = inotify_stream.as_ref() {
-                            let mut watches = stream.watches();
-                            linux_watches.sync(&mut watches, &state.plugins_dir, &state.tracked);
-                        }
-                        #[cfg(not(target_os = "linux"))]
-                        let _ = changed;
+                        sync_state_and_watches(
+                            &mut state,
+                            false,
+                            #[cfg(target_os = "linux")]
+                            inotify_stream.as_ref(),
+                            #[cfg(target_os = "linux")]
+                            &mut linux_watches,
+                        );
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             inotify_ev = next_inotify => {
-                #[cfg(target_os = "linux")]
-                match inotify_ev {
-                    Some(Ok(event)) => {
-                        let resync = linux::handle_event(
-                            &event,
-                            &mut linux_watches,
-                            &mut state,
-                        );
-                        if resync && let Some(stream) = inotify_stream.as_ref() {
-                            let mut watches = stream.watches();
-                            linux_watches.sync(&mut watches, &state.plugins_dir, &state.tracked);
-                        }
-                    }
-                    Some(Err(err)) => {
-                        warn!(error = %err, "inotify stream read error");
-                    }
-                    None => {
-                        inotify_stream = None;
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                if let Some(impossible) = inotify_ev {
-                    match impossible {}
-                }
+                handle_inotify_poll(
+                    inotify_ev,
+                    &mut state,
+                    #[cfg(target_os = "linux")]
+                    &mut inotify_stream,
+                    #[cfg(target_os = "linux")]
+                    &mut linux_watches,
+                );
             }
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn handle_inotify_poll(
+    inotify_ev: Option<std::io::Result<inotify::EventOwned>>,
+    state: &mut WatcherState,
+    inotify_stream: &mut Option<inotify::EventStream<Vec<u8>>>,
+    linux_watches: &mut linux::WatchIndex,
+) {
+    match inotify_ev {
+        Some(Ok(event)) => {
+            let mut watches = inotify_stream.as_ref().map(inotify::EventStream::watches);
+            let resync = linux::handle_event(&event, linux_watches, watches.as_mut(), state);
+            if resync && let Some(watches) = watches.as_mut() {
+                linux_watches.sync(watches, &state.plugins_dir, &state.tracked);
+            }
+        }
+        Some(Err(err)) => {
+            warn!(error = %err, "inotify stream read error");
+        }
+        None => {
+            *inotify_stream = None;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn handle_inotify_poll(inotify_ev: Option<std::convert::Infallible>, _state: &mut WatcherState) {
+    if let Some(impossible) = inotify_ev {
+        match impossible {}
+    }
+}
+
+fn sync_state_and_watches(
+    state: &mut WatcherState,
+    scan_existing: bool,
+    #[cfg(target_os = "linux")] inotify_stream: Option<&inotify::EventStream<Vec<u8>>>,
+    #[cfg(target_os = "linux")] linux_watches: &mut linux::WatchIndex,
+) {
+    let changed = state.sync_with_manager(scan_existing);
+    #[cfg(target_os = "linux")]
+    if changed && let Some(stream) = inotify_stream {
+        let mut watches = stream.watches();
+        linux_watches.sync(&mut watches, &state.plugins_dir, &state.tracked);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = changed;
 }
 
 fn is_ignored_name(name: &str) -> bool {
@@ -462,6 +493,7 @@ fn file_stamp_if_regular(path: &Path) -> Option<FileStamp> {
 mod linux {
     use std::collections::HashMap;
     use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
     use inotify::{EventMask, EventOwned, Inotify, WatchDescriptor, WatchMask, Watches};
@@ -483,9 +515,16 @@ mod linux {
         pub scope: WatchScope,
     }
 
+    #[derive(Debug, Clone)]
+    struct WatchEntry {
+        path: PathBuf,
+        inode: (u64, u64),
+        target: WatchTarget,
+    }
+
     #[derive(Debug, Default)]
     pub(super) struct WatchIndex {
-        by_wd: HashMap<WatchDescriptor, WatchTarget>,
+        by_wd: HashMap<WatchDescriptor, WatchEntry>,
         by_path: HashMap<PathBuf, WatchDescriptor>,
     }
 
@@ -496,18 +535,21 @@ mod linux {
             plugins_dir: &Path,
             tracked: &HashMap<String, TrackedPlugin>,
         ) {
-            let mut desired: HashMap<PathBuf, WatchTarget> = HashMap::new();
+            let mut desired: HashMap<PathBuf, (WatchTarget, (u64, u64))> = HashMap::new();
             for directory in tracked.keys() {
                 let plugin_root = plugins_dir.join(directory);
-                if !is_real_dir(&plugin_root) {
+                let Some(root_inode) = real_dir_inode(&plugin_root) else {
                     continue;
-                }
+                };
                 desired.insert(
                     plugin_root.clone(),
-                    WatchTarget {
-                        directory: directory.clone(),
-                        scope: WatchScope::PluginRoot,
-                    },
+                    (
+                        WatchTarget {
+                            directory: directory.clone(),
+                            scope: WatchScope::PluginRoot,
+                        },
+                        root_inode,
+                    ),
                 );
                 collect_watch_dirs(
                     &plugin_root.join("py_modules"),
@@ -530,10 +572,7 @@ mod linux {
                 .cloned()
                 .collect();
             for path in stale_paths {
-                if let Some(wd) = self.by_path.remove(&path) {
-                    self.by_wd.remove(&wd);
-                    let _ = watches.remove(wd);
-                }
+                self.remove_path(watches, &path);
             }
 
             let mask = WatchMask::MODIFY
@@ -546,15 +585,29 @@ mod linux {
                 | WatchMask::MOVE_SELF
                 | WatchMask::ONLYDIR;
 
-            for (path, target) in desired {
-                if let Some(wd) = self.by_path.get(&path) {
-                    self.by_wd.insert(wd.clone(), target);
-                    continue;
+            for (path, (target, inode)) in desired {
+                if let Some(existing_wd) = self.by_path.get(&path).cloned() {
+                    if let Some(entry) = self.by_wd.get_mut(&existing_wd)
+                        && entry.inode == inode
+                    {
+                        entry.target = target;
+                        continue;
+                    }
+                    // The directory at `path` was replaced by a different inode; drop the stale
+                    // watch so the replacement directory receives a fresh descriptor.
+                    self.remove_path(watches, &path);
                 }
                 match watches.add(&path, mask) {
                     Ok(wd) => {
-                        self.by_path.insert(path, wd.clone());
-                        self.by_wd.insert(wd, target);
+                        self.by_path.insert(path.clone(), wd.clone());
+                        self.by_wd.insert(
+                            wd,
+                            WatchEntry {
+                                path,
+                                inode,
+                                target,
+                            },
+                        );
                     }
                     Err(err) => {
                         warn!(path = %path.display(), error = %err, "failed to add inotify watch");
@@ -563,9 +616,34 @@ mod linux {
             }
         }
 
-        fn remove_wd(&mut self, wd: &WatchDescriptor) {
-            self.by_wd.remove(wd);
+        fn remove_path(&mut self, watches: &mut Watches, path: &Path) {
+            if let Some(wd) = self.by_path.remove(path) {
+                self.by_wd.remove(&wd);
+                let _ = watches.remove(wd);
+            }
+        }
+
+        fn invalidate_subtree(&mut self, watches: Option<&mut Watches>, root_path: &Path) {
+            let matching: Vec<(PathBuf, WatchDescriptor)> = self
+                .by_path
+                .iter()
+                .filter(|(path, _)| path.starts_with(root_path))
+                .map(|(path, wd)| (path.clone(), wd.clone()))
+                .collect();
+            let mut watches = watches;
+            for (path, wd) in matching {
+                self.by_path.remove(&path);
+                self.by_wd.remove(&wd);
+                if let Some(w) = watches.as_deref_mut() {
+                    let _ = w.remove(wd);
+                }
+            }
+        }
+
+        fn remove_wd(&mut self, wd: &WatchDescriptor) -> bool {
+            let removed = self.by_wd.remove(wd).is_some();
             self.by_path.retain(|_, existing| existing != wd);
+            removed
         }
     }
 
@@ -584,6 +662,7 @@ mod linux {
     pub(super) fn handle_event(
         event: &EventOwned,
         index: &mut WatchIndex,
+        watches: Option<&mut Watches>,
         state: &mut WatcherState,
     ) -> bool {
         if event.mask.contains(EventMask::Q_OVERFLOW) {
@@ -591,15 +670,30 @@ mod linux {
             return true;
         }
 
-        let mut resync = false;
         if event.mask.contains(EventMask::IGNORED) {
-            index.remove_wd(&event.wd);
-            return true;
+            return index.remove_wd(&event.wd);
         }
 
-        let Some(target) = index.by_wd.get(&event.wd).cloned() else {
+        let Some(entry) = index.by_wd.get(&event.wd).cloned() else {
             return false;
         };
+
+        if event
+            .mask
+            .intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF)
+        {
+            match entry.target.scope {
+                WatchScope::PluginRoot => {}
+                WatchScope::PyModules => {
+                    state.mark_dirty(&entry.target.directory, DirtyScope::Backend);
+                }
+                WatchScope::Dist => {
+                    state.mark_dirty(&entry.target.directory, DirtyScope::Frontend);
+                }
+            }
+            index.invalidate_subtree(watches, &entry.path);
+            return true;
+        }
 
         let name_str = event
             .name
@@ -611,46 +705,43 @@ mod linux {
             return false;
         }
 
-        match target.scope {
-            WatchScope::PluginRoot => {
-                if event
-                    .mask
-                    .intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF)
-                {
+        let mut resync = false;
+        match entry.target.scope {
+            WatchScope::PluginRoot => match name_str.as_deref() {
+                Some("main.py" | "plugin.json" | "package.json") => {
+                    state.mark_dirty(&entry.target.directory, DirtyScope::Backend);
+                }
+                Some("py_modules") => {
+                    state.mark_dirty(&entry.target.directory, DirtyScope::Backend);
+                    if event
+                        .mask
+                        .intersects(EventMask::MOVED_FROM | EventMask::DELETE)
+                    {
+                        index.invalidate_subtree(watches, &entry.path.join("py_modules"));
+                    }
                     resync = true;
                 }
-                match name_str.as_deref() {
-                    Some("main.py" | "plugin.json" | "package.json") => {
-                        state.mark_dirty(&target.directory, DirtyScope::Backend);
-                    }
-                    Some("py_modules") => {
-                        state.mark_dirty(&target.directory, DirtyScope::Backend);
-                        resync = true;
-                    }
-                    Some("dist") => {
-                        state.mark_dirty(&target.directory, DirtyScope::Frontend);
-                        resync = true;
-                    }
-                    _ => {}
-                }
-            }
-            WatchScope::PyModules => {
-                state.mark_dirty(&target.directory, DirtyScope::Backend);
-                if event.mask.contains(EventMask::ISDIR)
-                    || event
+                Some("dist") => {
+                    state.mark_dirty(&entry.target.directory, DirtyScope::Frontend);
+                    if event
                         .mask
-                        .intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF)
-                {
+                        .intersects(EventMask::MOVED_FROM | EventMask::DELETE)
+                    {
+                        index.invalidate_subtree(watches, &entry.path.join("dist"));
+                    }
+                    resync = true;
+                }
+                _ => {}
+            },
+            WatchScope::PyModules => {
+                state.mark_dirty(&entry.target.directory, DirtyScope::Backend);
+                if event.mask.contains(EventMask::ISDIR) {
                     resync = true;
                 }
             }
             WatchScope::Dist => {
-                state.mark_dirty(&target.directory, DirtyScope::Frontend);
-                if event.mask.contains(EventMask::ISDIR)
-                    || event
-                        .mask
-                        .intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF)
-                {
+                state.mark_dirty(&entry.target.directory, DirtyScope::Frontend);
+                if event.mask.contains(EventMask::ISDIR) {
                     resync = true;
                 }
             }
@@ -659,25 +750,29 @@ mod linux {
         resync
     }
 
-    fn is_real_dir(path: &Path) -> bool {
-        fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_symlink() && meta.is_dir())
+    fn real_dir_inode(path: &Path) -> Option<(u64, u64)> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        (!meta.file_type().is_symlink() && meta.is_dir()).then(|| (meta.dev(), meta.ino()))
     }
 
     fn collect_watch_dirs(
         dir: &Path,
         directory: &str,
         scope: WatchScope,
-        out: &mut HashMap<PathBuf, WatchTarget>,
+        out: &mut HashMap<PathBuf, (WatchTarget, (u64, u64))>,
     ) {
-        if !is_real_dir(dir) {
+        let Some(inode) = real_dir_inode(dir) else {
             return;
-        }
+        };
         out.insert(
             dir.to_path_buf(),
-            WatchTarget {
-                directory: directory.to_owned(),
-                scope,
-            },
+            (
+                WatchTarget {
+                    directory: directory.to_owned(),
+                    scope,
+                },
+                inode,
+            ),
         );
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -689,7 +784,7 @@ mod linux {
                 continue;
             }
             let child = entry.path();
-            if is_real_dir(&child) {
+            if real_dir_inode(&child).is_some() {
                 collect_watch_dirs(&child, directory, scope, out);
             }
         }

@@ -1339,6 +1339,82 @@ class Plugin:
         }
 
         #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_new_session_reexecutes_unacknowledged_call_from_previous_session() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-session-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let counter_file = dir.join("count.txt");
+            std::fs::write(&counter_file, "0").expect("seed counter");
+
+            let plug = paths.plugins_dir().join("counter");
+            std::fs::create_dir_all(&plug).expect("plug dir");
+            std::fs::write(
+                plug.join("plugin.json"),
+                r#"{"name":"Counter","author":"Tester","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            let py = format!(
+                "from pathlib import Path\nP = Path({:?})\nclass Plugin:\n    async def inc(self):\n        n = int(P.read_text()) + 1\n        P.write_text(str(n))\n        return n\n",
+                counter_file.display().to_string()
+            );
+            std::fs::write(plug.join("main.py"), py).expect("main.py");
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+            let (addr, token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+
+            let call_inc = json!({
+                "type": 0, "id": 1, "route": "loader/call_plugin_method",
+                "args": ["Counter", "inc"]
+            });
+            for (session, expected) in [("s1", 1), ("s2", 2)] {
+                let url = format!("ws://{addr}/ws?auth={token}&session={session}");
+                let (mut ws, _) = tokio_tungstenite::connect_async(url)
+                    .await
+                    .expect("ws connect");
+                ws.send(Message::Text(call_inc.to_string().into()))
+                    .await
+                    .expect("send call");
+                assert_eq!(
+                    next_text_frame(&mut ws).await,
+                    json!({"type": 1, "id": 1, "result": expected})
+                );
+                // Close without acknowledging the response.
+                drop(ws);
+            }
+            assert_eq!(std::fs::read_to_string(&counter_file).unwrap(), "2");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn ws_rejects_malformed_session_param() {
+            let (addr, token) = spawn_server(ServerConfig::default()).await;
+            let url = format!("ws://{addr}/ws?auth={token}&session=../x");
+            let err = tokio_tungstenite::connect_async(url)
+                .await
+                .expect_err("malformed session must be rejected");
+            match err {
+                tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                    assert_eq!(resp.status().as_u16(), 400);
+                }
+                other => panic!("expected HTTP 400, got {other:?}"),
+            }
+        }
+
+        #[cfg(unix)]
         fn setup_lifecycle_fixtures(
             dir: &std::path::Path,
             paths: &zerodeck_platform::PlatformPaths,

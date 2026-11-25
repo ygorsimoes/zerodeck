@@ -36,7 +36,7 @@ use zerodeck_protocol::{WsCallPayload, WsClientMessage, WsErrorDetail, WsServerM
 
 use crate::ServerError;
 use crate::auth::{csrf_middleware, host_guard};
-use crate::ws_sync::WsSyncCache;
+use crate::ws_sync::{SyncScope, WsSyncCache, parse_session_param};
 
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -733,10 +733,13 @@ async fn handle_ws_upgrade(
     if !authorized {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
+    let Ok(scope) = parse_session_param(query.get("session").map(String::as_str)) else {
+        return (StatusCode::BAD_REQUEST, "Invalid session").into_response();
+    };
     let max_bytes = state.config().ws_max_message_bytes;
     ws.max_message_size(max_bytes)
         .max_frame_size(max_bytes)
-        .on_upgrade(move |socket| handle_ws_socket(state, socket))
+        .on_upgrade(move |socket| handle_ws_socket(state, socket, scope))
 }
 
 async fn recv_plugin_event(rx: &mut Option<broadcast::Receiver<PluginEvent>>) -> WsServerMessage {
@@ -803,7 +806,7 @@ async fn recv_loader_event(rx: &mut Option<broadcast::Receiver<LoaderEvent>>) ->
 
 /// Drives one WebSocket client: inbound frames, spawned RPC replies, plugin/loader events, and
 /// keepalive pings.
-async fn handle_ws_socket(state: AppState, mut socket: WebSocket) {
+async fn handle_ws_socket(state: AppState, mut socket: WebSocket, scope: SyncScope) {
     debug!("WebSocket client connected");
     let (outbox, mut outbound) = mpsc::channel::<WsServerMessage>(64);
     let mut plugin_events = state.subscribe_plugin_events();
@@ -817,7 +820,7 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket) {
     loop {
         tokio::select! {
             inbound = socket.recv() => match inbound {
-                Some(Ok(Message::Text(text))) => handle_ws_text(&state, &text, &outbox),
+                Some(Ok(Message::Text(text))) => handle_ws_text(&state, &scope, &text, &outbox),
                 Some(Ok(Message::Pong(_))) => awaiting_pong = false,
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                 Some(Ok(Message::Binary(_) | Message::Ping(_))) => {}
@@ -855,19 +858,24 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket) {
     debug!("WebSocket client disconnected");
 }
 
-fn handle_ws_text(state: &AppState, text: &str, outbox: &mpsc::Sender<WsServerMessage>) {
+fn handle_ws_text(
+    state: &AppState,
+    scope: &SyncScope,
+    text: &str,
+    outbox: &mpsc::Sender<WsServerMessage>,
+) {
     match WsClientMessage::from_json_str(text) {
         Ok(WsClientMessage::Call(call)) => {
-            spawn_ws_call(state.clone(), call, outbox.clone());
+            spawn_ws_call(state.clone(), scope.clone(), call, outbox.clone());
         }
         Ok(WsClientMessage::ReceivedResponse { id }) => {
             debug!(call_id = id, "client acknowledged response");
-            state.ws_sync_cache().evict_id(id);
+            state.ws_sync_cache().evict_id(scope, id);
         }
         Ok(WsClientMessage::FullSync { messages }) => {
             debug!(count = messages.len(), "replaying FULL_SYNC calls");
             for call in messages {
-                spawn_ws_call(state.clone(), call, outbox.clone());
+                spawn_ws_call(state.clone(), scope.clone(), call, outbox.clone());
             }
         }
         Err(err) => {
@@ -876,11 +884,16 @@ fn handle_ws_text(state: &AppState, text: &str, outbox: &mpsc::Sender<WsServerMe
     }
 }
 
-fn spawn_ws_call(state: AppState, call: WsCallPayload, outbox: mpsc::Sender<WsServerMessage>) {
+fn spawn_ws_call(
+    state: AppState,
+    scope: SyncScope,
+    call: WsCallPayload,
+    outbox: mpsc::Sender<WsServerMessage>,
+) {
     let cache = Arc::clone(state.ws_sync_cache());
     tokio::spawn(async move {
         let reply = cache
-            .execute(call, |c| dispatch_call(state.clone(), c))
+            .execute(scope, call, |c| dispatch_call(state.clone(), c))
             .await;
         let _ = outbox.send(reply).await;
     });

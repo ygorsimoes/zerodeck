@@ -6,8 +6,41 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use zerodeck_protocol::{WsCallPayload, WsServerMessage};
 
-/// Composite deduplication key `(call.id, call.route, canonical_args_json)`.
-pub type WsSyncKey = (u64, String, String);
+/// Namespace for cached WS calls. The frontend restarts call ids at 1 on every page load, so each
+/// client session gets its own namespace; clients that send no session share [`Legacy`].
+///
+/// [`Legacy`]: SyncScope::Legacy
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SyncScope {
+    /// Shared namespace for clients that connect without a `session` query parameter.
+    Legacy,
+    /// Namespace private to one client session.
+    Session(String),
+}
+
+/// Composite deduplication key `(scope, call.id, call.route, canonical_args_json)`.
+pub type WsSyncKey = (SyncScope, u64, String, String);
+
+const MAX_SESSION_LEN: usize = 64;
+
+/// Parses the optional `session` query parameter: absent selects [`SyncScope::Legacy`]; present
+/// must be 1-64 characters of `[A-Za-z0-9-]`.
+///
+/// # Errors
+/// Returns `Err(())` when the value is empty, too long, or contains other characters.
+#[allow(clippy::result_unit_err)]
+pub fn parse_session_param(raw: Option<&str>) -> Result<SyncScope, ()> {
+    let Some(raw) = raw else {
+        return Ok(SyncScope::Legacy);
+    };
+    if raw.is_empty()
+        || raw.len() > MAX_SESSION_LEN
+        || !raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(());
+    }
+    Ok(SyncScope::Session(raw.to_owned()))
+}
 
 /// Bounded, TTL-expiring cache deduplicating in-flight and completed unacknowledged WS RPC calls
 /// across `CALL` and `FULL_SYNC` replays.
@@ -78,15 +111,20 @@ impl WsSyncCache {
         }
     }
 
-    /// Executes `call` once for its `(id, route, canonical_args)` key, joining an active
+    /// Executes `call` once for its `(scope, id, route, canonical_args)` key, joining an active
     /// in-flight run or returning a cached unacknowledged frame when present.
-    pub async fn execute<F, Fut>(self: Arc<Self>, call: WsCallPayload, run: F) -> WsServerMessage
+    pub async fn execute<F, Fut>(
+        self: Arc<Self>,
+        scope: SyncScope,
+        call: WsCallPayload,
+        run: F,
+    ) -> WsServerMessage
     where
         F: FnOnce(WsCallPayload) -> Fut,
         Fut: Future<Output = WsServerMessage>,
     {
         let call_id = call.id;
-        let key = canonical_key(&call);
+        let key = canonical_key(scope, &call);
 
         match self.begin(key) {
             BeginOutcome::Completed(frame) => frame,
@@ -109,12 +147,13 @@ impl WsSyncCache {
         }
     }
 
-    /// Evicts completed cached responses matching `id` when the client sends `RECEIVED_RESPONSE`.
-    pub fn evict_id(&self, id: u64) {
+    /// Evicts completed cached responses matching `scope` and `id` when the client sends
+    /// `RECEIVED_RESPONSE`.
+    pub fn evict_id(&self, scope: &SyncScope, id: u64) {
         let mut state = lock_unpoisoned(&self.inner);
-        state
-            .entries
-            .retain(|k, entry| !(k.0 == id && matches!(entry, CacheEntry::Completed { .. })));
+        state.entries.retain(|k, entry| {
+            !(&k.0 == scope && k.1 == id && matches!(entry, CacheEntry::Completed { .. }))
+        });
     }
 
     fn begin(&self, key: WsSyncKey) -> BeginOutcome<'_> {
@@ -220,9 +259,9 @@ impl WsSyncCache {
     }
 }
 
-fn canonical_key(call: &WsCallPayload) -> WsSyncKey {
+fn canonical_key(scope: SyncScope, call: &WsCallPayload) -> WsSyncKey {
     let args_json = serde_json::to_string(&call.args).unwrap_or_default();
-    (call.id, call.route.clone(), args_json)
+    (scope, call.id, call.route.clone(), args_json)
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -241,7 +280,7 @@ mod tests {
     use tokio::sync::Notify;
     use zerodeck_protocol::{WsCallPayload, WsServerMessage};
 
-    use super::WsSyncCache;
+    use super::{SyncScope, WsSyncCache, parse_session_param};
 
     fn call_payload(id: u64) -> WsCallPayload {
         WsCallPayload {
@@ -272,7 +311,7 @@ mod tests {
             let runs = Arc::clone(&leader_runs);
             tokio::spawn(async move {
                 cache
-                    .execute(call_payload(100), move |c| async move {
+                    .execute(SyncScope::Legacy, call_payload(100), move |c| async move {
                         runs.fetch_add(1, Ordering::SeqCst);
                         started.notify_one();
                         release.notified().await;
@@ -290,7 +329,7 @@ mod tests {
             let runs = Arc::clone(&waiter_runs);
             tokio::spawn(async move {
                 cache
-                    .execute(call_payload(100), move |c| async move {
+                    .execute(SyncScope::Legacy, call_payload(100), move |c| async move {
                         runs.fetch_add(1, Ordering::SeqCst);
                         reply_frame(c.id, "unexpected-waiter-run")
                     })
@@ -304,7 +343,7 @@ mod tests {
         for id in 1..=3 {
             let runs = Arc::clone(&completed_runs);
             let frame = Arc::clone(&cache)
-                .execute(call_payload(id), move |c| async move {
+                .execute(SyncScope::Legacy, call_payload(id), move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
                     reply_frame(c.id, "first")
                 })
@@ -317,7 +356,7 @@ mod tests {
         for id in [2, 3] {
             let runs = Arc::clone(&completed_runs);
             let frame = Arc::clone(&cache)
-                .execute(call_payload(id), move |c| async move {
+                .execute(SyncScope::Legacy, call_payload(id), move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
                     reply_frame(c.id, "re-executed")
                 })
@@ -327,7 +366,7 @@ mod tests {
         assert_eq!(completed_runs.load(Ordering::SeqCst), 3);
 
         let re_run = Arc::clone(&cache)
-            .execute(call_payload(1), {
+            .execute(SyncScope::Legacy, call_payload(1), {
                 let runs = Arc::clone(&completed_runs);
                 move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
@@ -362,7 +401,7 @@ mod tests {
             let runs = Arc::clone(&runs);
             tokio::spawn(async move {
                 cache
-                    .execute(call_payload(7), move |c| async move {
+                    .execute(SyncScope::Legacy, call_payload(7), move |c| async move {
                         runs.fetch_add(1, Ordering::SeqCst);
                         started.notify_one();
                         release.notified().await;
@@ -379,7 +418,7 @@ mod tests {
             let runs = Arc::clone(&runs);
             tokio::spawn(async move {
                 cache
-                    .execute(call_payload(7), move |c| async move {
+                    .execute(SyncScope::Legacy, call_payload(7), move |c| async move {
                         runs.fetch_add(1, Ordering::SeqCst);
                         reply_frame(c.id, "unexpected")
                     })
@@ -401,7 +440,7 @@ mod tests {
 
         // Completed entry must not be retained when capacity == 0.
         let second = Arc::clone(&cache)
-            .execute(call_payload(7), {
+            .execute(SyncScope::Legacy, call_payload(7), {
                 let runs = Arc::clone(&runs);
                 move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
@@ -419,7 +458,7 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
 
         let first = Arc::clone(&cache)
-            .execute(call_payload(42), {
+            .execute(SyncScope::Legacy, call_payload(42), {
                 let runs = Arc::clone(&runs);
                 move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
@@ -432,7 +471,7 @@ mod tests {
 
         // Before TTL expires, the cached frame is returned.
         let cached = Arc::clone(&cache)
-            .execute(call_payload(42), {
+            .execute(SyncScope::Legacy, call_payload(42), {
                 let runs = Arc::clone(&runs);
                 move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
@@ -446,7 +485,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
 
         let after_ttl = Arc::clone(&cache)
-            .execute(call_payload(42), {
+            .execute(SyncScope::Legacy, call_payload(42), {
                 let runs = Arc::clone(&runs);
                 move |c| async move {
                     runs.fetch_add(1, Ordering::SeqCst);
@@ -456,5 +495,76 @@ mod tests {
             .await;
         assert_eq!(after_ttl, reply_frame(42, "fresh-2"));
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    async fn run_counting(
+        cache: &Arc<WsSyncCache>,
+        scope: SyncScope,
+        id: u64,
+        runs: &Arc<AtomicUsize>,
+    ) -> WsServerMessage {
+        let runs = Arc::clone(runs);
+        Arc::clone(cache)
+            .execute(scope, call_payload(id), move |c| async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                reply_frame(c.id, "run")
+            })
+            .await
+    }
+
+    fn session(name: &str) -> SyncScope {
+        SyncScope::Session(name.to_owned())
+    }
+
+    #[tokio::test]
+    async fn sessions_with_same_call_key_execute_independently() {
+        let cache = Arc::new(WsSyncCache::new(8, Duration::from_secs(60)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        run_counting(&cache, session("a"), 1, &runs).await;
+        run_counting(&cache, session("b"), 1, &runs).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn evict_in_one_session_keeps_other_session_entry() {
+        let cache = Arc::new(WsSyncCache::new(8, Duration::from_secs(60)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        run_counting(&cache, session("a"), 1, &runs).await;
+        run_counting(&cache, session("b"), 1, &runs).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        cache.evict_id(&session("a"), 1);
+
+        run_counting(&cache, session("b"), 1, &runs).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "B stays cached");
+        run_counting(&cache, session("a"), 1, &runs).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "A re-executes after evict");
+    }
+
+    #[tokio::test]
+    async fn legacy_scope_shares_entries_across_connections() {
+        let cache = Arc::new(WsSyncCache::new(8, Duration::from_secs(60)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        run_counting(&cache, SyncScope::Legacy, 1, &runs).await;
+        run_counting(&cache, SyncScope::Legacy, 1, &runs).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parse_session_param_accepts_uuid_and_rejects_bad_values() {
+        let uuid = "3f2b8c1e-9d4a-4e7b-a1c2-0123456789ab";
+        assert_eq!(
+            parse_session_param(Some(uuid)),
+            Ok(SyncScope::Session(uuid.to_owned()))
+        );
+        assert_eq!(parse_session_param(None), Ok(SyncScope::Legacy));
+        assert_eq!(parse_session_param(Some("")), Err(()));
+        assert_eq!(parse_session_param(Some("../x")), Err(()));
+        assert_eq!(parse_session_param(Some("a b")), Err(()));
+        assert_eq!(parse_session_param(Some(&"a".repeat(65))), Err(()));
+        assert_eq!(
+            parse_session_param(Some(&"a".repeat(64))),
+            Ok(SyncScope::Session("a".repeat(64)))
+        );
     }
 }

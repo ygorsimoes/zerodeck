@@ -75,10 +75,11 @@ Server-to-client `EVENT` (`type: 5`) frames:
 If a plugin worker crashes or stops while a call is in flight (or is in `BackingOff`/`StartupTimeout`), the server responds with `DISCARD` (`2`) for that call ID.
 
 `FULL_SYNC` and `RECEIVED_RESPONSE` semantics (`WsSyncCache`, default capacity `256`, TTL `300 s`):
-- Inbound `CALL (0)` and `FULL_SYNC (4)` replays are keyed by `(call.id, call.route, canonical_args_json)`.
+- Inbound `CALL (0)` and `FULL_SYNC (4)` replays are keyed by `(session, call.id, call.route, canonical_args_json)`.
+- `session` comes from the optional `session` query parameter of the `/ws` upgrade (the frontend sends one `crypto.randomUUID()` per page load, stable across reconnects). It must be 1-64 characters of `[A-Za-z0-9-]`; any other value is rejected with `400 Bad Request` (after the auth check). Connections that omit it share one legacy namespace. This keeps a new page load, whose call ids restart at 1, from receiving another session's cached reply.
 - If an identical call is already in flight, the replay joins the active execution and receives its single result without spawning duplicate work.
 - If an identical call has completed and has not yet been acknowledged, the cached `REPLY`/`ERROR`/`DISCARD` frame is returned immediately without re-executing the call.
-- `RECEIVED_RESPONSE (3)` evicts completed cached entries matching `id`.
+- `RECEIVED_RESPONSE (3)` evicts completed cached entries matching `id` within the connection's session only.
 - Each inbound `CALL` and replayed call runs in its own spawned task so slow plugin calls never starve WebSocket keepalive `pong` handling.
 
 Connection limits:

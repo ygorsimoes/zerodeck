@@ -120,9 +120,10 @@ lint-infra: _toolchain-sync
         hadolint --config /hadolint.yaml - < Dockerfile
 
 # Root-only tests (`privileged_*`: privilege drop, parent-death signal) in the root container
+# (always Docker, even with ZERODECK_NATIVE=1; inside a container it runs directly and needs root)
 [group('checks')]
 test-privileged:
-    {{ if native == "true" { "" } else { "docker compose run --rm $( [ -t 0 ] && [ -t 1 ] || echo -T ) privileged-test" } }} just _test-privileged
+    {{ if env("ZERODECK_IN_CONTAINER", "") != "" { "" } else { "docker compose run --rm $( [ -t 0 ] && [ -t 1 ] || echo -T ) privileged-test" } }} just _test-privileged
 
 # Fuzz one target, e.g. `just fuzz zip_extract 120` (targets: fuzz/fuzz_targets/)
 [group('checks')]
@@ -222,6 +223,12 @@ _cargo-test:
 
 [private]
 _test-privileged:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "error: privileged tests require root; run \`just test-privileged\` from the host" >&2
+        exit 1
+    fi
     cargo test --workspace --locked -- --ignored privileged_
 
 [private]

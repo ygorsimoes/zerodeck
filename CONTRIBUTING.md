@@ -34,6 +34,7 @@ That's all. Run `just` to list every recipe.
 just setup          # once (and after toolchain changes): build the dev image, install frontend deps
 just check          # core checks: fmt, clippy, tests, Python lint/tests, cargo-deny, frontend
 just ci             # everything CI runs except fuzzing: check + Python matrix + lint-infra + smoke
+                    # + test-privileged (root-only tests, always in the root container)
 just fmt            # format Rust + frontend code
 just lint           # lints only (no tests)
 just test           # tests only (Rust, Python worker host, frontend)

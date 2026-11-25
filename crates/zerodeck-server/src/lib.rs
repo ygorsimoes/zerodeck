@@ -2,10 +2,13 @@
 
 mod auth;
 mod error;
+mod fetch;
 mod router;
+mod ws_sync;
 
 pub use error::ServerError;
 pub use router::{AppState, ServerConfig, build_router, serve};
+pub use ws_sync::WsSyncCache;
 
 #[cfg(test)]
 mod tests {
@@ -194,14 +197,18 @@ mod tests {
                 "{uri}"
             );
         }
-        // A valid token gets past the middleware (`/fetch` itself is not routed yet).
+        // A valid token gets past the middleware (`/fetch` requires `fetch_url`).
         assert_eq!(
             get_status(&app, &format!("/fetch?url=x&auth={token}"), None).await,
-            StatusCode::NOT_FOUND
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            get_status(&app, &format!("/fetch?auth={token}"), None).await,
+            StatusCode::BAD_REQUEST
         );
         assert_eq!(
             get_status(&app, "/fetch", Some(&token)).await,
-            StatusCode::NOT_FOUND
+            StatusCode::BAD_REQUEST
         );
     }
 
@@ -227,6 +234,341 @@ mod tests {
         assert!(!crate::auth::tokens_match("abc-123", "abc-124"));
         assert!(!crate::auth::tokens_match("abc-123", "abc-1234"));
         assert!(!crate::auth::tokens_match("", "abc"));
+    }
+
+    async fn call_get(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("call router");
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn test_paths_with_home(root: &std::path::Path) -> zerodeck_platform::PlatformPaths {
+        let root_str = root.display().to_string();
+        let home_str = root.join("home").display().to_string();
+        std::fs::create_dir_all(&home_str).expect("create home");
+        let lookup = std::collections::HashMap::from([
+            ("UNPRIVILEGED_PATH", root_str.as_str()),
+            ("PRIVILEGED_PATH", root_str.as_str()),
+            ("DECKY_USER_HOME", home_str.as_str()),
+            ("HOME", home_str.as_str()),
+        ]);
+        zerodeck_platform::PlatformPaths::from_lookup(|k| lookup.get(k).map(|v| (*v).to_owned()))
+    }
+
+    #[cfg(unix)]
+    fn seed_static_and_plugin_routes(
+        dir: &std::path::Path,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::Arc<zerodeck_core::PluginManager>,
+    ) {
+        let frontend = dir.join("frontend");
+        std::fs::create_dir_all(frontend.join("static")).expect("mkdir static");
+        std::fs::create_dir_all(frontend.join("locales")).expect("mkdir locales");
+        std::fs::write(frontend.join("index.js"), "console.log('fe');").expect("index.js");
+        std::fs::write(frontend.join("static/app.css"), "body{}").expect("app.css");
+        std::fs::write(frontend.join("locales/en.json"), r#"{"ok":true}"#).expect("en.json");
+
+        let paths = test_paths_with_home(dir);
+        let plug = paths.plugins_dir().join("demo");
+        std::fs::create_dir_all(plug.join("dist")).expect("dist");
+        std::fs::create_dir_all(plug.join("assets")).expect("assets");
+        std::fs::create_dir_all(paths.data_dir().join("demo")).expect("data");
+        std::fs::write(
+            plug.join("plugin.json"),
+            r#"{"name":"Demo","author":"Alice"}"#,
+        )
+        .expect("plugin.json");
+        std::fs::write(plug.join("dist/index.js"), "export default 1;").expect("dist/index.js");
+        std::fs::write(plug.join("assets/icon.svg"), "<svg/>").expect("icon.svg");
+        std::fs::write(paths.data_dir().join("demo/cache.json"), r#"{"n":1}"#).expect("cache.json");
+
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "secret").expect("outside");
+        std::os::unix::fs::symlink(&outside, plug.join("assets/escape.svg")).expect("symlink");
+        std::os::unix::fs::symlink(dir.join("missing.svg"), plug.join("assets/broken.svg"))
+            .expect("broken symlink");
+
+        let mgr = std::sync::Arc::new(
+            zerodeck_core::PluginManager::open(
+                paths,
+                zerodeck_plugin_host::SupervisorConfig::default(),
+                "0.1.0",
+            )
+            .expect("open mgr"),
+        );
+        (frontend, mgr)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_static_and_plugin_routes_serve_mime_types_and_block_traversal() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-static-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+
+        for (uri, mime, expected_body) in [
+            (
+                "/frontend/index.js",
+                "text/javascript; charset=utf-8",
+                "console.log('fe');",
+            ),
+            ("/static/app.css", "text/css; charset=utf-8", "body{}"),
+            ("/locales/en.json", "application/json", r#"{"ok":true}"#),
+            (
+                "/plugins/Demo/dist/index.js",
+                "text/javascript; charset=utf-8",
+                "export default 1;",
+            ),
+            ("/plugins/Demo/assets/icon.svg", "image/svg+xml", "<svg/>"),
+            (
+                "/plugins/Demo/data/cache.json",
+                "application/json",
+                r#"{"n":1}"#,
+            ),
+        ] {
+            let (st, hdrs, body) = call_get(&app, "GET", uri).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+            assert_eq!(hdrs.get("content-type").unwrap(), mime, "{uri}");
+            assert_eq!(body, expected_body, "{uri}");
+        }
+
+        for bundle_uri in ["/plugins/load_main/Demo", "/plugins/Demo/frontend_bundle"] {
+            let (st, hdrs, body) = call_get(&app, "GET", bundle_uri).await;
+            assert_eq!(st, StatusCode::OK, "{bundle_uri}");
+            assert_eq!(
+                hdrs.get("content-type").unwrap(),
+                "text/javascript; charset=utf-8"
+            );
+            assert_eq!(hdrs.get("cache-control").unwrap(), "no-store");
+            assert_eq!(body, "export default 1;");
+        }
+        let (head_st, head_hdrs, head_body) =
+            call_get(&app, "HEAD", "/plugins/Demo/frontend_bundle").await;
+        assert_eq!(head_st, StatusCode::OK);
+        assert_eq!(
+            head_hdrs.get("content-type").unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(head_body, "");
+
+        for bad in [
+            "/frontend/../outside.txt",
+            "/plugins/Demo/assets/%2e%2e/plugin.json",
+            "/plugins/Demo/assets/%00bad",
+            "/plugins/Demo/assets/escape.svg",
+        ] {
+            let (st, _, _) = call_get(&app, "GET", bad).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{bad}");
+        }
+
+        for missing in [
+            "/frontend/missing.js",
+            "/plugins/Demo/assets/missing.svg",
+            "/plugins/Demo/assets/broken.svg",
+            "/plugins/Missing/dist/index.js",
+        ] {
+            let (st, _, _) = call_get(&app, "GET", missing).await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{missing}");
+        }
+
+        let no_fe_app = build_router(AppState::new(ServerConfig::default()));
+        let (st, _, _) = call_get(&no_fe_app, "GET", "/static/app.css").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn spawn_mock_upstream() -> std::net::SocketAddr {
+        use axum::routing::{get, post};
+        let mock = axum::Router::new()
+            .route(
+                "/echo",
+                post(
+                    |headers: axum::http::HeaderMap, body: axum::body::Bytes| async move {
+                        let hdr = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned)
+                        };
+                        let payload = serde_json::json!({
+                            "x_custom": hdr("x-custom"),
+                            "cookie": hdr("cookie"),
+                            "origin": hdr("origin"),
+                            "x_decky_auth": hdr("x-decky-auth"),
+                            "body": String::from_utf8_lossy(&body).into_owned(),
+                        });
+                        (
+                            StatusCode::OK,
+                            [
+                                ("access-control-allow-origin", "https://evil.example"),
+                                ("access-control-expose-headers", "X-Evil"),
+                                ("x-upstream", "ok"),
+                                ("connection", "x-hop"),
+                                ("x-hop", "secret"),
+                            ],
+                            axum::Json(payload),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/stream",
+                get(|| async {
+                    let chunks = vec![
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(
+                            b"chunk1-",
+                        )),
+                        Ok(axum::body::Bytes::from_static(b"chunk2-")),
+                        Ok(axum::body::Bytes::from_static(b"chunk3")),
+                    ];
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/plain")
+                        .body(Body::from_stream(futures_util::stream::iter(chunks)))
+                        .expect("stream resp")
+                }),
+            )
+            .route(
+                "/redirect-loopback",
+                get(|| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("location", "http://127.0.0.1:1337/auth/token")
+                        .body(Body::empty())
+                        .expect("redirect")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_translates_headers_streams_body_and_blocks_ssrf_redirects() {
+        let mock_addr = spawn_mock_upstream().await;
+        let policy = zerodeck_core::OutboundHttpPolicy::for_loopback_ports_for_testing(vec![
+            mock_addr.port(),
+        ]);
+        let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
+        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let token = state.csrf_token().to_owned();
+        let app = build_router(state);
+
+        let echo_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/fetch?fetch_url=http://127.0.0.1:{}/echo",
+                        mock_addr.port()
+                    ))
+                    .header("X-Decky-Auth", &token)
+                    .header("X-Decky-Header-X-Custom", "hello")
+                    .header("X-Decky-Header-Cookie", "session=abc")
+                    .header("Cookie", "leak=1")
+                    .header("Origin", "https://steamloopback.host")
+                    .header("X-Decky-Fetch-Excluded-Headers", "origin")
+                    .body(Body::from("payload-bytes"))
+                    .expect("echo req"),
+            )
+            .await
+            .expect("echo resp");
+        assert_eq!(echo_res.status(), StatusCode::OK);
+        assert_eq!(echo_res.headers().get("x-upstream").unwrap(), "ok");
+        assert_eq!(
+            echo_res
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://steamloopback.host"
+        );
+        assert!(
+            echo_res
+                .headers()
+                .get("access-control-expose-headers")
+                .is_none()
+        );
+        assert!(echo_res.headers().get("x-hop").is_none());
+        let echo_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(echo_res.into_body(), 16 * 1024).await.unwrap())
+                .expect("json");
+        assert_eq!(
+            echo_json,
+            serde_json::json!({
+                "x_custom": "hello",
+                "cookie": "session=abc",
+                "origin": null,
+                "x_decky_auth": null,
+                "body": "payload-bytes",
+            })
+        );
+
+        let stream_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/fetch?fetch_url=http://127.0.0.1:{}/stream&auth={token}",
+                        mock_addr.port()
+                    ))
+                    .body(Body::empty())
+                    .expect("stream req"),
+            )
+            .await
+            .expect("stream resp");
+        assert_eq!(stream_res.status(), StatusCode::OK);
+        let stream_body = to_bytes(stream_res.into_body(), 16 * 1024).await.unwrap();
+        assert_eq!(stream_body.as_ref(), b"chunk1-chunk2-chunk3");
+
+        for blocked in [
+            format!("/fetch?fetch_url=http://127.0.0.1:1337/auth/token&auth={token}"),
+            format!("/fetch?fetch_url=http://169.254.169.254/latest/meta-data&auth={token}"),
+            format!(
+                "/fetch?fetch_url=http://127.0.0.1:{}/redirect-loopback&auth={token}",
+                mock_addr.port()
+            ),
+        ] {
+            let (st, _, _) = call_get(&app, "GET", &blocked).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{blocked}");
+        }
+
+        for invalid in [
+            format!("/fetch?fetch_url=file:///etc/passwd&auth={token}"),
+            format!("/fetch?fetch_url=not-a-url&auth={token}"),
+        ] {
+            let (st, _, _) = call_get(&app, "GET", &invalid).await;
+            assert_eq!(st, StatusCode::BAD_REQUEST, "{invalid}");
+        }
     }
 
     mod ws {
@@ -747,6 +1089,350 @@ class Plugin:
 
             manager.shutdown_all().await;
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        async fn ws_call<S>(
+            ws: &mut S,
+            events: &mut Vec<Value>,
+            id: u64,
+            route: &str,
+            args: Value,
+        ) -> Value
+        where
+            S: SinkExt<Message>
+                + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+                + Unpin,
+            <S as futures_util::Sink<Message>>::Error: std::fmt::Debug,
+        {
+            let msg = json!({"type": 0, "id": id, "route": route, "args": args});
+            ws.send(Message::Text(msg.to_string().into()))
+                .await
+                .expect("send ws call");
+            loop {
+                let frame = next_text_frame(ws).await;
+                if frame["id"] == json!(id) {
+                    return frame;
+                }
+                if frame["type"] == json!(5) {
+                    events.push(frame);
+                }
+            }
+        }
+
+        async fn take_event<S>(ws: &mut S, events: &mut Vec<Value>, event_name: &str) -> Value
+        where
+            S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+        {
+            if let Some(pos) = events.iter().position(|e| e["event"] == json!(event_name)) {
+                return events.remove(pos);
+            }
+            loop {
+                let frame = next_text_frame(ws).await;
+                if frame["type"] == json!(5) && frame["event"] == json!(event_name) {
+                    return frame;
+                }
+                if frame["type"] == json!(5) {
+                    events.push(frame);
+                }
+            }
+        }
+
+        fn build_plugin_zip(
+            zip_path: &std::path::Path,
+            wrapper: &str,
+            manifest_json: &str,
+            main_py: &str,
+        ) -> String {
+            use sha2::Digest;
+            use std::io::Write;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut writer = zip::ZipWriter::new(&mut buf);
+                let opts = zip::write::SimpleFileOptions::default();
+                writer
+                    .start_file(format!("{wrapper}/plugin.json"), opts)
+                    .expect("start plugin.json");
+                writer
+                    .write_all(manifest_json.as_bytes())
+                    .expect("write plugin.json");
+                writer
+                    .start_file(format!("{wrapper}/main.py"), opts)
+                    .expect("start main.py");
+                writer.write_all(main_py.as_bytes()).expect("write main.py");
+                writer.finish().expect("finish zip");
+            }
+            let bytes = buf.into_inner();
+            std::fs::write(zip_path, &bytes).expect("write zip");
+            hex::encode(sha2::Sha256::digest(&bytes))
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_full_sync_deduplicates_completed_call_and_evicts_on_received_response() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-sync-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let counter_file = dir.join("count.txt");
+            std::fs::write(&counter_file, "0").expect("seed counter");
+
+            let plug = paths.plugins_dir().join("counter");
+            std::fs::create_dir_all(&plug).expect("plug dir");
+            std::fs::write(
+                plug.join("plugin.json"),
+                r#"{"name":"Counter","author":"Tester","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            let py = format!(
+                "import asyncio\nfrom pathlib import Path\nP = Path({:?})\nclass Plugin:\n    async def inc(self):\n        n = int(P.read_text()) + 1\n        P.write_text(str(n))\n        return n\n    async def slow_inc(self):\n        await asyncio.sleep(0.15)\n        return await self.inc()\n",
+                counter_file.display().to_string()
+            );
+            std::fs::write(plug.join("main.py"), py).expect("main.py");
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+
+            let (addr, token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+
+            // 1) Completed call cached across reconnect FULL_SYNC until RECEIVED_RESPONSE.
+            let mut ws1 = connect(addr, &token).await;
+            let call_inc = json!({
+                "type": 0, "id": 42, "route": "loader/call_plugin_method",
+                "args": ["Counter", "inc"]
+            });
+            ws1.send(Message::Text(call_inc.to_string().into()))
+                .await
+                .expect("send call");
+            let r1 = next_text_frame(&mut ws1).await;
+            assert_eq!(r1, json!({"type": 1, "id": 42, "result": 1}));
+            drop(ws1);
+
+            let mut ws2 = connect(addr, &token).await;
+            let sync = json!({"type": 4, "messages": [call_inc]});
+            ws2.send(Message::Text(sync.to_string().into()))
+                .await
+                .expect("send sync");
+            assert_eq!(
+                next_text_frame(&mut ws2).await,
+                json!({"type": 1, "id": 42, "result": 1})
+            );
+            assert_eq!(std::fs::read_to_string(&counter_file).unwrap(), "1");
+
+            // 2) In-flight call deduplicated across reconnect FULL_SYNC.
+            let mut ws_drop = connect(addr, &token).await;
+            let call_slow = json!({
+                "type": 0, "id": 43, "route": "loader/call_plugin_method",
+                "args": ["Counter", "slow_inc"]
+            });
+            ws_drop
+                .send(Message::Text(call_slow.to_string().into()))
+                .await
+                .expect("send slow");
+            drop(ws_drop);
+            ws2.send(Message::Text(
+                json!({"type": 4, "messages": [call_slow]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send in-flight sync");
+            assert_eq!(
+                next_text_frame(&mut ws2).await,
+                json!({"type": 1, "id": 43, "result": 2})
+            );
+            assert_eq!(std::fs::read_to_string(&counter_file).unwrap(), "2");
+
+            // 3) RECEIVED_RESPONSE evicts id=42 so calling again executes fresh.
+            ws2.send(Message::Text(
+                json!({"type": 3, "id": 42}).to_string().into(),
+            ))
+            .await
+            .expect("send ack");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ws2.send(Message::Text(call_inc.to_string().into()))
+                .await
+                .expect("send fresh call");
+            assert_eq!(
+                next_text_frame(&mut ws2).await,
+                json!({"type": 1, "id": 42, "result": 3})
+            );
+            assert_eq!(std::fs::read_to_string(&counter_file).unwrap(), "3");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        fn setup_lifecycle_fixtures(
+            dir: &std::path::Path,
+            paths: &zerodeck_platform::PlatformPaths,
+        ) -> (
+            std::path::PathBuf,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            std::path::PathBuf,
+            String,
+            std::path::PathBuf,
+            String,
+        ) {
+            let sub = paths.user_home().join("sub");
+            std::fs::create_dir_all(sub.join("nested")).expect("nested");
+            std::fs::write(sub.join("sample.txt"), "hello").expect("sample.txt");
+            let outside =
+                std::env::temp_dir().join(format!("zd-srv-outside-{}.txt", uuid::Uuid::new_v4()));
+            std::fs::write(&outside, "secret").expect("outside");
+            std::os::unix::fs::symlink(&outside, sub.join("escape.txt")).expect("symlink");
+
+            let marker = dir.join("uninstalled.marker");
+            let zip1 = paths.user_home().join("demo1.zip");
+            let sha1 = build_plugin_zip(
+                &zip1,
+                "Demo",
+                r#"{"name":"Demo","author":"Alice","api_version":1}"#,
+                &format!(
+                    "from pathlib import Path\nclass Plugin:\n    async def _uninstall(self):\n        Path({:?}).write_text('done')\n    async def ping(self):\n        return 'ok'\n",
+                    marker.display().to_string()
+                ),
+            );
+            let zip2 = paths.user_home().join("demo2.zip");
+            let sha2 = build_plugin_zip(
+                &zip2,
+                "Demo2",
+                r#"{"name":"Demo2","author":"Bob"}"#,
+                "class Plugin:\n    pass\n",
+            );
+            (sub, outside, marker, zip1, sha1, zip2, sha2)
+        }
+
+        async fn verify_lifecycle_and_settings<S>(ws: &mut S, events: &mut Vec<Value>)
+        where
+            S: SinkExt<Message>
+                + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+                + Unpin,
+            <S as futures_util::Sink<Message>>::Error: std::fmt::Debug,
+        {
+            for (id, route, args) in [
+                (4, "loader/disable_plugin", json!(["Demo"])),
+                (5, "loader/enable_plugin", json!(["Demo"])),
+                (6, "loader/set_plugin_order", json!([["Demo2", "Demo"]])),
+                (
+                    7,
+                    "loader/set_setting",
+                    json!(["developer.allow_unverified_installs", true]),
+                ),
+                (
+                    8,
+                    "loader/get_settings",
+                    json!(["developer.allow_unverified_installs"]),
+                ),
+            ] {
+                assert_eq!(
+                    ws_call(ws, events, id, route, args).await["result"],
+                    json!(true)
+                );
+            }
+            let bad_set = ws_call(
+                ws,
+                events,
+                9,
+                "loader/set_setting",
+                json!(["disabledPlugins", []]),
+            )
+            .await;
+            assert_eq!(bad_set["type"], json!(-1));
+            assert_eq!(bad_set["error"]["name"], json!("ValueError"));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_routes_cover_filepicker_install_lifecycle_and_settings() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-life-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let (sub, outside, marker, zip1, sha1, zip2, sha2) =
+                setup_lifecycle_fixtures(&dir, &paths);
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            let (addr, token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+            let mut ws = connect(addr, &token).await;
+            let mut events = Vec::new();
+
+            let fp = ws_call(
+                &mut ws,
+                &mut events,
+                1,
+                "utilities/filepicker",
+                json!([sub]),
+            )
+            .await;
+            let files = fp["result"]["files"].as_array().expect("files array");
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0]["name"], json!("nested"));
+            assert_eq!(files[0]["isdir"], json!(true));
+            assert_eq!(files[1]["name"], json!("sample.txt"));
+            assert_eq!(files[1]["size"], json!(5));
+            assert!(files[1]["modified"].as_f64().is_some());
+
+            let install_uri = url::Url::from_file_path(&zip1).unwrap().to_string();
+            let inst1 = ws_call(
+                &mut ws,
+                &mut events,
+                2,
+                "loader/install_plugin",
+                json!([install_uri, "Demo", null, sha1, "local", true]),
+            )
+            .await;
+            assert_eq!(inst1["result"]["name"], json!("Demo"));
+            let _ = take_event(&mut ws, &mut events, "loader/plugins_changed").await;
+
+            let inst2 = ws_call(
+                &mut ws,
+                &mut events,
+                3,
+                "utilities/install_plugin",
+                json!([{"url": zip2.display().to_string(), "sha256": sha2, "user_confirmed": true}]),
+            )
+            .await;
+            assert_eq!(inst2["result"]["name"], json!("Demo2"));
+            let _ = take_event(&mut ws, &mut events, "loader/plugins_changed").await;
+
+            verify_lifecycle_and_settings(&mut ws, &mut events).await;
+
+            assert_eq!(
+                ws_call(
+                    &mut ws,
+                    &mut events,
+                    10,
+                    "loader/uninstall_plugin",
+                    json!(["Demo", false])
+                )
+                .await["result"],
+                json!(true)
+            );
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&outside);
         }
     }
 }

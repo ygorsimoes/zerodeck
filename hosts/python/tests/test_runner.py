@@ -999,6 +999,52 @@ class SyncMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
             runner.plugin.release.set()
             thread.join(timeout=5)
 
+    async def test_awaitable_returned_by_sync_main_is_run_and_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entrypoint = self._write_plugin(
+                Path(tmp),
+                [
+                    "import asyncio",
+                    "import functools",
+                    "",
+                    "def plain(fn):",
+                    "    @functools.wraps(fn)",
+                    "    def wrapper(*args, **kwargs):",
+                    "        return fn(*args, **kwargs)",
+                    "    return wrapper",
+                    "",
+                    "class Plugin:",
+                    "    def __init__(self):",
+                    "        self.started = False",
+                    "        self.cancelled = False",
+                    "",
+                    "    @plain",
+                    "    async def _main(self):",
+                    "        self.started = True",
+                    "        try:",
+                    "            await asyncio.sleep(60)",
+                    "        except asyncio.CancelledError:",
+                    "            self.cancelled = True",
+                    "            raise",
+                ],
+            )
+
+            async def sink(_payload: dict[str, object]) -> None:
+                return None
+
+            runner = PluginRunner(
+                entrypoint=entrypoint, plugin_name="Wrapped", api_version=1, emit_sink=sink
+            )
+            runner.load()
+            await runner.start_lifecycle()
+            for _ in range(100):
+                if runner.plugin.started:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(runner.plugin.started, "wrapped async _main never ran")
+            await asyncio.wait_for(runner.stop_lifecycle(), timeout=1.0)
+            self.assertTrue(runner.plugin.cancelled)
+
     async def test_sync_main_exception_is_logged(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

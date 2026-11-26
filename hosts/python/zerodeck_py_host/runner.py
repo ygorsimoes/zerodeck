@@ -40,6 +40,7 @@ class PluginRunner:
         self.uninstalling = False
         self.main_task: asyncio.Task[Any] | None = None
         self.main_thread: threading.Thread | None = None
+        self._stopping = False
         self._decky_logger: Any = None
         self._stop_event: asyncio.Event | None = stop_event
 
@@ -119,22 +120,43 @@ class PluginRunner:
                 # default executor, which asyncio.run waits for) lets the worker exit on shutdown.
                 self.main_thread = threading.Thread(
                     target=self._run_sync_main,
-                    args=(callable_fn, prefix),
+                    args=(callable_fn, prefix, asyncio.get_running_loop()),
                     name=f"{self.plugin_name}-main",
                     daemon=True,
                 )
                 self.main_thread.start()
             await asyncio.sleep(0)
 
-    def _run_sync_main(self, callable_fn: Callable[..., Any], prefix: tuple[Any, ...]) -> None:
+    def _run_sync_main(
+        self,
+        callable_fn: Callable[..., Any],
+        prefix: tuple[Any, ...],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
         try:
-            callable_fn(*prefix)
+            result = callable_fn(*prefix)
+            if inspect.isawaitable(result):
+                # A plain function returning a coroutine (e.g. `async def _main` behind an
+                # ordinary decorator): run it on the event loop like an async _main.
+                loop.call_soon_threadsafe(self._adopt_main_awaitable, result)
         except Exception as exc:
             if self._decky_logger is not None:
                 self._decky_logger.error(
                     "plugin _main task failed",
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+
+    def _adopt_main_awaitable(self, awaitable: Awaitable[Any]) -> None:
+        if self._stopping:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            return
+
+        async def _await_main() -> Any:
+            return await awaitable
+
+        self.main_task = asyncio.get_running_loop().create_task(_await_main())
+        self.main_task.add_done_callback(self._log_main_task_result)
 
     def _log_main_task_result(self, task: asyncio.Task[Any]) -> None:
         if task.cancelled():
@@ -147,6 +169,7 @@ class PluginRunner:
             )
 
     async def stop_lifecycle(self) -> None:
+        self._stopping = True
         if self.main_task is not None and not self.main_task.done():
             self.main_task.cancel()
             with suppress(asyncio.CancelledError):

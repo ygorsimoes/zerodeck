@@ -62,6 +62,11 @@ fn daemon_command(home: &TempHome, host: &str, port: u16) -> Command {
         .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Under `just coverage` the daemon binary is instrumented; keep its profile output where
+    // cargo-llvm-cov collects it instead of a stray `default_*.profraw` in the working directory.
+    if let Some(profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile_file);
+    }
     cmd
 }
 

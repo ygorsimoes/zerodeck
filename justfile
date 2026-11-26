@@ -40,7 +40,8 @@ setup:
 check:
     {{ dev }} just _check
 
-# Everything CI runs except fuzzing: check + Python matrix + infra lint + smoke + root-only tests
+# Everything CI runs except fuzzing and coverage: check + Python matrix + infra lint + smoke +
+# root-only tests
 [group('dev')]
 ci: check py-matrix lint-infra smoke test-privileged
 
@@ -81,7 +82,7 @@ clean:
 check-rust:
     {{ dev }} just _fmt-check _clippy _doc _cargo-test
 
-# Rust test coverage report (HTML + lcov) into target/coverage
+# Rust test coverage report (HTML + lcov) into ./coverage (open coverage/html/index.html)
 [group('checks')]
 coverage:
     {{ dev }} just _coverage
@@ -242,8 +243,8 @@ _test-privileged:
 
 [private]
 _coverage:
-    cargo llvm-cov --workspace --locked --html --output-dir target/coverage
-    cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
+    cargo llvm-cov --workspace --locked --html --output-dir coverage
+    cargo llvm-cov report --lcov --output-path coverage/lcov.info
 
 [private]
 _py-test:

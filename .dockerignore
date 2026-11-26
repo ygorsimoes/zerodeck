@@ -3,6 +3,8 @@
 .superpowers
 .worktrees
 target
+coverage
+**/*.profraw
 **/node_modules
 frontend/dist
 frontend/.vite

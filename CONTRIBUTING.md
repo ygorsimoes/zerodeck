@@ -33,7 +33,7 @@ That's all. Run `just` to list every recipe.
 ```bash
 just setup          # once (and after toolchain changes): build the dev image, install frontend deps
 just check          # core checks: fmt, clippy, rustdoc, tests, Python lint/tests, cargo-deny, frontend
-just ci             # everything CI runs except fuzzing: check + Python matrix + lint-infra + smoke
+just ci             # everything CI runs except fuzzing and coverage: check + Python matrix + lint-infra + smoke
                     # + test-privileged (root-only tests, always in the root container)
 just fmt            # format Rust + frontend code
 just lint           # lints only (no tests)
@@ -48,7 +48,7 @@ Focused checks:
 ```bash
 just check-rust     # rustfmt, clippy -D warnings, rustdoc -D warnings, cargo test
 just test-privileged  # root-only tests (privilege drop, worker reaping, root plugin ownership)
-just coverage       # Rust coverage report (HTML + lcov) into target/coverage
+just coverage       # Rust coverage report (HTML + lcov) into ./coverage
 just deny           # deny.toml: licenses, advisories, sources
 just check-python   # ruff, strict pyright, unittest
 just py-test-on 3.10  # Python worker host tests on one interpreter (official python image)

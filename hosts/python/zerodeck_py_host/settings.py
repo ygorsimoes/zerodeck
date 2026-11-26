@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -72,17 +73,15 @@ class SettingsManager:
                 os.replace(tmp_path, self.path)
                 _fsync_directory(self.settings_directory)
             except BaseException:
-                try:
+                with suppress(OSError):
                     tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 raise
 
-    def getSetting(self, key: str, default: Any = None) -> Any:  # noqa: N802
+    def getSetting(self, key: str, default: Any = None) -> Any:
         with self._lock:
             return self.settings.get(key, default)
 
-    def setSetting(self, key: str, value: Any) -> None:  # noqa: N802
+    def setSetting(self, key: str, value: Any) -> None:
         with self._lock:
             self.settings[key] = value
         self.commit()
@@ -95,8 +94,7 @@ def _fsync_directory(directory: Path) -> None:
     except OSError:
         return
     try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
+        with suppress(OSError):
+            os.fsync(dir_fd)
     finally:
         os.close(dir_fd)

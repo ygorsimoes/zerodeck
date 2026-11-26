@@ -129,7 +129,7 @@ class PluginRunner:
     def _run_sync_main(self, callable_fn: Callable[..., Any], prefix: tuple[Any, ...]) -> None:
         try:
             callable_fn(*prefix)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             if self._decky_logger is not None:
                 self._decky_logger.error(
                     "plugin _main task failed",
@@ -205,7 +205,7 @@ class PluginRunner:
                 else:
                     raise ValueError("args must be a JSON array")
                 response["res"] = await self._invoke(method_name, args=tuple(args))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             response["success"] = False
             response["res"] = str(exc)
             response["error"] = _error_detail(exc)
@@ -255,10 +255,8 @@ async def _run_worker(args: argparse.Namespace) -> None:
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop_event.set)
-            except NotImplementedError:
-                pass
 
         serve_task = asyncio.create_task(transport.serve(runner.handle_message))
         stop_task = asyncio.create_task(stop_event.wait())

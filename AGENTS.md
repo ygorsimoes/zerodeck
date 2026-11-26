@@ -31,7 +31,7 @@ zerodeckd
   - Workspace lints (`Cargo.toml`) enable `unsafe_code = "warn"`, `missing_debug_implementations = "warn"`, `rust_2018_idioms`, `clippy::all`, and `clippy::pedantic`. CI runs `clippy` with `-D warnings`.
   - Minimize `unsafe`; any unavoidable `unsafe` block MUST include a clear `// SAFETY:` invariant comment.
   - Crates without `unsafe` declare `#![forbid(unsafe_code)]`; `zerodeck-cef` uses `deny` (Phase 4 may need a reviewed `#[allow]`); only `zerodeck-plugin-host` may contain `unsafe`.
-- **Python (`hosts/python`):** Target `>=3.10`, line length `100`, `ruff` (`E`, `F`, `I`, `UP`, `B`), and `pyright` in `"strict"` mode.
+- **Python (`hosts/python`):** Target `>=3.10`, line length `100`, `ruff` (`E`, `F`, `I`, `UP`, `B`, `SIM`, `RUF`, `ASYNC`, `C4`, `PIE`; `ASYNC` ignored under `tests/`), and `pyright` in `"strict"` mode.
 - **Frontend (`frontend/`):** Use **`pnpm` exclusively** (`pnpm@12.16.1`, pinned by `packageManager` in the root `package.json`; workspace in `pnpm-workspace.yaml`; never create `package-lock.json` or `yarn.lock`). TypeScript `^7.0.2` strict mode + `@biomejs/biome` (`biome.json`: 2-space indent, single quotes in JS/TS, line width `100`).
 - **Editor defaults:** Follow `.editorconfig` (LF, UTF-8, trailing newline, 4 spaces for `.rs`/`.py`/`.toml`/`justfile`, 2 spaces for `.ts`/`.json`/`.yml`/`.md`).
 

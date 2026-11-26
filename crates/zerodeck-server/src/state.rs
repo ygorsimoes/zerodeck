@@ -107,14 +107,6 @@ impl AppStateBuilder {
         self
     }
 
-    /// Serves a fixed list of discovered plugins without a manager (tests and tooling).
-    #[doc(hidden)]
-    #[must_use]
-    pub fn static_plugins(mut self, plugins: Vec<DiscoveredPlugin>) -> Self {
-        self.backend = PluginBackend::Static(plugins);
-        self
-    }
-
     /// Outbound client for `/fetch` (defaults to the production SSRF policy with the configured
     /// timeouts).
     #[must_use]

@@ -147,12 +147,17 @@ async fn dispatch_plugin_rpc(
         );
     };
 
-    reply(
-        call.id,
-        manager
-            .call_plugin_method(plugin_name, method_name, payload_args, legacy)
-            .await,
-    )
+    // Plugin results are already JSON; hand them over without re-serializing a copy.
+    match manager
+        .call_plugin_method(plugin_name, method_name, payload_args, legacy)
+        .await
+    {
+        Ok(result) => WsServerMessage::Reply {
+            id: call.id,
+            result,
+        },
+        Err(err) => core_error_to_ws(call.id, err),
+    }
 }
 
 async fn dispatch_reload_plugin(state: &AppState, call: &WsCallPayload) -> WsServerMessage {

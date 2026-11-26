@@ -181,6 +181,7 @@ ENV HOME=/home/zerodeck \
     PRIVILEGED_PATH=/homebrew \
     PYTHONPATH=/opt/zerodeck/python \
     SERVER_HOST=0.0.0.0 \
+    ZERODECK_ALLOW_NON_LOOPBACK=1 \
     SERVER_PORT=1337 \
     RUST_LOG=info
 

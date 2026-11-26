@@ -37,7 +37,7 @@
 ## 🧪 Verification & Quality Checklist
 
 > [!TIP]
-> Run `just check` before pushing: it validates Rust, Python, cargo-deny and the frontend inside the same Docker image CI uses. Run `just ci` for the full CI set (Python matrix, infra lint, runtime smoke test).
+> Run `just check` before pushing: it validates Rust, Python, cargo-deny and the frontend inside the same Docker image CI uses. Run `just ci` for the full CI set (Python matrix, infra lint, runtime smoke test, root-only `test-privileged`).
 
 - [ ] 🦀 **Rust:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` pass (Rust `1.100.0`)
 - [ ] 🐍 **Python:** `unittest`, `ruff check hosts/python`, and `pyright --project hosts/python` (strict) pass

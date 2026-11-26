@@ -75,6 +75,11 @@ export interface WSRouterOptions {
    * because plugin methods may legitimately run for a long time.
    */
   callTimeoutMs?: number;
+  /**
+   * Identifies this page load to the daemon so its `FULL_SYNC` reply cache never mixes call ids
+   * from another session. Defaults to a fresh `crypto.randomUUID()`.
+   */
+  sessionId?: string;
 }
 
 export class PyError extends Error {
@@ -112,8 +117,10 @@ export class WSRouter {
   private readonly createSocket: (url: string) => WebSocketLike;
   private readonly refreshAuthToken?: () => Promise<string>;
   private readonly callTimeoutMs?: number;
+  readonly sessionId: string;
 
   constructor(options: WSRouterOptions = {}) {
+    this.sessionId = options.sessionId ?? crypto.randomUUID();
     this.baseUrl = options.baseUrl ?? 'ws://127.0.0.1:1337';
     this.reconnectDelayMs = options.reconnectDelayMs ?? 1000;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 30_000;
@@ -141,7 +148,9 @@ export class WSRouter {
 
   connect(authToken: string): Promise<void> {
     return new Promise((resolve) => {
-      const ws = this.createSocket(`${this.baseUrl}/ws?auth=${encodeURIComponent(authToken)}`);
+      const ws = this.createSocket(
+        `${this.baseUrl}/ws?auth=${encodeURIComponent(authToken)}&session=${encodeURIComponent(this.sessionId)}`,
+      );
       this.ws = ws;
 
       ws.addEventListener('open', () => {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -18,7 +19,8 @@ pub struct DiscoveredPlugin {
 }
 
 /// Scans `plugins_dir` for non-hidden subdirectories containing a valid `plugin.json`, sorted by
-/// directory name.
+/// directory name. At most one plugin is returned per manifest name: later directories declaring a
+/// name already claimed by an earlier directory are logged and skipped.
 ///
 /// A plugin whose `plugin.json` or `package.json` cannot be read or parsed is logged and skipped,
 /// so one broken plugin never prevents the remaining plugins (or the daemon) from loading.
@@ -58,7 +60,25 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<DiscoveredPlugin>, Cor
 
     // `read_dir` order is filesystem-dependent; sort so load order and listings are stable.
     plugins.sort_by(|a, b| a.directory.cmp(&b.directory));
-    Ok(plugins)
+
+    // Workers are keyed by manifest name, so keep the first directory (sorted order) per name and
+    // skip the rest; `kept_dirs` maps each kept name to its owning directory for the warning.
+    let mut kept_dirs: HashMap<String, String> = HashMap::new();
+    let mut unique = Vec::with_capacity(plugins.len());
+    for plugin in plugins {
+        if let Some(first_dir) = kept_dirs.get(&plugin.manifest.name) {
+            warn!(
+                plugin = %plugin.manifest.name,
+                kept = %first_dir,
+                skipped = %plugin.directory,
+                "duplicate plugin name"
+            );
+            continue;
+        }
+        kept_dirs.insert(plugin.manifest.name.clone(), plugin.directory.clone());
+        unique.push(plugin);
+    }
+    Ok(unique)
 }
 
 pub(crate) fn discover_single_plugin(

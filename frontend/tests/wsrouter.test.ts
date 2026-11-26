@@ -204,6 +204,35 @@ test('WSRouter keeps dispatching EVENT to other listeners when one throws synchr
   assert.deepEqual(received, [7]);
 });
 
+test('WSRouter sends one stable session id across reconnects', async () => {
+  const sockets: MockWebSocket[] = [];
+  const urls: string[] = [];
+  const options = {
+    createSocket: (url: string) => {
+      urls.push(url);
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  };
+  const router = new WSRouter(options);
+
+  const first = router.connect('tok');
+  sockets[0].emit('open', {});
+  await first;
+  const second = router.connect('tok');
+  sockets[1].emit('open', {});
+  await second;
+
+  const sessionOf = (url: string) => new URL(url).searchParams.get('session');
+  assert.ok(router.sessionId.length > 0);
+  assert.equal(sessionOf(urls[0]), router.sessionId);
+  assert.equal(sessionOf(urls[1]), router.sessionId);
+
+  const other = new WSRouter(options);
+  assert.notEqual(other.sessionId, router.sessionId);
+});
+
 test('WSRouter fetches a fresh auth token before reconnecting', async () => {
   const sockets: MockWebSocket[] = [];
   const urls: string[] = [];
@@ -226,8 +255,8 @@ test('WSRouter fetches a fresh auth token before reconnecting', async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.equal(urls.length, 2);
-  assert.match(urls[0], /auth=tok-old$/);
-  assert.match(urls[1], /auth=tok-new$/);
+  assert.match(urls[0], /auth=tok-old&session=/);
+  assert.match(urls[1], /auth=tok-new&session=/);
 });
 
 test('WSRouter backs off exponentially between failed reconnects and resets after open', async () => {
@@ -307,7 +336,7 @@ test('WSRouter.start keeps retrying until the daemon hands out a token', async (
   assert.equal(tokenRequests, 3);
   assert.deepEqual(delays, [100, 200]);
   assert.equal(urls.length, 1);
-  assert.match(urls[0], /auth=tok-late$/);
+  assert.match(urls[0], /auth=tok-late&session=/);
 });
 
 test('WSRouter.start requires refreshAuthToken', () => {

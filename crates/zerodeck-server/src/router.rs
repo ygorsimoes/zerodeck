@@ -3,13 +3,13 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderValue, Method, Request, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{any, get, post};
@@ -36,7 +36,7 @@ use zerodeck_protocol::{WsCallPayload, WsClientMessage, WsErrorDetail, WsServerM
 
 use crate::ServerError;
 use crate::auth::{csrf_middleware, host_guard};
-use crate::ws_sync::WsSyncCache;
+use crate::ws_sync::{SyncScope, WsSyncCache, parse_session_param};
 
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,39 +316,43 @@ async fn handle_auth_token(State(state): State<AppState>) -> String {
 async fn handle_frontend_file(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Response {
     let Some(root) = state.config().frontend_dir.as_deref() else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     };
-    serve_static_under(root, &raw_path, method, false).await
+    serve_static_under(root, &raw_path, method, &headers, false).await
 }
 
 async fn handle_static_file(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Response {
     let Some(root) = state.config().frontend_dir.as_deref() else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     };
-    serve_static_under(&root.join("static"), &raw_path, method, false).await
+    serve_static_under(&root.join("static"), &raw_path, method, &headers, false).await
 }
 
 async fn handle_locales_file(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath(raw_path): AxumPath<String>,
 ) -> Response {
     let Some(root) = state.config().frontend_dir.as_deref() else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     };
-    serve_static_under(&root.join("locales"), &raw_path, method, false).await
+    serve_static_under(&root.join("locales"), &raw_path, method, &headers, false).await
 }
 
 async fn handle_plugin_frontend_bundle(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath(raw_name): AxumPath<String>,
 ) -> Response {
     serve_plugin_scope_file(
@@ -357,6 +361,7 @@ async fn handle_plugin_frontend_bundle(
         PluginFileScope::FrontendBundle,
         "index.js",
         method,
+        &headers,
         true,
     )
     .await
@@ -365,6 +370,7 @@ async fn handle_plugin_frontend_bundle(
 async fn handle_plugin_dist_file(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath((raw_name, raw_path)): AxumPath<(String, String)>,
 ) -> Response {
     serve_plugin_scope_file(
@@ -373,6 +379,7 @@ async fn handle_plugin_dist_file(
         PluginFileScope::Dist,
         &raw_path,
         method,
+        &headers,
         false,
     )
     .await
@@ -381,6 +388,7 @@ async fn handle_plugin_dist_file(
 async fn handle_plugin_assets_file(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath((raw_name, raw_path)): AxumPath<(String, String)>,
 ) -> Response {
     serve_plugin_scope_file(
@@ -389,6 +397,7 @@ async fn handle_plugin_assets_file(
         PluginFileScope::Assets,
         &raw_path,
         method,
+        &headers,
         false,
     )
     .await
@@ -397,6 +406,7 @@ async fn handle_plugin_assets_file(
 async fn handle_plugin_data_file(
     State(state): State<AppState>,
     method: Method,
+    headers: HeaderMap,
     AxumPath((raw_name, raw_path)): AxumPath<(String, String)>,
 ) -> Response {
     serve_plugin_scope_file(
@@ -405,6 +415,7 @@ async fn handle_plugin_data_file(
         PluginFileScope::Data,
         &raw_path,
         method,
+        &headers,
         false,
     )
     .await
@@ -414,6 +425,7 @@ async fn serve_static_under(
     root: &Path,
     raw_rel: &str,
     method: Method,
+    headers: &HeaderMap,
     no_store: bool,
 ) -> Response {
     let rel_path = match decode_safe_rel_path(raw_rel) {
@@ -421,7 +433,9 @@ async fn serve_static_under(
         Err(err) => return err.into_response(),
     };
     match resolve_static_file(root, &rel_path) {
-        Ok(resolved) => stream_file_response(&resolved, method, no_store).await,
+        Ok(resolved) => {
+            stream_file_response(&resolved, method, no_store, if_modified_since(headers)).await
+        }
         Err(err) => core_file_error_response(&err),
     }
 }
@@ -432,6 +446,7 @@ async fn serve_plugin_scope_file(
     scope: PluginFileScope,
     raw_rel: &str,
     method: Method,
+    headers: &HeaderMap,
     no_store: bool,
 ) -> Response {
     let plugin_name = match decode_safe_segment(raw_name) {
@@ -446,7 +461,9 @@ async fn serve_plugin_scope_file(
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     };
     match manager.resolve_plugin_file(&plugin_name, scope, &rel_path) {
-        Ok(resolved) => stream_file_response(&resolved, method, no_store).await,
+        Ok(resolved) => {
+            stream_file_response(&resolved, method, no_store, if_modified_since(headers)).await
+        }
         Err(err) => core_file_error_response(&err),
     }
 }
@@ -517,31 +534,83 @@ fn io_error_status(err: &std::io::Error) -> (StatusCode, &'static str) {
     }
 }
 
-async fn stream_file_response(path: &Path, method: Method, no_store: bool) -> Response {
+fn if_modified_since(headers: &HeaderMap) -> Option<SystemTime> {
+    headers
+        .get(header::IF_MODIFIED_SINCE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| httpdate::parse_http_date(v).ok())
+}
+
+/// Whole seconds since the Unix epoch (HTTP dates have second precision).
+fn epoch_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+async fn stream_file_response(
+    path: &Path,
+    method: Method,
+    no_store: bool,
+    if_modified_since: Option<SystemTime>,
+) -> Response {
     let content_type = mime_for_path(path);
-    if method == Method::HEAD {
-        let Ok(meta) = tokio::fs::metadata(path).await else {
-            return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    let build_err = |_| (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response();
+    let file = if method == Method::HEAD {
+        None
+    } else {
+        match tokio::fs::File::open(path).await {
+            Ok(f) => Some(f),
+            Err(err) => return io_error_status(&err).into_response(),
+        }
+    };
+    let meta = match &file {
+        Some(f) => f.metadata().await,
+        None => tokio::fs::metadata(path).await,
+    };
+    let Ok(meta) = meta else {
+        return if file.is_some() {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response()
+        } else {
+            (StatusCode::NOT_FOUND, "Not Found").into_response()
         };
-        return build_file_headers(
-            Response::builder(),
-            content_type,
-            Some(meta.len()),
-            no_store,
-        )
-        .body(Body::empty())
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response());
+    };
+    let modified = meta.modified().ok();
+
+    // RFC 7232 section 3.3: an `If-Modified-Since` later than the current time is ignored.
+    if !no_store
+        && let (Some(since), Some(mtime)) = (if_modified_since, modified)
+        && since <= SystemTime::now()
+        && epoch_secs(mtime) <= epoch_secs(since)
+    {
+        let builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+        return with_file_validators(builder, modified)
+            .body(Body::empty())
+            .unwrap_or_else(build_err);
     }
 
-    let file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(err) => return io_error_status(&err).into_response(),
+    let builder = build_file_headers(
+        Response::builder(),
+        content_type,
+        Some(meta.len()),
+        no_store,
+        modified,
+    );
+    let body = match file {
+        Some(f) => Body::from_stream(ReaderStream::new(f)),
+        None => Body::empty(),
     };
-    let len = file.metadata().await.ok().map(|m| m.len());
-    let stream = ReaderStream::new(file);
-    build_file_headers(Response::builder(), content_type, len, no_store)
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response())
+    builder.body(body).unwrap_or_else(build_err)
+}
+
+fn with_file_validators(
+    mut builder: axum::http::response::Builder,
+    modified: Option<SystemTime>,
+) -> axum::http::response::Builder {
+    builder = builder.header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    if let Some(mtime) = modified {
+        let secs = UNIX_EPOCH + Duration::from_secs(epoch_secs(mtime));
+        builder = builder.header(header::LAST_MODIFIED, httpdate::fmt_http_date(secs));
+    }
+    builder
 }
 
 fn build_file_headers(
@@ -549,6 +618,7 @@ fn build_file_headers(
     content_type: &'static str,
     content_length: Option<u64>,
     no_store: bool,
+    modified: Option<SystemTime>,
 ) -> axum::http::response::Builder {
     builder = builder
         .status(StatusCode::OK)
@@ -559,10 +629,10 @@ fn build_file_headers(
     if no_store {
         builder = builder.header(header::CACHE_CONTROL, "no-store");
     }
-    builder
+    with_file_validators(builder, modified)
 }
 
-fn mime_for_path(path: &Path) -> &'static str {
+pub(crate) fn mime_for_path(path: &Path) -> &'static str {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -570,7 +640,7 @@ fn mime_for_path(path: &Path) -> &'static str {
     match ext.as_deref() {
         Some("js" | "mjs") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
-        Some("json") => "application/json",
+        Some("json" | "map") => "application/json",
         Some("html") => "text/html; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("png") => "image/png",
@@ -578,6 +648,18 @@ fn mime_for_path(path: &Path) -> &'static str {
         Some("webp") => "image/webp",
         Some("woff2") => "font/woff2",
         Some("wasm") => "application/wasm",
+        Some("gif") => "image/gif",
+        Some("ico") => "image/x-icon",
+        Some("avif") => "image/avif",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("mp4") => "video/mp4",
+        Some("webm") => "video/webm",
         _ => "application/octet-stream",
     }
 }
@@ -703,6 +785,7 @@ async fn handle_http_call_plugin_method(state: &AppState, body: &[u8]) -> Respon
             .into_response(),
         Err(
             err @ (CoreError::PluginDisabled(_)
+            | CoreError::PluginBlocked { .. }
             | CoreError::Host(
                 HostError::PassivePlugin(_)
                 | HostError::PluginFailed(_)
@@ -733,10 +816,13 @@ async fn handle_ws_upgrade(
     if !authorized {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
     }
+    let Ok(scope) = parse_session_param(query.get("session").map(String::as_str)) else {
+        return (StatusCode::BAD_REQUEST, "Invalid session").into_response();
+    };
     let max_bytes = state.config().ws_max_message_bytes;
     ws.max_message_size(max_bytes)
         .max_frame_size(max_bytes)
-        .on_upgrade(move |socket| handle_ws_socket(state, socket))
+        .on_upgrade(move |socket| handle_ws_socket(state, socket, scope))
 }
 
 async fn recv_plugin_event(rx: &mut Option<broadcast::Receiver<PluginEvent>>) -> WsServerMessage {
@@ -803,7 +889,7 @@ async fn recv_loader_event(rx: &mut Option<broadcast::Receiver<LoaderEvent>>) ->
 
 /// Drives one WebSocket client: inbound frames, spawned RPC replies, plugin/loader events, and
 /// keepalive pings.
-async fn handle_ws_socket(state: AppState, mut socket: WebSocket) {
+async fn handle_ws_socket(state: AppState, mut socket: WebSocket, scope: SyncScope) {
     debug!("WebSocket client connected");
     let (outbox, mut outbound) = mpsc::channel::<WsServerMessage>(64);
     let mut plugin_events = state.subscribe_plugin_events();
@@ -817,7 +903,7 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket) {
     loop {
         tokio::select! {
             inbound = socket.recv() => match inbound {
-                Some(Ok(Message::Text(text))) => handle_ws_text(&state, &text, &outbox),
+                Some(Ok(Message::Text(text))) => handle_ws_text(&state, &scope, &text, &outbox),
                 Some(Ok(Message::Pong(_))) => awaiting_pong = false,
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                 Some(Ok(Message::Binary(_) | Message::Ping(_))) => {}
@@ -855,19 +941,24 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket) {
     debug!("WebSocket client disconnected");
 }
 
-fn handle_ws_text(state: &AppState, text: &str, outbox: &mpsc::Sender<WsServerMessage>) {
+fn handle_ws_text(
+    state: &AppState,
+    scope: &SyncScope,
+    text: &str,
+    outbox: &mpsc::Sender<WsServerMessage>,
+) {
     match WsClientMessage::from_json_str(text) {
         Ok(WsClientMessage::Call(call)) => {
-            spawn_ws_call(state.clone(), call, outbox.clone());
+            spawn_ws_call(state.clone(), scope.clone(), call, outbox.clone());
         }
         Ok(WsClientMessage::ReceivedResponse { id }) => {
             debug!(call_id = id, "client acknowledged response");
-            state.ws_sync_cache().evict_id(id);
+            state.ws_sync_cache().evict_id(scope, id);
         }
         Ok(WsClientMessage::FullSync { messages }) => {
             debug!(count = messages.len(), "replaying FULL_SYNC calls");
             for call in messages {
-                spawn_ws_call(state.clone(), call, outbox.clone());
+                spawn_ws_call(state.clone(), scope.clone(), call, outbox.clone());
             }
         }
         Err(err) => {
@@ -876,11 +967,16 @@ fn handle_ws_text(state: &AppState, text: &str, outbox: &mpsc::Sender<WsServerMe
     }
 }
 
-fn spawn_ws_call(state: AppState, call: WsCallPayload, outbox: mpsc::Sender<WsServerMessage>) {
+fn spawn_ws_call(
+    state: AppState,
+    scope: SyncScope,
+    call: WsCallPayload,
+    outbox: mpsc::Sender<WsServerMessage>,
+) {
     let cache = Arc::clone(state.ws_sync_cache());
     tokio::spawn(async move {
         let reply = cache
-            .execute(call, |c| dispatch_call(state.clone(), c))
+            .execute(scope, call, |c| dispatch_call(state.clone(), c))
             .await;
         let _ = outbox.send(reply).await;
     });
@@ -930,6 +1026,7 @@ fn serialize_plugin_summaries(plugins: &[PluginSummary]) -> Value {
                     "disabled": p.disabled,
                     "passive": p.passive,
                     "state": format!("{:?}", p.state),
+                    "failure_reason": p.failure_reason,
                 })
             })
             .collect(),
@@ -1421,7 +1518,7 @@ fn parse_set_setting_args(args: &[Value]) -> Result<(String, Value), String> {
     Ok((key, val))
 }
 
-fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
+pub(crate) fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
     match err {
         CoreError::Host(HostError::WorkerStopped | HostError::StartupTimeout) => {
             WsServerMessage::Discard { id }
@@ -1455,6 +1552,12 @@ fn core_error_to_ws(id: u64, err: CoreError) -> WsServerMessage {
             format!("plugin `{name}` is disabled"),
             None,
         ),
+        CoreError::PluginBlocked { .. } => {
+            ws_error(id, "PluginBlockedError", err.to_string(), None)
+        }
+        CoreError::DuplicatePluginName { .. } => {
+            ws_error(id, "DuplicatePluginNameError", err.to_string(), None)
+        }
         CoreError::Host(HostError::InvalidMethodName(method)) => ws_error(
             id,
             "PermissionError",

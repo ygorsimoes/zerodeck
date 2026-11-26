@@ -40,9 +40,9 @@ setup:
 check:
     {{ dev }} just _check
 
-# Everything CI runs except fuzzing: check + Python matrix + infra lint + runtime smoke test
+# Everything CI runs except fuzzing: check + Python matrix + infra lint + smoke + root-only tests
 [group('dev')]
-ci: check py-matrix lint-infra smoke
+ci: check py-matrix lint-infra smoke test-privileged
 
 # Format Rust and frontend code
 [group('dev')]
@@ -72,7 +72,7 @@ shell:
 # Remove dev containers and their cached volumes (target, cargo, node_modules)
 [group('dev')]
 clean:
-    docker compose --profile dev --profile fuzz down --volumes --remove-orphans
+    docker compose --profile dev --profile fuzz --profile privileged down --volumes --remove-orphans
 
 # ─── Focused checks (one per CI job) ─────────────────────────────────────────────────────────────
 
@@ -118,6 +118,12 @@ lint-infra: _toolchain-sync
     docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/zizmorcore/zizmor:1.33.1 --offline --no-progress .
     docker run --rm -i -v "$PWD/.hadolint.yaml:/hadolint.yaml:ro" hadolint/hadolint:v2.15.1 \
         hadolint --config /hadolint.yaml - < Dockerfile
+
+# Root-only tests (`privileged_*`: privilege drop, parent-death signal) in the root container
+# (always Docker, even with ZERODECK_NATIVE=1; inside a container it runs directly and needs root)
+[group('checks')]
+test-privileged:
+    {{ if env("ZERODECK_IN_CONTAINER", "") != "" { "" } else { "docker compose run --rm $( [ -t 0 ] && [ -t 1 ] || echo -T ) privileged-test" } }} just _test-privileged
 
 # Fuzz one target, e.g. `just fuzz zip_extract 120` (targets: fuzz/fuzz_targets/)
 [group('checks')]
@@ -214,6 +220,16 @@ _clippy:
 [private]
 _cargo-test:
     cargo test --workspace --locked
+
+[private]
+_test-privileged:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "error: privileged tests require root; run \`just test-privileged\` from the host" >&2
+        exit 1
+    fi
+    cargo test --workspace --locked -- --ignored privileged_
 
 [private]
 _py-test:

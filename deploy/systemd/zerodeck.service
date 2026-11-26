@@ -11,6 +11,8 @@ Type=simple
 User=root
 Restart=always
 RestartSec=2
+# Only the daemon gets the stop signal: it unloads workers itself (plugin `_unload`) within
+# TimeoutStopSec, and a daemon that dies anyway takes its workers down via their parent-death signal.
 KillMode=process
 TimeoutStopSec=15
 ExecStart=/usr/local/bin/zerodeckd

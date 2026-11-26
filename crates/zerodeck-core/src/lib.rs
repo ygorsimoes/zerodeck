@@ -7,6 +7,7 @@ pub mod filepicker;
 pub mod http_policy;
 pub mod installer;
 mod manager;
+mod preflight;
 mod settings;
 pub mod watcher;
 
@@ -203,6 +204,25 @@ mod tests {
         let mut expected = names.to_vec();
         expected.sort_unstable();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn discover_plugins_skips_duplicate_names_keeping_first_directory() {
+        let dir = TestDir::new("discover-duplicate-name");
+        for directory in ["b-orig", "a-copy"] {
+            let plugin = dir.0.join(directory);
+            fs::create_dir_all(&plugin).expect("create plugin dir");
+            fs::write(
+                plugin.join("plugin.json"),
+                r#"{"name": "Same", "author": "Alice"}"#,
+            )
+            .expect("write plugin.json");
+        }
+
+        let plugins = discover_plugins(&dir.0).expect("discover plugins");
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].manifest.name, "Same");
+        assert_eq!(plugins[0].directory, "a-copy");
     }
 
     #[test]
@@ -2375,6 +2395,251 @@ class Plugin:
                 zerodeck_platform::PlatformError::PathEscape { .. }
             ))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsafe_root_plugins_opt_in_bypasses_tree_check() {
+        if running_as_root() {
+            eprintln!("skipping: the temp tree is root-owned when tests run as root");
+            return;
+        }
+        let dir = TestDir::new("mgr-unsafe-root-opt-in");
+        let paths = manager_test_paths(&dir.0);
+        write_watcher_plugin(
+            &paths.plugins_dir().join("rooted"),
+            "Rooted",
+            &["root"],
+            "v1",
+        );
+        // loader.json must be ignored; only the daemon setter may opt in.
+        fs::create_dir_all(paths.settings_dir()).expect("settings dir");
+        fs::write(
+            paths.settings_dir().join("loader.json"),
+            r#"{"developer":{"allow_unsafe_root_plugins":true}}"#,
+        )
+        .expect("write loader.json");
+
+        let mut manager = crate::PluginManager::open(
+            paths.clone(),
+            zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_module_path()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            },
+            "0.1.0",
+        )
+        .expect("open manager");
+        // The temp tree is owned by the test user, so the tree check fails as it would for a
+        // deck-owned plugin under a root daemon.
+        manager.assume_root_daemon_for_tests();
+        manager.start_all().await.expect("start_all");
+
+        let rooted = manager
+            .list_plugins()
+            .into_iter()
+            .find(|p| p.name == "Rooted")
+            .expect("plugin");
+        assert_eq!(rooted.state, zerodeck_plugin_host::PluginState::Failed);
+        let reason = rooted.failure_reason.expect("failure reason");
+        assert!(
+            reason.contains(&paths.plugins_dir().display().to_string()),
+            "{reason}"
+        );
+        assert!(reason.contains("not root"), "{reason}");
+
+        manager.set_allow_unsafe_root_plugins(true);
+        manager
+            .reload_plugin("Rooted")
+            .await
+            .expect("opt-in skips the tree check");
+        assert_eq!(
+            call_plugin_ok(&manager, "Rooted", "version_tag").await,
+            serde_json::json!("v1")
+        );
+        let rooted = manager
+            .list_plugins()
+            .into_iter()
+            .find(|p| p.name == "Rooted")
+            .expect("plugin");
+        assert_eq!(rooted.failure_reason, None);
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        zerodeck_platform::current_process_identity().euid == 0
+    }
+
+    /// Writes a backend plugin and a fake `python3` that leaves `marker` behind if it ever runs.
+    #[cfg(unix)]
+    fn write_spawn_marker_plugin(
+        paths: &zerodeck_platform::PlatformPaths,
+        root: &std::path::Path,
+        marker: &std::path::Path,
+    ) -> zerodeck_plugin_host::SupervisorConfig {
+        use std::os::unix::fs::PermissionsExt;
+
+        let plugin = paths.plugins_dir().join("blocked");
+        fs::create_dir_all(&plugin).expect("create plugin dir");
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"name":"Blocked","author":"Tester","api_version":1}"#,
+        )
+        .expect("write plugin.json");
+        fs::write(plugin.join("main.py"), "class Plugin:\n    pass\n").expect("write main.py");
+
+        let fake_python = root.join("fake-python3");
+        fs::write(
+            &fake_python,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("write fake python3");
+        fs::set_permissions(&fake_python, fs::Permissions::from_mode(0o755))
+            .expect("chmod fake python3");
+        zerodeck_plugin_host::SupervisorConfig {
+            python_host: zerodeck_plugin_host::PythonHostConfig {
+                python_bin: fake_python.display().to_string(),
+                host_module_path: None,
+            },
+            ..zerodeck_plugin_host::SupervisorConfig::default()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn python_host_missing_marks_plugins_failed_with_reason() {
+        let dir = TestDir::new("mgr-py-missing");
+        let paths = manager_test_paths(&dir.0);
+        let marker = dir.0.join("spawned");
+        let config = write_spawn_marker_plugin(&paths, &dir.0, &marker);
+
+        let manager = crate::PluginManager::open(paths, config, "0.1.0").expect("open manager");
+        manager.set_python_host_missing(Some("zerodeck_py_host is not importable".to_owned()));
+        manager
+            .start_all()
+            .await
+            .expect("start_all continues past blocked plugins");
+
+        let list = manager.list_plugins();
+        let blocked = list.iter().find(|p| p.name == "Blocked").expect("plugin");
+        assert_eq!(blocked.state, zerodeck_plugin_host::PluginState::Failed);
+        assert_eq!(
+            blocked.failure_reason.as_deref(),
+            Some("zerodeck_py_host is not importable")
+        );
+
+        let err = manager
+            .call_plugin_method("Blocked", "ping", serde_json::json!([]), false)
+            .await
+            .expect_err("a blocked plugin cannot be called");
+        assert!(
+            matches!(err, CoreError::PluginBlocked { ref name, .. } if name == "Blocked"),
+            "{err}"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "no worker may be spawned");
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_rejects_rename_onto_another_directorys_name() {
+        let dir = TestDir::new("mgr-reload-dup-name");
+        let paths = manager_test_paths(&dir.0);
+        write_watcher_plugin(&paths.plugins_dir().join("alpha"), "Alpha", &[], "alpha");
+        let beta = paths.plugins_dir().join("beta");
+        write_watcher_plugin(&beta, "Beta", &[], "beta");
+
+        let manager = test_manager_open(&paths);
+        manager.start_all().await.expect("start_all");
+
+        // Beta's manifest now claims Alpha's name, which `alpha/` already owns.
+        fs::write(
+            beta.join("plugin.json"),
+            r#"{"name":"Alpha","author":"Alice","flags":[],"api_version":1}"#,
+        )
+        .expect("rename beta's manifest");
+        let err = manager
+            .reload_plugin("Beta")
+            .await
+            .expect_err("a rename onto another directory's name must be refused");
+        assert!(
+            matches!(err, CoreError::DuplicatePluginName { ref name, ref directory }
+                if name == "Alpha" && directory == "alpha"),
+            "{err}"
+        );
+
+        let mut names: Vec<_> = manager.list_plugins().into_iter().map(|p| p.name).collect();
+        names.sort();
+        assert_eq!(names, ["Alpha", "Beta"]);
+        assert_eq!(
+            call_plugin_ok(&manager, "Alpha", "version_tag").await,
+            serde_json::json!("alpha")
+        );
+        assert_eq!(
+            call_plugin_ok(&manager, "Beta", "version_tag").await,
+            serde_json::json!("beta")
+        );
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn debug_reload_runs_preflight() {
+        let dir = TestDir::new("mgr-reload-preflight");
+        let paths = manager_test_paths(&dir.0);
+        let plugin = paths.plugins_dir().join("hot");
+        write_watcher_plugin(&plugin, "Hot", &["debug"], "v1");
+
+        let manager = test_manager_open(&paths);
+        manager.start_all().await.expect("start_all");
+        assert_eq!(
+            call_plugin_ok(&manager, "Hot", "version_tag").await,
+            serde_json::json!("v1")
+        );
+
+        let mut events = manager.subscribe_loader_events();
+        manager.set_python_host_missing(Some("zerodeck_py_host is not importable".to_owned()));
+        let err = manager
+            .reload_plugin("Hot")
+            .await
+            .expect_err("reload must run the spawn preflight");
+        assert!(
+            matches!(err, CoreError::PluginBlocked { ref name, ref reason }
+                if name == "Hot" && reason == "zerodeck_py_host is not importable"),
+            "{err}"
+        );
+        wait_for_loader_event(&mut events, std::time::Duration::from_secs(5), |ev| {
+            matches!(ev, crate::LoaderEvent::PluginsChanged(list)
+                if list.iter().any(|p| p.name == "Hot" && p.failure_reason.is_some()))
+        })
+        .await;
+
+        let hot = manager
+            .list_plugins()
+            .into_iter()
+            .find(|p| p.name == "Hot")
+            .expect("plugin");
+        assert_eq!(hot.state, zerodeck_plugin_host::PluginState::Failed);
+
+        // Clearing the condition lets the next spawn through and clears the recorded reason.
+        manager.set_python_host_missing(None);
+        manager
+            .reload_plugin("Hot")
+            .await
+            .expect("reload after fix");
+        let hot = manager
+            .list_plugins()
+            .into_iter()
+            .find(|p| p.name == "Hot")
+            .expect("plugin");
+        assert_eq!(hot.failure_reason, None);
+        assert_ne!(hot.state, zerodeck_plugin_host::PluginState::Failed);
+        manager.shutdown_all().await;
     }
 
     #[cfg(unix)]

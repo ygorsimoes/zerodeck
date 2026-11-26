@@ -290,6 +290,195 @@ async fn daemon_runs_python_plugin_over_ws_and_shuts_down_worker_on_sigterm() {
     );
 }
 
+/// Kills a worker that outlived its daemon, so a failing test does not leak it.
+#[cfg(target_os = "linux")]
+struct Worker(u32);
+
+#[cfg(target_os = "linux")]
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &self.0.to_string()])
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// `kill -0` also succeeds on a zombie that is still waiting to be reaped, which already exited.
+#[cfg(target_os = "linux")]
+fn process_running(pid: u32) -> bool {
+    let signalable = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .expect("run kill -0")
+        .success();
+    signalable
+        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_worker_pid(pid_file: &std::path::Path) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "worker never wrote its pid file");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A plugin whose `_main` records the worker pid, then blocks the worker's event loop for good.
+/// The worker then never sees EOF on its IPC socket when the daemon dies, so only the parent-death
+/// signal (default SIGTERM action) can end it: exactly what the tests below observe.
+#[cfg(target_os = "linux")]
+fn write_blocking_plugin(home: &TempHome, pid_file: &std::path::Path) {
+    let plug_dir = home.0.join("plugins").join("blocking_plug");
+    std::fs::create_dir_all(&plug_dir).expect("create plugin dir");
+    std::fs::write(
+        plug_dir.join("plugin.json"),
+        r#"{"name":"BlockingPlug","author":"Tester","api_version":1}"#,
+    )
+    .expect("write plugin.json");
+    std::fs::write(
+        plug_dir.join("main.py"),
+        format!(
+            r#"import os, signal, time
+from pathlib import Path
+
+class Plugin:
+    async def _main(self):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        Path({pid:?}).write_text(str(os.getpid()), encoding="utf-8")
+        time.sleep(3600)
+"#,
+            pid = pid_file.display().to_string(),
+        ),
+    )
+    .expect("write main.py");
+}
+
+/// Starts the daemon with the blocking plugin, SIGKILLs the daemon (no graceful shutdown) and
+/// asserts the worker follows it within 5 s. `run_dir` must be writable by the worker's user.
+#[cfg(target_os = "linux")]
+fn assert_worker_exits_when_daemon_is_killed(
+    home: &TempHome,
+    run_dir: &std::path::Path,
+    configure: impl FnOnce(&mut Command),
+    inspect_worker: impl FnOnce(u32),
+) {
+    let pid_file = run_dir.join("worker.pid");
+    write_blocking_plugin(home, &pid_file);
+
+    let py_host = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../hosts/python")
+        .canonicalize()
+        .expect("resolve hosts/python");
+    let port = free_port("127.0.0.1");
+    let mut cmd = daemon_command(home, "127.0.0.1", port);
+    cmd.env("PYTHONPATH", py_host);
+    configure(&mut cmd);
+    let mut daemon = Daemon(cmd.spawn().expect("spawn zerodeckd"));
+
+    wait_until_healthy(home, "127.0.0.1", port);
+    let worker = Worker(wait_for_worker_pid(&pid_file));
+    assert!(process_running(worker.0), "worker is not running");
+    inspect_worker(worker.0);
+
+    let status = Command::new("kill")
+        .args(["-KILL", &daemon.0.id().to_string()])
+        .status()
+        .expect("send SIGKILL");
+    assert!(status.success());
+    wait_for_exit(&mut daemon, Duration::from_secs(5));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_running(worker.0) {
+        assert!(
+            Instant::now() < deadline,
+            "worker {} still alive 5 s after the daemon was killed",
+            worker.0
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_exits_when_daemon_is_killed() {
+    let home = TempHome::new("pdeathsig");
+    assert_worker_exits_when_daemon_is_killed(&home, &home.0, |_| {}, |_| {});
+}
+
+#[cfg(target_os = "linux")]
+fn id_of(flag: &str, user: &str) -> u32 {
+    let out = Command::new("id")
+        .args([flag, user])
+        .output()
+        .expect("run id");
+    assert!(out.status.success(), "unknown host user {user}");
+    String::from_utf8(out.stdout)
+        .expect("utf-8 id output")
+        .trim()
+        .parse()
+        .expect("numeric id")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root; run with just test-privileged"]
+fn privileged_worker_exits_when_root_daemon_is_killed() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    let host_user = std::env::var("ZERODECK_TEST_HOST_USER")
+        .expect("ZERODECK_TEST_HOST_USER names the unprivileged host user");
+
+    let home = TempHome::new("pdeathsig-root");
+    // The worker drops to the host user, so it writes its pid where that user owns the directory.
+    let run_dir = home.0.join("run");
+    std::fs::create_dir_all(&run_dir).expect("create run dir");
+    std::os::unix::fs::chown(
+        &run_dir,
+        Some(id_of("-u", &host_user)),
+        Some(id_of("-g", &host_user)),
+    )
+    .expect("chown run dir to the host user");
+
+    assert_worker_exits_when_daemon_is_killed(
+        &home,
+        &run_dir,
+        |cmd| {
+            cmd.env("DECKY_USER", &host_user);
+        },
+        |pid| {
+            let status =
+                std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read worker status");
+            let uids = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .expect("Uid: line in /proc/<pid>/status");
+            assert!(
+                uids.split_whitespace().all(|uid| uid != "0"),
+                "worker kept root ids after the drop: Uid:{uids}"
+            );
+            let gids = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Gid:"))
+                .expect("Gid: line in /proc/<pid>/status");
+            assert!(
+                gids.split_whitespace().all(|gid| gid != "0"),
+                "worker kept root group ids after the drop: Gid:{gids}"
+            );
+        },
+    );
+}
+
 fn build_sideload_zip(uninstall_marker: &std::path::Path) -> Vec<u8> {
     use std::io::{Cursor, Write};
     use zip::ZipWriter;
@@ -564,4 +753,194 @@ async fn daemon_serves_frontend_sideloads_plugin_assets_and_uninstalls() {
         wait_for_exit(&mut daemon, Duration::from_secs(10)).success(),
         "daemon must exit cleanly"
     );
+}
+
+#[test]
+fn refuses_non_loopback_bind_without_opt_in() {
+    let home = TempHome::new("non-loopback");
+    let port = free_port("127.0.0.1");
+    let mut cmd = daemon_command(&home, "127.0.0.1", port);
+    cmd.args(["--host", "0.0.0.0", "--port", &port.to_string()])
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn zerodeckd");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut daemon = Daemon(child);
+
+    let status = wait_for_exit(&mut daemon, Duration::from_secs(5));
+    assert!(!status.success(), "daemon must refuse, got {status}");
+
+    let mut output = String::new();
+    std::io::Read::read_to_string(&mut { stderr }, &mut output).expect("read stderr");
+    assert!(output.contains("--allow-non-loopback"), "stderr: {output}");
+}
+
+#[test]
+fn check_config_accepts_env_opt_in_for_non_loopback_host() {
+    let home = TempHome::new("opt-in-env");
+    let status = daemon_command(&home, "0.0.0.0", 1)
+        .env("ZERODECK_ALLOW_NON_LOOPBACK", "1")
+        .arg("--check-config")
+        .status()
+        .expect("run --check-config");
+    assert!(
+        status.success(),
+        "ZERODECK_ALLOW_NON_LOOPBACK=1 must be accepted"
+    );
+
+    let refused = daemon_command(&home, "0.0.0.0", 1)
+        .arg("--check-config")
+        .status()
+        .expect("run --check-config");
+    assert!(
+        !refused.success(),
+        "--check-config must report the bind policy"
+    );
+}
+
+#[test]
+fn check_config_refuses_non_loopback_host_when_env_opt_in_is_falsy() {
+    let home = TempHome::new("opt-in-env-falsy");
+    let output = daemon_command(&home, "127.0.0.1", 1)
+        .env("ZERODECK_ALLOW_NON_LOOPBACK", "0")
+        .args(["--check-config", "--host", "0.0.0.0"])
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run --check-config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "ZERODECK_ALLOW_NON_LOOPBACK=0 must not opt in"
+    );
+    assert!(stderr.contains("refusing to bind"), "stderr: {stderr}");
+}
+
+/// Copies `zerodeck_py_host` (without `__pycache__`) under `home`: a root worker importing it from
+/// the bind-mounted checkout would leave root-owned bytecode there.
+#[cfg(target_os = "linux")]
+fn copy_python_host(home: &TempHome) -> PathBuf {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hosts/python/zerodeck_py_host");
+    let root = home.0.join("python");
+    let dest = root.join("zerodeck_py_host");
+    std::fs::create_dir_all(&dest).expect("create python host copy");
+    for entry in std::fs::read_dir(&src).expect("read hosts/python/zerodeck_py_host") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().is_some_and(|ext| ext == "py") {
+            std::fs::copy(&path, dest.join(path.file_name().expect("file name")))
+                .expect("copy python host module");
+        }
+    }
+    root
+}
+
+/// Reads the `loader/get_plugins` entry for `name` over a fresh WebSocket session.
+#[cfg(target_os = "linux")]
+async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
+    let token = fetch_auth_token(&reqwest::Client::new(), port).await;
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws?auth={token}"))
+            .await
+            .expect("connect ws");
+    let reply = ws_call_reply(
+        &mut ws,
+        1,
+        "loader/get_plugins",
+        serde_json::json!([]),
+        Duration::from_secs(5),
+    )
+    .await;
+    reply["result"]
+        .as_array()
+        .expect("get_plugins returns an array")
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("plugin {name} missing from {reply}"))
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root; run with just test-privileged"]
+async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    let host_user = std::env::var("ZERODECK_TEST_HOST_USER")
+        .expect("ZERODECK_TEST_HOST_USER names the unprivileged host user");
+
+    let home = TempHome::new("root-plugin-owner");
+    let plug_dir = home.0.join("plugins").join("root_plug");
+    std::fs::create_dir_all(&plug_dir).expect("create plugin dir");
+    std::fs::write(
+        plug_dir.join("plugin.json"),
+        r#"{"name":"RootPlug","author":"Tester","flags":["root"],"api_version":1}"#,
+    )
+    .expect("write plugin.json");
+    std::fs::write(
+        plug_dir.join("main.py"),
+        "class Plugin:\n    async def _main(self):\n        pass\n",
+    )
+    .expect("write main.py");
+    let chown = Command::new("chown")
+        .args(["-R", &host_user])
+        .arg(&plug_dir)
+        .status()
+        .expect("run chown");
+    assert!(chown.success(), "chown the plugin to the host user");
+
+    let py_host = copy_python_host(&home);
+    let start = |port: u16, opt_in: bool| {
+        let mut cmd = daemon_command(&home, "127.0.0.1", port);
+        cmd.env("PYTHONPATH", &py_host)
+            .env("DECKY_USER", &host_user);
+        if opt_in {
+            cmd.env("ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS", "1");
+        }
+        Daemon(cmd.spawn().expect("spawn zerodeckd"))
+    };
+    let assert_blocked = |entry: &serde_json::Value| {
+        assert_eq!(entry["state"], "Failed", "{entry}");
+        let reason = entry["failure_reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains(&plug_dir.display().to_string()) && reason.contains("not root"),
+            "failure_reason must name the plugin path: {entry}"
+        );
+    };
+
+    let port = free_port("127.0.0.1");
+    let mut daemon = start(port, false);
+    wait_until_healthy(&home, "127.0.0.1", port);
+    assert_blocked(&get_plugin_entry(port, "RootPlug").await);
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+
+    // settings/ belongs to the host user, so loader.json must not be able to grant root.
+    std::fs::create_dir_all(home.0.join("settings")).expect("create settings dir");
+    std::fs::write(
+        home.0.join("settings").join("loader.json"),
+        r#"{"developer":{"allow_unsafe_root_plugins":true}}"#,
+    )
+    .expect("write loader.json");
+    let port = free_port("127.0.0.1");
+    let mut daemon = start(port, false);
+    wait_until_healthy(&home, "127.0.0.1", port);
+    assert_blocked(&get_plugin_entry(port, "RootPlug").await);
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+
+    let port = free_port("127.0.0.1");
+    let mut daemon = start(port, true);
+    wait_until_healthy(&home, "127.0.0.1", port);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let entry = get_plugin_entry(port, "RootPlug").await;
+        if entry["state"] == "Running" {
+            assert_eq!(entry["failure_reason"], serde_json::Value::Null, "{entry}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "opted-in root plugin never reached Running: {entry}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
 }

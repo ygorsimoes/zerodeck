@@ -97,6 +97,7 @@ docker compose up -d --build            # or: just up
 curl http://127.0.0.1:1337/healthz      # {"status":"ok"}
 ```
 
+- **Network exposure:** the container binds `0.0.0.0` internally (`ZERODECK_ALLOW_NON_LOOPBACK=1`), so always publish the port on loopback only (`-p 127.0.0.1:1337:1337`, as `compose.yaml` does); publishing it on all interfaces would expose the auth token to your network.
 - **Update:** `git pull && docker compose up -d --build`
 - **Stop:** `docker compose down` (or `just down`)
 - **Logs:** `docker compose logs -f zerodeckd` (or `just logs`)
@@ -166,6 +167,8 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | Flag | Environment variable | Default | Description |
 |---|---|---|---|
 | `--host` | `SERVER_HOST` | `127.0.0.1` | Address to bind the HTTP/WebSocket server to |
+| `--allow-non-loopback` | `ZERODECK_ALLOW_NON_LOOPBACK` | off | Allow binding to a non-loopback address (exposes the auth token to that network) |
+| `--allow-unsafe-root-plugins` | `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS` | off | Start `"root"` plugins whose files a non-root user can modify (development only; set it in a systemd drop-in, which only root can) |
 | `--port` | `SERVER_PORT` | `1337` | Port to listen on |
 | `--check-config` | | | Validate paths, settings and plugin manifests, then exit |
 | `--healthcheck` | | | Probe `/healthz` on a running daemon and exit `0` or `1` |
@@ -175,6 +178,21 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 | | `ZERODECK_FRONTEND_DIR` | auto-detected | Directory containing the `@zerodeck/frontend` bundle |
 | | `PYTHONPATH` | auto-detected | Override search path containing `zerodeck_py_host` |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
+
+Without `ZERODECK_FRONTEND_DIR` / `PYTHONPATH`, the frontend and `zerodeck_py_host` are searched
+in `/opt/zerodeck/{frontend,python}` and next to the binary (`<exe>/../{frontend,python}`). Debug builds also try the working directory
+and the source tree; release builds never do, because those can be writable by a non-root user. If
+`zerodeck_py_host` cannot be imported, the daemon still starts and serves the UI, logs one error,
+and every backend plugin shows as `Failed` with the reason in `failure_reason`.
+
+Plugins flagged `"root"` keep root privileges, so a root daemon only starts them from a tree that
+only root can modify: `plugins/` and every file and directory of the plugin must be owned by root,
+must not be group- or world-writable, and must not be symlinks. Store installs already produce such
+trees. Otherwise the plugin shows as `Failed` with the offending path in `failure_reason`. For local
+development you can skip the check with `--allow-unsafe-root-plugins` /
+`ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`, set in the daemon's own command line or a systemd drop-in.
+It is deliberately not a `loader.json` setting: `settings/` belongs to the unprivileged user, who
+must not be able to grant themselves root.
 
 </details>
 
@@ -256,7 +274,8 @@ interesting work is still ahead. Rust, Python and TypeScript are all welcome.
 ```bash
 just setup   # once: builds the dev image and installs frontend dependencies
 just check   # formatting, lints, tests and licenses
-just ci      # optional: everything CI runs (adds the Python matrix, infra lint, smoke test)
+just ci      # optional: everything CI runs (adds the Python matrix, infra lint, smoke test,
+             # root-only privileged tests)
 ```
 
 Found a vulnerability? Report it privately as described in [`SECURITY.md`](SECURITY.md). Everyone

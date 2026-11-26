@@ -260,6 +260,182 @@ mod tests {
         (status, headers, String::from_utf8_lossy(&body).into_owned())
     }
 
+    async fn call_get_with(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in extra {
+            builder = builder.header(*k, *v);
+        }
+        let res = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("call router");
+        let status = res.status();
+        let headers = res.headers().clone();
+        let body = to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[test]
+    fn mime_for_path_covers_common_asset_types() {
+        for (ext, mime) in [
+            ("gif", "image/gif"),
+            ("ico", "image/x-icon"),
+            ("avif", "image/avif"),
+            ("ttf", "font/ttf"),
+            ("otf", "font/otf"),
+            ("woff", "font/woff"),
+            ("map", "application/json"),
+            ("txt", "text/plain; charset=utf-8"),
+            ("mp3", "audio/mpeg"),
+            ("ogg", "audio/ogg"),
+            ("wav", "audio/wav"),
+            ("mp4", "video/mp4"),
+            ("webm", "video/webm"),
+        ] {
+            let path = std::path::PathBuf::from(format!("file.{ext}"));
+            assert_eq!(crate::router::mime_for_path(&path), mime, "{ext}");
+        }
+    }
+
+    #[test]
+    fn duplicate_plugin_name_maps_to_its_own_ws_error() {
+        let err = zerodeck_core::CoreError::DuplicatePluginName {
+            name: "Alpha".to_owned(),
+            directory: "alpha".to_owned(),
+        };
+        match crate::router::core_error_to_ws(7, err) {
+            zerodeck_protocol::WsServerMessage::Error { id, error } => {
+                assert_eq!(id, 7);
+                assert_eq!(error.name, "DuplicatePluginNameError");
+                assert!(error.error.contains("`alpha`"), "{}", error.error);
+            }
+            other => panic!("expected an error reply, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_responses_send_nosniff_and_last_modified() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-hdr-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        for method in ["GET", "HEAD"] {
+            let (st, hdrs, _) = call_get(&app, method, "/plugins/Demo/assets/a.png").await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(hdrs.get("x-content-type-options").unwrap(), "nosniff");
+            assert!(hdrs.get("last-modified").is_some(), "{method}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_if_modified_since_returns_304() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-ims-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        let uri = "/plugins/Demo/assets/a.png";
+        let (_, hdrs, _) = call_get(&app, "GET", uri).await;
+        let lm = hdrs
+            .get("last-modified")
+            .expect("last-modified")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let (st, hdrs, body) = call_get_with(&app, "GET", uri, &[("if-modified-since", &lm)]).await;
+        assert_eq!(st, StatusCode::NOT_MODIFIED);
+        assert_eq!(body, "");
+        assert_eq!(hdrs.get("x-content-type-options").unwrap(), "nosniff");
+        let (st, _, body) = call_get_with(&app, "HEAD", uri, &[("if-modified-since", &lm)]).await;
+        assert_eq!(st, StatusCode::NOT_MODIFIED, "HEAD");
+        assert_eq!(body, "");
+        // An older validator yields the full body.
+        let (st, _, body) = call_get_with(
+            &app,
+            "GET",
+            uri,
+            &[("if-modified-since", "Thu, 01 Jan 1970 00:00:00 GMT")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, "png");
+        // Garbage validators are ignored.
+        let (st, _, _) =
+            call_get_with(&app, "GET", uri, &[("if-modified-since", "nonsense")]).await;
+        assert_eq!(st, StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn static_if_modified_since_in_the_future_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-ims-future-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        // RFC 7232 section 3.3: a date later than the server's current time is invalid.
+        let future = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_hours(24),
+        );
+        for method in ["GET", "HEAD"] {
+            let (st, _, _) = call_get_with(
+                &app,
+                method,
+                "/plugins/Demo/assets/a.png",
+                &[("if-modified-since", &future)],
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{method}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frontend_bundle_never_returns_304() {
+        let dir = std::env::temp_dir().join(format!("zd-srv-bundle-{}", uuid::Uuid::new_v4()));
+        let (frontend, mgr) = seed_static_and_plugin_routes(&dir);
+        let cfg = ServerConfig {
+            frontend_dir: Some(frontend),
+            ..ServerConfig::default()
+        };
+        let app = build_router(AppState::with_manager(cfg, mgr));
+        for uri in ["/plugins/Demo/frontend_bundle", "/plugins/load_main/Demo"] {
+            let (_, hdrs, _) = call_get(&app, "GET", uri).await;
+            let lm = hdrs
+                .get("last-modified")
+                .expect("last-modified")
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let (st, hdrs, body) =
+                call_get_with(&app, "GET", uri, &[("if-modified-since", &lm)]).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+            assert_eq!(hdrs.get("cache-control").unwrap(), "no-store");
+            assert_eq!(body, "export default 1;");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn test_paths_with_home(root: &std::path::Path) -> zerodeck_platform::PlatformPaths {
         let root_str = root.display().to_string();
         let home_str = root.join("home").display().to_string();
@@ -299,6 +475,7 @@ mod tests {
         .expect("plugin.json");
         std::fs::write(plug.join("dist/index.js"), "export default 1;").expect("dist/index.js");
         std::fs::write(plug.join("assets/icon.svg"), "<svg/>").expect("icon.svg");
+        std::fs::write(plug.join("assets/a.png"), "png").expect("a.png");
         std::fs::write(paths.data_dir().join("demo/cache.json"), r#"{"n":1}"#).expect("cache.json");
 
         let outside = dir.join("outside.txt");
@@ -1336,6 +1513,97 @@ class Plugin:
 
             manager.shutdown_all().await;
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_new_session_reexecutes_unacknowledged_call_from_previous_session() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-session-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let counter_file = dir.join("count.txt");
+            std::fs::write(&counter_file, "0").expect("seed counter");
+
+            let plug = paths.plugins_dir().join("counter");
+            std::fs::create_dir_all(&plug).expect("plug dir");
+            std::fs::write(
+                plug.join("plugin.json"),
+                r#"{"name":"Counter","author":"Tester","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            let py = format!(
+                "from pathlib import Path\nP = Path({:?})\nclass Plugin:\n    async def inc(self):\n        n = int(P.read_text()) + 1\n        P.write_text(str(n))\n        return n\n",
+                counter_file.display().to_string()
+            );
+            std::fs::write(plug.join("main.py"), py).expect("main.py");
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+            let (addr, token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+
+            let call_inc = json!({
+                "type": 0, "id": 1, "route": "loader/call_plugin_method",
+                "args": ["Counter", "inc"]
+            });
+            for (session, expected) in [("s1", 1), ("s2", 2)] {
+                let url = format!("ws://{addr}/ws?auth={token}&session={session}");
+                let (mut ws, _) = tokio_tungstenite::connect_async(url)
+                    .await
+                    .expect("ws connect");
+                ws.send(Message::Text(call_inc.to_string().into()))
+                    .await
+                    .expect("send call");
+                assert_eq!(
+                    next_text_frame(&mut ws).await,
+                    json!({"type": 1, "id": 1, "result": expected})
+                );
+                // Close without acknowledging the response.
+                drop(ws);
+            }
+            assert_eq!(std::fs::read_to_string(&counter_file).unwrap(), "2");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn ws_rejects_malformed_session_param() {
+            let (addr, token) = spawn_server(ServerConfig::default()).await;
+            let url = format!("ws://{addr}/ws?auth={token}&session=../x");
+            let err = tokio_tungstenite::connect_async(url)
+                .await
+                .expect_err("malformed session must be rejected");
+            match err {
+                tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                    assert_eq!(resp.status().as_u16(), 400);
+                }
+                other => panic!("expected HTTP 400, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn ws_rejects_bad_token_before_validating_session() {
+            let (addr, _token) = spawn_server(ServerConfig::default()).await;
+            let url = format!("ws://{addr}/ws?auth=wrong&session=../x");
+            let err = tokio_tungstenite::connect_async(url)
+                .await
+                .expect_err("a bad token must be rejected");
+            match err {
+                tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                    assert_eq!(resp.status().as_u16(), 403);
+                }
+                other => panic!("expected HTTP 403, got {other:?}"),
+            }
         }
 
         #[cfg(unix)]

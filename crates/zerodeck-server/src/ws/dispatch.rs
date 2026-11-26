@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
-use zerodeck_core::{PluginManager, PluginSummary};
+use zerodeck_core::{CoreError, PluginManager, PluginSummary};
 use zerodeck_protocol::{WsCallPayload, WsServerMessage};
 
 use crate::state::AppState;
@@ -146,16 +147,12 @@ async fn dispatch_plugin_rpc(
         );
     };
 
-    match manager
-        .call_plugin_method(plugin_name, method_name, payload_args, legacy)
-        .await
-    {
-        Ok(result) => WsServerMessage::Reply {
-            id: call.id,
-            result,
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply(
+        call.id,
+        manager
+            .call_plugin_method(plugin_name, method_name, payload_args, legacy)
+            .await,
+    )
 }
 
 async fn dispatch_reload_plugin(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -171,13 +168,7 @@ async fn dispatch_reload_plugin(state: &AppState, call: &WsCallPayload) -> WsSer
             None,
         );
     };
-    match manager.reload_plugin(&plugin_name).await {
-        Ok(()) => WsServerMessage::Reply {
-            id: call.id,
-            result: Value::Bool(true),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply_done(call.id, manager.reload_plugin(&plugin_name).await)
 }
 
 async fn dispatch_filepicker(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -189,16 +180,7 @@ async fn dispatch_filepicker(state: &AppState, call: &WsCallPayload) -> WsServer
         Ok(q) => q,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.list_files(query).await {
-        Ok(listing) => match serde_json::to_value(listing) {
-            Ok(result) => WsServerMessage::Reply {
-                id: call.id,
-                result,
-            },
-            Err(err) => ws_error(call.id, "BackendError", err.to_string(), None),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply(call.id, manager.list_files(query).await)
 }
 
 async fn dispatch_install_plugin(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -210,16 +192,7 @@ async fn dispatch_install_plugin(state: &AppState, call: &WsCallPayload) -> WsSe
         Ok(r) => r,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.install_plugin(req).await {
-        Ok(outcome) => match serde_json::to_value(outcome) {
-            Ok(result) => WsServerMessage::Reply {
-                id: call.id,
-                result,
-            },
-            Err(err) => ws_error(call.id, "BackendError", err.to_string(), None),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply(call.id, manager.install_plugin(req).await)
 }
 
 async fn dispatch_uninstall_plugin(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -231,13 +204,10 @@ async fn dispatch_uninstall_plugin(state: &AppState, call: &WsCallPayload) -> Ws
         Ok(v) => v,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.uninstall_plugin(&plugin_name, purge_data).await {
-        Ok(()) => WsServerMessage::Reply {
-            id: call.id,
-            result: Value::Bool(true),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply_done(
+        call.id,
+        manager.uninstall_plugin(&plugin_name, purge_data).await,
+    )
 }
 
 async fn dispatch_enable_plugin(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -249,13 +219,7 @@ async fn dispatch_enable_plugin(state: &AppState, call: &WsCallPayload) -> WsSer
         Ok(n) => n,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.enable_plugin(&plugin_name).await {
-        Ok(()) => WsServerMessage::Reply {
-            id: call.id,
-            result: Value::Bool(true),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply_done(call.id, manager.enable_plugin(&plugin_name).await)
 }
 
 async fn dispatch_disable_plugin(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -267,13 +231,7 @@ async fn dispatch_disable_plugin(state: &AppState, call: &WsCallPayload) -> WsSe
         Ok(n) => n,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.disable_plugin(&plugin_name).await {
-        Ok(()) => WsServerMessage::Reply {
-            id: call.id,
-            result: Value::Bool(true),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply_done(call.id, manager.disable_plugin(&plugin_name).await)
 }
 
 async fn dispatch_set_plugin_order(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -285,13 +243,7 @@ async fn dispatch_set_plugin_order(state: &AppState, call: &WsCallPayload) -> Ws
         Ok(o) => o,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.set_plugin_order(order).await {
-        Ok(()) => WsServerMessage::Reply {
-            id: call.id,
-            result: Value::Bool(true),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
-    }
+    reply_done(call.id, manager.set_plugin_order(order).await)
 }
 
 fn dispatch_get_settings(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
@@ -318,11 +270,68 @@ async fn dispatch_set_setting(state: &AppState, call: &WsCallPayload) -> WsServe
         Ok(pair) => pair,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.set_setting(&key, value).await {
-        Ok(()) => WsServerMessage::Reply {
-            id: call.id,
-            result: Value::Bool(true),
-        },
-        Err(err) => core_error_to_ws(call.id, err),
+    reply_done(call.id, manager.set_setting(&key, value).await)
+}
+
+/// Turns a manager result into a `REPLY` carrying the serialized value, or an `ERROR` frame.
+pub(crate) fn reply<T: Serialize>(id: u64, result: Result<T, CoreError>) -> WsServerMessage {
+    match result.map(serde_json::to_value) {
+        Ok(Ok(result)) => WsServerMessage::Reply { id, result },
+        Ok(Err(err)) => ws_error(id, "BackendError", err.to_string(), None),
+        Err(err) => core_error_to_ws(id, err),
+    }
+}
+
+/// [`reply`] for mutations that return nothing: a successful call answers `true`.
+pub(crate) fn reply_done(id: u64, result: Result<(), CoreError>) -> WsServerMessage {
+    reply(id, result.map(|()| true))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use zerodeck_core::CoreError;
+    use zerodeck_plugin_host::HostError;
+    use zerodeck_protocol::WsServerMessage;
+
+    use super::{reply, reply_done};
+
+    #[test]
+    fn reply_serializes_the_ok_value() {
+        assert_eq!(
+            reply(3, Ok::<_, CoreError>(vec!["a", "b"])),
+            WsServerMessage::Reply {
+                id: 3,
+                result: json!(["a", "b"])
+            }
+        );
+    }
+
+    #[test]
+    fn reply_done_answers_true() {
+        assert_eq!(
+            reply_done(4, Ok(())),
+            WsServerMessage::Reply {
+                id: 4,
+                result: json!(true)
+            }
+        );
+    }
+
+    #[test]
+    fn reply_maps_core_errors_to_error_frames() {
+        let frame = reply_done(
+            5,
+            Err(CoreError::Host(HostError::PluginNotFound(
+                "Gone".to_owned(),
+            ))),
+        );
+        match frame {
+            WsServerMessage::Error { id, error } => {
+                assert_eq!(id, 5);
+                assert_eq!(error.name, "PluginNotFoundError");
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
     }
 }

@@ -273,9 +273,10 @@ interesting work is still ahead. Rust, Python and TypeScript are all welcome.
 
 ```bash
 just setup   # once: builds the dev image and installs frontend dependencies
-just check   # formatting, lints, tests and licenses
+just check   # formatting, lints, rustdoc, tests and licenses
 just ci      # optional: everything CI runs (adds the Python matrix, infra lint, smoke test,
-             # root-only privileged tests)
+             # root-only `just test-privileged`)
+just coverage  # optional: Rust coverage report in ./coverage/html
 ```
 
 Found a vulnerability? Report it privately as described in [`SECURITY.md`](SECURITY.md). Everyone

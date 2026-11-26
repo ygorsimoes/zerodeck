@@ -40,7 +40,8 @@ setup:
 check:
     {{ dev }} just _check
 
-# Everything CI runs except fuzzing: check + Python matrix + infra lint + smoke + root-only tests
+# Everything CI runs except fuzzing and coverage: check + Python matrix + infra lint + smoke +
+# root-only tests
 [group('dev')]
 ci: check py-matrix lint-infra smoke test-privileged
 
@@ -52,7 +53,7 @@ fmt:
 # Lint everything without running tests
 [group('dev')]
 lint:
-    {{ dev }} just _fmt-check _clippy _py-lint _fe-lint
+    {{ dev }} just _fmt-check _clippy _doc _py-lint _fe-lint
 
 # Run every test suite (Rust, Python worker host, frontend)
 [group('dev')]
@@ -76,10 +77,15 @@ clean:
 
 # ─── Focused checks (one per CI job) ─────────────────────────────────────────────────────────────
 
-# Rust: rustfmt, clippy (-D warnings), tests
+# Rust: rustfmt, clippy (-D warnings), rustdoc (-D warnings), tests
 [group('checks')]
 check-rust:
-    {{ dev }} just _fmt-check _clippy _cargo-test
+    {{ dev }} just _fmt-check _clippy _doc _cargo-test
+
+# Rust test coverage report (HTML + lcov) into ./coverage (open coverage/html/index.html)
+[group('checks')]
+coverage:
+    {{ dev }} just _coverage
 
 # Licenses, advisories and sources (deny.toml)
 [group('checks')]
@@ -202,7 +208,7 @@ dist tag image="zerodeck:runtime":
 # ─── Implementations (run where the public recipe decided: container or native) ─────────────────
 
 [private]
-_check: _fmt-check _clippy _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test
+_check: _fmt-check _clippy _doc _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test
 
 [private]
 _fmt: _fe-deps
@@ -218,6 +224,10 @@ _clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
 [private]
+_doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+[private]
 _cargo-test:
     cargo test --workspace --locked
 
@@ -230,6 +240,11 @@ _test-privileged:
         exit 1
     fi
     cargo test --workspace --locked -- --ignored privileged_
+
+[private]
+_coverage:
+    cargo llvm-cov --workspace --locked --html --output-dir coverage
+    cargo llvm-cov report --lcov --output-path coverage/lcov.info
 
 [private]
 _py-test:

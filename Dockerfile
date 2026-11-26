@@ -19,6 +19,9 @@ ARG TARGETARCH
 ARG CARGO_DENY_VERSION=0.22.1
 ARG CARGO_DENY_SHA256_AMD64=13f7e825e9cb811c2f8de63f29b0f45851dfb53004029f0f2501af524728364d
 ARG CARGO_DENY_SHA256_ARM64=0bac0838a1653ce693e4602b8634d15ca179edd2198e438af9c35ab1c551d509
+ARG CARGO_LLVM_COV_VERSION=0.9.2
+ARG CARGO_LLVM_COV_SHA256_AMD64=8d863ab2df1fb53d4f41052b3fa4627ac003d00c46a6388ce037d17472c504ef
+ARG CARGO_LLVM_COV_SHA256_ARM64=dab1bfd1f25f7fcd3d6fc6abf9d71b40217a7a103e1da88c1a23111960aa4a40
 ARG JUST_VERSION=1.59.0
 ARG JUST_SHA256_AMD64=409044617b6f06517c1035e55ca38c8c856ff8b650e41bc2aa1ef82d5903a23e
 ARG JUST_SHA256_ARM64=23871b1702bfd550fb5f901778fd4290ecf2ee034a45a889fbe96d89b188086d
@@ -38,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-venv \
         xz-utils \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup component add rustfmt clippy
+    && rustup component add rustfmt clippy llvm-tools-preview
 
 # Node.js + npm from the official image (same major as the frontend build), then pnpm and pyright.
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
@@ -53,10 +56,11 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 RUN UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin UV_PYTHON_DOWNLOADS=never \
     uv tool install "ruff==${RUFF_VERSION}"
 
-# Prebuilt cargo-deny and just, verified against SHA-256 digests pinned in this file (fail closed).
+# Prebuilt cargo-deny, cargo-llvm-cov and just, verified against SHA-256 digests pinned in this
+# file (fail closed).
 RUN case "${TARGETARCH:-amd64}" in \
-        amd64) triple="x86_64-unknown-linux-musl"; deny_sha="${CARGO_DENY_SHA256_AMD64}"; just_sha="${JUST_SHA256_AMD64}" ;; \
-        arm64) triple="aarch64-unknown-linux-musl"; deny_sha="${CARGO_DENY_SHA256_ARM64}"; just_sha="${JUST_SHA256_ARM64}" ;; \
+        amd64) triple="x86_64-unknown-linux-musl"; deny_sha="${CARGO_DENY_SHA256_AMD64}"; just_sha="${JUST_SHA256_AMD64}"; cov_sha="${CARGO_LLVM_COV_SHA256_AMD64}" ;; \
+        arm64) triple="aarch64-unknown-linux-musl"; deny_sha="${CARGO_DENY_SHA256_ARM64}"; just_sha="${JUST_SHA256_ARM64}"; cov_sha="${CARGO_LLVM_COV_SHA256_ARM64}" ;; \
         *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac \
     && tmp="$(mktemp -d)" \
@@ -69,8 +73,12 @@ RUN case "${TARGETARCH:-amd64}" in \
         "https://github.com/casey/just/releases/download/${JUST_VERSION}/just-${JUST_VERSION}-${triple}.tar.gz" \
     && echo "${just_sha}  ${tmp}/just.tar.gz" | sha256sum -c - \
     && tar -xzf "${tmp}/just.tar.gz" -C /usr/local/bin just \
+    && curl -fsSL -o "${tmp}/llvm-cov.tar.gz" \
+        "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${CARGO_LLVM_COV_VERSION}/cargo-llvm-cov-${triple}.tar.gz" \
+    && echo "${cov_sha}  ${tmp}/llvm-cov.tar.gz" | sha256sum -c - \
+    && tar -xzf "${tmp}/llvm-cov.tar.gz" -C /usr/local/bin cargo-llvm-cov \
     && rm -rf "${tmp}" \
-    && cargo deny --version && just --version && ruff --version && pyright --version && pnpm --version
+    && cargo deny --version && cargo llvm-cov --version && just --version && ruff --version && pyright --version && pnpm --version
 
 # Day-to-day development image: `just <recipe>` runs here (see compose.yaml `dev`). The user takes
 # the host UID/GID so files written into the bind-mounted checkout keep the right owner.

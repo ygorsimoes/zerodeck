@@ -32,8 +32,8 @@ That's all. Run `just` to list every recipe.
 
 ```bash
 just setup          # once (and after toolchain changes): build the dev image, install frontend deps
-just check          # core checks: fmt, clippy, tests, Python lint/tests, cargo-deny, frontend
-just ci             # everything CI runs except fuzzing: check + Python matrix + lint-infra + smoke
+just check          # core checks: fmt, clippy, rustdoc, tests, Python lint/tests, cargo-deny, frontend
+just ci             # everything CI runs except fuzzing and coverage: check + Python matrix + lint-infra + smoke
                     # + test-privileged (root-only tests, always in the root container)
 just fmt            # format Rust + frontend code
 just lint           # lints only (no tests)
@@ -46,7 +46,9 @@ just clean          # drop the dev containers and their cache volumes
 Focused checks:
 
 ```bash
-just check-rust     # rustfmt, clippy -D warnings, cargo test
+just check-rust     # rustfmt, clippy -D warnings, rustdoc -D warnings, cargo test
+just test-privileged  # root-only tests (privilege drop, worker reaping, root plugin ownership)
+just coverage       # Rust coverage report (HTML + lcov) into ./coverage
 just deny           # deny.toml: licenses, advisories, sources
 just check-python   # ruff, strict pyright, unittest
 just py-test-on 3.10  # Python worker host tests on one interpreter (official python image)
@@ -54,7 +56,7 @@ just py-matrix      # ...on every supported interpreter: 3.10, 3.11, 3.12, 3.13
 just check-frontend # biome, tsc, vite build, node tests
 just lint-infra     # version pins in sync, compose config, actionlint + zizmor (workflows), hadolint
 just fuzz zip_extract 120   # fuzz one untrusted-input parser (nightly, in its own image)
-just fuzz-all 30    # every fuzz target, 30 s each
+just fuzz-all 30    # every fuzz target, 30 s each (CI also runs 5 min each, nightly)
 ```
 
 The shipped runtime image:

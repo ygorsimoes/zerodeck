@@ -5,11 +5,14 @@
 mod auth;
 mod error;
 mod fetch;
-mod router;
+mod routes;
+mod state;
+mod ws;
 mod ws_sync;
 
 pub use error::ServerError;
-pub use router::{AppState, ServerConfig, build_router, serve};
+pub use routes::{build_router, serve};
+pub use state::{AppState, ServerConfig};
 pub use ws_sync::WsSyncCache;
 
 #[cfg(test)]
@@ -166,12 +169,12 @@ mod tests {
     fn redacted_uri_hides_auth_token_but_keeps_other_query_params() {
         let uri: axum::http::Uri = "/ws?foo=1&auth=secret-token&bar=2".parse().expect("uri");
         assert_eq!(
-            crate::router::redacted_uri(&uri),
+            crate::routes::redacted_uri(&uri),
             "/ws?foo=1&auth=[redacted]&bar=2"
         );
 
         let plain: axum::http::Uri = "/healthz".parse().expect("uri");
-        assert_eq!(crate::router::redacted_uri(&plain), "/healthz");
+        assert_eq!(crate::routes::redacted_uri(&plain), "/healthz");
     }
 
     async fn get_status(app: &axum::Router, uri: &str, header: Option<&str>) -> StatusCode {
@@ -303,7 +306,11 @@ mod tests {
             ("webm", "video/webm"),
         ] {
             let path = std::path::PathBuf::from(format!("file.{ext}"));
-            assert_eq!(crate::router::mime_for_path(&path), mime, "{ext}");
+            assert_eq!(
+                crate::routes::static_files::mime_for_path(&path),
+                mime,
+                "{ext}"
+            );
         }
     }
 
@@ -313,7 +320,7 @@ mod tests {
             name: "Alpha".to_owned(),
             directory: "alpha".to_owned(),
         };
-        match crate::router::core_error_to_ws(7, err) {
+        match crate::ws::errors::core_error_to_ws(7, err) {
             zerodeck_protocol::WsServerMessage::Error { id, error } => {
                 assert_eq!(id, 7);
                 assert_eq!(error.name, "DuplicatePluginNameError");

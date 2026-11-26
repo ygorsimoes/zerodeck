@@ -382,7 +382,7 @@ async fn installer_enforces_sha256_policy_and_file_uri_sideload() {
     assert_eq!(outcome.name, "LocalDemo");
     assert!(target_dir.join("plugin.json").is_file());
 
-    // Outside file:///etc/passwd must fail PathEscape even when user_confirmed == true.
+    // Outside file:///etc/passwd must fail PathOutsideRoots even when user_confirmed == true.
     let escape_req = crate::InstallPluginRequest {
         source: crate::parse_install_source("file:///etc/passwd", None, None, true)
             .expect("parse /etc/passwd file URI"),
@@ -392,10 +392,10 @@ async fn installer_enforces_sha256_policy_and_file_uri_sideload() {
     };
     let err_escape = crate::prepare_staged_plugin(&paths, &client, &limits, &escape_req, false)
         .await
-        .expect_err("file:///etc/passwd must fail PathEscape");
+        .expect_err("file:///etc/passwd must fail PathOutsideRoots");
     assert!(matches!(
         err_escape,
-        CoreError::Platform(zerodeck_platform::PlatformError::PathEscape { .. })
+        CoreError::Platform(zerodeck_platform::PlatformError::PathOutsideRoots { .. })
     ));
 
     server.abort();

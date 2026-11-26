@@ -132,7 +132,12 @@ impl CoreError {
     /// Returns `true` if this error represents a path-jail escape attempt.
     #[must_use]
     pub fn is_path_escape(&self) -> bool {
-        matches!(self, Self::Platform(PlatformError::PathEscape { .. }))
+        matches!(
+            self,
+            Self::Platform(
+                PlatformError::PathEscape { .. } | PlatformError::PathOutsideRoots { .. }
+            )
+        )
     }
 }
 
@@ -151,6 +156,12 @@ mod tests {
             root: PathBuf::from("/srv/plugins"),
         });
         assert!(escape.is_path_escape());
+
+        let outside_roots = CoreError::Platform(PlatformError::PathOutsideRoots {
+            candidate: PathBuf::from("/etc/passwd"),
+            roots: vec![PathBuf::from("/home/deck"), PathBuf::from("/run/media")],
+        });
+        assert!(outside_roots.is_path_escape());
 
         let empty_roots = CoreError::Platform(PlatformError::EmptyRootSet);
         assert!(!empty_roots.is_path_escape());

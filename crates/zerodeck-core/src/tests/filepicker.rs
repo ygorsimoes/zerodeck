@@ -125,11 +125,12 @@ fn filepicker_lists_allowed_roots_filters_extensions_and_omits_escaping_symlinks
             ..crate::FilePickerQuery::default()
         },
     )
-    .expect_err("outside path must fail with PathEscape");
+    .expect_err("outside path must fail with PathOutsideRoots");
     assert!(matches!(
         err_escape,
-        CoreError::Platform(zerodeck_platform::PlatformError::PathEscape { .. })
+        CoreError::Platform(zerodeck_platform::PlatformError::PathOutsideRoots { .. })
     ));
+    assert!(err_escape.is_path_escape());
 }
 
 #[test]

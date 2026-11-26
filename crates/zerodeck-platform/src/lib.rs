@@ -105,7 +105,33 @@ mod tests {
         let err = set
             .resolve(&outside_file)
             .expect_err("outside path must fail");
-        assert!(matches!(err, PlatformError::PathEscape { .. }));
+        assert!(matches!(err, PlatformError::PathOutsideRoots { .. }));
+    }
+
+    #[test]
+    fn safe_path_set_error_lists_every_root() {
+        let first = TestDir::new("roots-first");
+        let second = TestDir::new("roots-second");
+        let outside = TestDir::new("roots-outside");
+
+        let set =
+            SafePathSet::new(vec![first.0.clone(), second.0.clone()]).expect("init SafePathSet");
+        match set.resolve(&outside.0).expect_err("outside path must fail") {
+            PlatformError::PathOutsideRoots { candidate, roots } => {
+                assert_eq!(
+                    candidate,
+                    fs::canonicalize(&outside.0).expect("canon outside")
+                );
+                assert_eq!(
+                    roots,
+                    vec![
+                        fs::canonicalize(&first.0).expect("canon first"),
+                        fs::canonicalize(&second.0).expect("canon second"),
+                    ]
+                );
+            }
+            other => panic!("expected PathOutsideRoots, got {other:?}"),
+        }
     }
 
     #[test]

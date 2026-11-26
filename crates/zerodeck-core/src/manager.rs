@@ -15,8 +15,8 @@ use zerodeck_plugin_host::{
 };
 use zerodeck_protocol::PluginLoadType;
 
+use crate::blocking::run_blocking;
 use crate::discovery::discover_single_plugin;
-use crate::installer::run_blocking;
 use crate::preflight::{PreflightInput, preflight};
 use crate::settings::insert_dotted;
 use crate::{
@@ -878,6 +878,11 @@ impl PluginManager {
     /// Applies `mutate` to a copy of the settings, writes it on the blocking pool, then makes it
     /// current. Writes are ordered by `settings_writer`; readers keep seeing the previous values
     /// until the write succeeds and never wait on `fsync`.
+    ///
+    /// Not cancel-safe: if this future is dropped while the write runs, the file may hold the
+    /// new values while memory keeps the old ones until the next write. Call it only from tasks
+    /// that run to completion (every caller today runs in a detached WebSocket or lifecycle
+    /// task).
     async fn persist_settings<F>(&self, mutate: F) -> Result<(), CoreError>
     where
         F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,

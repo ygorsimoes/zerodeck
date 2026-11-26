@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod archive;
+mod blocking;
 mod discovery;
 mod error;
 pub mod filepicker;
@@ -37,7 +38,7 @@ pub use manager::{
     LoaderEvent, PluginFileScope, PluginManager, PluginManagerBuilder, PluginSummary,
     resolve_static_file,
 };
-pub use settings::{PendingSettings, SettingsManager};
+pub use settings::SettingsManager;
 pub use watcher::{DebugWatcherHandle, start_debug_watcher};
 
 #[cfg(test)]

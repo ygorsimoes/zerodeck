@@ -81,6 +81,11 @@ clean:
 check-rust:
     {{ dev }} just _fmt-check _clippy _cargo-test
 
+# Rust test coverage report (HTML + lcov) into target/coverage
+[group('checks')]
+coverage:
+    {{ dev }} just _coverage
+
 # Licenses, advisories and sources (deny.toml)
 [group('checks')]
 deny:
@@ -230,6 +235,11 @@ _test-privileged:
         exit 1
     fi
     cargo test --workspace --locked -- --ignored privileged_
+
+[private]
+_coverage:
+    cargo llvm-cov --workspace --locked --html --output-dir target/coverage
+    cargo llvm-cov report --lcov --output-path target/coverage/lcov.info
 
 [private]
 _py-test:

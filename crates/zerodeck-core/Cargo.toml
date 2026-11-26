@@ -29,3 +29,5 @@ zip.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 inotify.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

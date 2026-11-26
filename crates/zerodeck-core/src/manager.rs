@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 use tracing::{info_span, warn};
-use zerodeck_platform::{OwnershipViolation, PlatformError, PlatformPaths, SafePath};
+use zerodeck_platform::{
+    OwnershipViolation, PlatformError, PlatformPaths, SafePath, lock_unpoisoned,
+};
 use zerodeck_plugin_host::{
     HostError, PluginEvent, PluginSpawnSpec, PluginState, PluginSupervisor, SupervisorConfig,
 };
@@ -1055,10 +1057,4 @@ fn strip_name_from_array_key(map: &mut Map<String, Value>, key: &str, name: &str
     let before = items.len();
     items.retain(|entry| entry.as_str() != Some(name));
     items.len() != before
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

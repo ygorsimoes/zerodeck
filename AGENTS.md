@@ -14,7 +14,7 @@ Maintain the acyclic Cargo workspace dependency graph in `Cargo.toml`:
 
 ```text
 zerodeckd
- ├── zerodeck-server ── zerodeck-core, zerodeck-cef, zerodeck-plugin-host, zerodeck-protocol
+ ├── zerodeck-server ── zerodeck-core, zerodeck-cef, zerodeck-plugin-host, zerodeck-platform, zerodeck-protocol
  ├── zerodeck-cef ───── zerodeck-protocol
  ├── zerodeck-core ──── zerodeck-platform, zerodeck-plugin-host, zerodeck-protocol
  └── zerodeck-plugin-host ── zerodeck-platform, zerodeck-protocol

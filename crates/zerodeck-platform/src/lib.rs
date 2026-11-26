@@ -6,6 +6,7 @@ mod ownership;
 mod paths;
 mod privilege;
 mod safe_path;
+mod sync;
 
 pub use error::PlatformError;
 pub use fs::atomic_write;
@@ -19,6 +20,7 @@ pub use privilege::{
     HostUserIdentity, ProcessIdentity, current_process_identity, ensure_owned_dir,
 };
 pub use safe_path::{SafePath, SafePathSet};
+pub use sync::lock_unpoisoned;
 
 #[cfg(test)]
 mod tests {

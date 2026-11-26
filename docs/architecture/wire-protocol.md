@@ -7,6 +7,7 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 ### Authentication & CORS
 - `GET /auth/token` returns the daemon's ephemeral CSRF token (`text/plain`).
 - Protected HTTP endpoints require header `X-Decky-Auth: <token>` (or `?auth=<token>` on `/ws` and `/fetch`).
+- `GET /readyz` requires `X-Decky-Auth` and returns `{"version", "build_id", "python_host_ready"}` without filesystem paths. It is the local activation readiness contract for the loader generation itself; unrelated plugin failures do not gate it. `GET /healthz` remains an unauthenticated liveness probe.
 - CORS origin allowlist: `https://steamloopback.host` with `allow_credentials = true`.
 - `Host` allowlist (DNS-rebinding defense): every request carrying a `Host` header must name a loopback host (`localhost`, `127.0.0.0/8`, or `[::1]`, any port); anything else gets `403 Forbidden`.
 - Bind policy: the daemon refuses to start when `SERVER_HOST`/`--host` resolves to any non-loopback address (e.g. `0.0.0.0`, `::`, a LAN IP), because `/auth/token` would become reachable from that network and the `Host` check can be spoofed by a remote client. `--allow-non-loopback` / `ZERODECK_ALLOW_NON_LOOPBACK=1` opts in (a warning is logged); the runtime container image sets it and relies on a loopback-only port mapping (`127.0.0.1:1337:1337`).

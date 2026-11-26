@@ -16,6 +16,13 @@ use zerodeck_plugin_host::{PluginEvent, PythonHostConfig};
 use crate::ServerError;
 use crate::ws_sync::WsSyncCache;
 
+fn default_build_id() -> String {
+    option_env!("ZERODECK_BUILD_ID")
+        .filter(|build_id| !build_id.is_empty())
+        .unwrap_or("dev")
+        .to_owned()
+}
+
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -29,6 +36,12 @@ pub struct ServerConfig {
     pub ws_max_message_bytes: usize,
     /// Optional path to the packaged `@zerodeck/frontend` dist directory.
     pub frontend_dir: Option<PathBuf>,
+    /// Loader version reported by `/readyz`.
+    pub version: String,
+    /// Embedded loader build identity reported by `/readyz`.
+    pub build_id: String,
+    /// Whether the Python worker host was importable during startup.
+    pub python_host_ready: bool,
     /// Maximum compressed plugin ZIP archive size accepted by the installer.
     pub max_zip_download_bytes: usize,
     /// Maximum size of a single `remote_binary` download.
@@ -58,6 +71,9 @@ impl Default for ServerConfig {
             ws_ping_interval: Duration::from_secs(30),
             ws_max_message_bytes: 16 * 1024 * 1024,
             frontend_dir: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_id: default_build_id(),
+            python_host_ready: false,
             max_zip_download_bytes: DEFAULT_MAX_ZIP_DOWNLOAD_BYTES,
             max_remote_binary_bytes: DEFAULT_MAX_REMOTE_BINARY_BYTES,
             fetch_connect_timeout: Duration::from_secs(10),

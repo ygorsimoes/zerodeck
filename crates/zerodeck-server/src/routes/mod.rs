@@ -52,6 +52,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(handle_healthz))
+        .route("/readyz", get(handle_readyz))
         .route("/auth/token", get(handle_auth_token))
         .route("/ws", get(handle_ws_upgrade))
         .route("/fetch", any(crate::fetch::handle_fetch))
@@ -128,6 +129,15 @@ where
 
 async fn handle_healthz() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn handle_readyz(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config();
+    Json(json!({
+        "version": &config.version,
+        "build_id": &config.build_id,
+        "python_host_ready": config.python_host_ready,
+    }))
 }
 
 async fn handle_auth_token(State(state): State<AppState>) -> String {

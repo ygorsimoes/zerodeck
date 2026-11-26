@@ -63,6 +63,7 @@ semver = { version = "1.0.28", features = ["serde"] }
 tar = "0.4.46"
 flate2 = "1.1.11"
 tough = { version = "0.24.0", features = ["http"] }
+sd-notify = "0.5.0"
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 uuid = { version = "1.29.3", features = ["v4"] }
 rustix = { version = "1.1.6", features = ["process", "fs", "net", "thread"] }

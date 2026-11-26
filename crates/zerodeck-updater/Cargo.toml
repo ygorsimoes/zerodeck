@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 flate2.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 semver.workspace = true
@@ -25,6 +26,7 @@ sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tough.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
@@ -33,3 +35,4 @@ zerodeck-platform.workspace = true
 
 [dev-dependencies]
 aws-lc-rs = "1.19.0"
+axum.workspace = true

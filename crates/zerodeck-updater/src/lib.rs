@@ -4,11 +4,13 @@
 
 mod catalog;
 mod generation;
+pub mod service;
 mod stage;
 mod state;
 
 use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use semver::Version;
 use thiserror::Error;
@@ -16,6 +18,10 @@ use zerodeck_platform::PlatformError;
 
 pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
 pub use generation::{GenerationId, GenerationStore};
+pub use service::{
+    ACTIVATION_DEADLINE, ReleaseIdentity, Systemctl, SystemctlFuture, SystemdService,
+    TokioSystemctl, verify_ready,
+};
 pub use stage::{StageFault, StageLimits, stage_release, stage_release_with};
 pub use state::{
     CATALOG_STATE_SCHEMA, CatalogState, CatalogStateStore, PendingTransaction, StateStore,
@@ -187,6 +193,70 @@ pub enum UpdateError {
     /// A generation directory does not contain the expected release identity.
     #[error("cached generation `{0}` is incomplete or corrupt")]
     CorruptGeneration(GenerationId),
+
+    /// A `systemctl` query for the activation service failed.
+    #[error("systemctl query for `{unit}` failed: {reason}")]
+    Systemctl { unit: String, reason: String },
+
+    /// No pre-activation invocation was recorded for the service.
+    #[error("no pre-activation invocation was recorded for service `{0}`")]
+    InvocationBaselineMissing(String),
+
+    /// The systemd unit is not running.
+    #[error("systemd service `{0}` is not running")]
+    ServiceNotRunning(String),
+
+    /// The systemd unit is still on its pre-activation invocation.
+    #[error("systemd service `{0}` is still on its previous invocation")]
+    ServiceNotRestarted(String),
+
+    /// The readiness state lock was poisoned.
+    #[error("readiness state is poisoned")]
+    ReadinessStatePoisoned,
+
+    /// A local readiness endpoint could not be built.
+    #[error("invalid readiness endpoint `{endpoint}`: {reason}")]
+    InvalidReadyEndpoint { endpoint: String, reason: String },
+
+    /// A local readiness request failed at the HTTP transport.
+    #[error("readiness request to `{url}` failed: {source}")]
+    ReadyHttp {
+        url: String,
+        #[source]
+        source: Box<reqwest::Error>,
+    },
+
+    /// A readiness endpoint returned a non-success status.
+    #[error("readiness endpoint `{path}` returned status {status}")]
+    ReadyStatus { path: &'static str, status: u16 },
+
+    /// The readiness response was malformed or incomplete.
+    #[error("invalid readiness response: {0}")]
+    InvalidReadyResponse(String),
+
+    /// `/readyz` reported a different release identity than the activated generation.
+    #[error("readiness {field} mismatch: expected `{expected}`, got `{found}`")]
+    ReadinessIdentityMismatch {
+        field: &'static str,
+        expected: String,
+        found: String,
+    },
+
+    /// The Python worker host is not importable.
+    #[error("the Python worker host is not importable")]
+    PythonHostNotReady,
+
+    /// The packaged frontend asset is missing or unusable.
+    #[error("expected frontend asset `{path}` is unavailable: {reason}")]
+    FrontendAsset { path: &'static str, reason: String },
+
+    /// The authenticated readiness RPC failed.
+    #[error("authenticated readiness RPC failed: {0}")]
+    ReadinessRpc(String),
+
+    /// Readiness did not pass within the activation deadline.
+    #[error("readiness did not pass within the {0:?} activation deadline")]
+    ReadinessDeadline(Duration),
 
     /// A `zerodeck-core` operation failed.
     #[error(transparent)]

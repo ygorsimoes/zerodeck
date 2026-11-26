@@ -6,10 +6,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zerodeck_platform::atomic_write;
 
-use crate::{GenerationId, UpdateError};
+use crate::{AuthorizedRelease, GenerationId, UpdateError};
 
 /// Current on-disk [`UpdateState`] schema version.
 pub const UPDATE_STATE_SCHEMA: u32 = 1;
+
+/// Current on-disk [`CatalogState`] schema version.
+pub const CATALOG_STATE_SCHEMA: u32 = 1;
 
 /// Durable state shared by the update, apply, and recovery helpers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +162,96 @@ impl StateStore {
     /// Atomically persists `state` after rejecting an unknown schema.
     pub fn write(&self, state: &UpdateState) -> Result<(), UpdateError> {
         if state.schema != UPDATE_STATE_SCHEMA {
+            return Err(UpdateError::UnsupportedSchema(state.schema));
+        }
+        let mut bytes = serde_json::to_vec_pretty(state)?;
+        bytes.push(b'\n');
+        atomic_write(&self.path, &bytes)?;
+        Ok(())
+    }
+}
+
+/// Persisted outcome of the freshest successful trusted catalog verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogState {
+    /// Schema version of this document.
+    #[serde(default)]
+    pub schema: u32,
+    /// Unix seconds of the last successful trusted metadata verification.
+    #[serde(default)]
+    pub last_verified_at: Option<u64>,
+    /// Unix seconds at which the trusted metadata expires.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    /// The release selected from the freshest trusted metadata, if any.
+    #[serde(default)]
+    pub authorization: Option<AuthorizedRelease>,
+}
+
+impl CatalogState {
+    /// Creates an empty catalog state document at the current schema version.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            schema: CATALOG_STATE_SCHEMA,
+            last_verified_at: None,
+            expires_at: None,
+            authorization: None,
+        }
+    }
+}
+
+impl Default for CatalogState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// JSON persistence for [`CatalogState`] under the owned update state root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogStateStore {
+    path: PathBuf,
+}
+
+impl CatalogStateStore {
+    /// Creates a catalog state store backed by `path`.
+    #[must_use]
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Returns the backing state file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reads and validates the persisted catalog state, returning an empty document when absent.
+    pub fn read(&self) -> Result<CatalogState, UpdateError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Ok(CatalogState::new());
+            }
+            Err(source) => {
+                return Err(UpdateError::Io {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        let state: CatalogState = serde_json::from_slice(&bytes)?;
+        if state.schema != CATALOG_STATE_SCHEMA {
+            return Err(UpdateError::UnsupportedSchema(state.schema));
+        }
+        Ok(state)
+    }
+
+    /// Atomically persists `state` after rejecting an unknown schema.
+    pub fn write(&self, state: &CatalogState) -> Result<(), UpdateError> {
+        if state.schema != CATALOG_STATE_SCHEMA {
             return Err(UpdateError::UnsupportedSchema(state.schema));
         }
         let mut bytes = serde_json::to_vec_pretty(state)?;

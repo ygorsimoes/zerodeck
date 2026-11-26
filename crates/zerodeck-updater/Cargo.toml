@@ -15,8 +15,21 @@ name = "zerodeckctl"
 path = "src/main.rs"
 
 [dependencies]
+flate2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tough.workspace = true
+url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
+zerodeck-core.workspace = true
 zerodeck-platform.workspace = true
+
+[dev-dependencies]
+aws-lc-rs = "1.19.0"

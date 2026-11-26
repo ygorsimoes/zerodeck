@@ -83,9 +83,15 @@ stopping the active service. Validate and sync the staged tree before activation
 `current` with a same-filesystem rename and directory sync. Startup confirmation is
 version/build-aware and checks frontend assets, Python import, authenticated RPC and
 systemd readiness within 60 seconds; no unrelated plugin is required to start successfully.
-On failure retain the failing digest and recover the previous generation offline. The
-managed apply runs in a dedicated systemd unit with post-stop recovery; a separate ordered
-oneshot runs before the daemon on boot. A kill or reboot before confirmation reverts rather
+On failure retain the failing digest and recover the previous generation offline. The host
+contract is `/usr/local/lib/zerodeck/bin/zerodeckctl` for the controller, with
+`/var/lib/zerodeck` for `current`, `generations/`, update state, staging, the TUF datastore and
+the maintenance lock. `current` is a root-owned file containing the active generation digest.
+The daemon service executes a hidden `zerodeckctl exec-current --root /var/lib/zerodeck` wrapper,
+which validates the selected generation and `exec`s `<generation>/bin/zerodeckd
+--managed-generation <generation>`, so systemd's main PID is the daemon and no stable path has
+to be repointed inside a writable tree. Managed apply runs in a dedicated systemd unit with
+post-stop recovery; a separate ordered oneshot runs before the daemon on boot. A kill or reboot before confirmation reverts rather
 than silently reporting success. Post-stop recovery and boot recovery must distinguish
 whether to restart the daemon or only restore the reference. When no good generation exists
 (e.g. failed first install), leave the service stopped, preserve state, and report the error.

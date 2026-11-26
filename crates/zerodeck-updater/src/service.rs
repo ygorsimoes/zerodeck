@@ -19,6 +19,7 @@ pub const ACTIVATION_DEADLINE: Duration = Duration::from_secs(60);
 
 const READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTH_TOKEN_PATH: &str = "/auth/token";
 const READY_PATH: &str = "/readyz";
 const FRONTEND_ASSET_PATH: &str = "/frontend/index.js";
@@ -43,11 +44,16 @@ pub struct TokioSystemctl;
 impl Systemctl for TokioSystemctl {
     fn invocation_id<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, String> {
         Box::pin(async move {
-            let output = tokio::process::Command::new("systemctl")
+            let mut command = tokio::process::Command::new("systemctl");
+            command
                 .args(["show", "--property=InvocationID", "--value", "--", unit])
-                .kill_on_drop(true)
-                .output()
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.output())
                 .await
+                .map_err(|_| UpdateError::Systemctl {
+                    unit: unit.to_owned(),
+                    reason: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
+                })?
                 .map_err(|error| UpdateError::Systemctl {
                     unit: unit.to_owned(),
                     reason: error.to_string(),
@@ -223,12 +229,31 @@ impl SystemdService {
                 status: response.status().as_u16(),
             });
         }
-        let token = response
-            .text()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_READY_BODY_BYTES as u64)
+        {
+            return Err(UpdateError::InvalidReadyResponse(format!(
+                "`{AUTH_TOKEN_PATH}` exceeds {MAX_READY_BODY_BYTES} bytes"
+            )));
+        }
+        let bytes = response
+            .bytes()
             .await
             .map_err(|source| UpdateError::ReadyHttp {
                 url: url.to_string(),
                 source: Box::new(source),
+            })?;
+        if bytes.len() > MAX_READY_BODY_BYTES {
+            return Err(UpdateError::InvalidReadyResponse(format!(
+                "`{AUTH_TOKEN_PATH}` exceeds {MAX_READY_BODY_BYTES} bytes"
+            )));
+        }
+        let token = std::str::from_utf8(&bytes)
+            .map_err(|error| {
+                UpdateError::InvalidReadyResponse(format!(
+                    "auth token endpoint returned non-UTF-8 data: {error}"
+                ))
             })?
             .trim()
             .to_owned();
@@ -354,7 +379,10 @@ impl SystemdService {
         let (mut socket, _) = tokio_tungstenite::connect_async(url.as_str())
             .await
             .map_err(|error| {
-                UpdateError::ReadinessRpc(format!("cannot connect to `{url}`: {error}"))
+                UpdateError::ReadinessRpc(format!(
+                    "cannot connect to `{}`: {error}",
+                    redacted_url(&url)
+                ))
             })?;
         socket
             .send(Message::Text(
@@ -438,7 +466,12 @@ pub async fn verify_ready(
         let attempt = remaining.min(READINESS_ATTEMPT_TIMEOUT);
         match tokio::time::timeout(attempt, service.ready_once(expected)).await {
             Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => last_error = Some(error),
+            Ok(Err(error)) => {
+                if !is_retryable_readiness_failure(&error) {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
             Err(_) => last_error = Some(UpdateError::ReadinessDeadline(deadline)),
         }
 
@@ -449,4 +482,64 @@ pub async fn verify_ready(
         tokio::time::sleep(remaining.min(READINESS_RETRY_INTERVAL)).await;
     }
     Err(last_error.unwrap_or(UpdateError::ReadinessDeadline(deadline)))
+}
+
+fn is_retryable_readiness_failure(error: &UpdateError) -> bool {
+    match error {
+        UpdateError::Systemctl { .. }
+        | UpdateError::ServiceNotRunning(_)
+        | UpdateError::ServiceNotRestarted(_)
+        | UpdateError::ReadyHttp { .. } => true,
+        UpdateError::ReadyStatus { status, .. } => {
+            *status == 408 || *status == 429 || (500..=599).contains(status)
+        }
+        _ => false,
+    }
+}
+
+fn redacted_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    redacted.set_query(None);
+    redacted.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::{is_retryable_readiness_failure, redacted_url};
+    use crate::UpdateError;
+
+    #[test]
+    fn readiness_errors_redact_the_auth_query() {
+        let url = Url::parse("ws://127.0.0.1:1337/ws?auth=secret-token").expect("valid URL");
+        let redacted = redacted_url(&url);
+        assert_eq!(redacted, "ws://127.0.0.1:1337/ws");
+        assert!(!redacted.contains("secret-token"), "{redacted}");
+    }
+
+    #[test]
+    fn readiness_classifies_permanent_and_transient_failures() {
+        assert!(is_retryable_readiness_failure(
+            &UpdateError::ServiceNotRestarted("zerodeck.service".to_owned())
+        ));
+        assert!(is_retryable_readiness_failure(&UpdateError::ReadyStatus {
+            path: "/readyz",
+            status: 503,
+        }));
+        assert!(!is_retryable_readiness_failure(&UpdateError::ReadyStatus {
+            path: "/readyz",
+            status: 404,
+        }));
+        assert!(!is_retryable_readiness_failure(
+            &UpdateError::ReadinessIdentityMismatch {
+                field: "build_id",
+                expected: "new".to_owned(),
+                found: "old".to_owned(),
+            }
+        ));
+        assert!(!is_retryable_readiness_failure(
+            &UpdateError::PythonHostNotReady
+        ));
+    }
 }

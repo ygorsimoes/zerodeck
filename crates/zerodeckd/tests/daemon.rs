@@ -842,7 +842,6 @@ fn copy_python_host(home: &TempHome) -> PathBuf {
 }
 
 /// Reads the `loader/get_plugins` entry for `name` over a fresh WebSocket session.
-#[cfg(target_os = "linux")]
 async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
     let token = fetch_auth_token(&reqwest::Client::new(), port).await;
     let (mut ws, _) =
@@ -986,7 +985,25 @@ fn make_executable(path: &Path) {
         .expect("mark file executable");
 }
 
-fn write_managed_generation(root: &Path, build_id: &str, script: &str, css: &str) {
+fn embedded_build_id() -> &'static str {
+    option_env!("ZERODECK_BUILD_ID")
+        .filter(|build_id| !build_id.is_empty())
+        .unwrap_or("dev")
+}
+
+fn install_generation_binary(generation: &Path) {
+    let binary = generation.join("bin/zerodeckd");
+    std::fs::copy(BIN, &binary).expect("copy the real daemon binary into the generation");
+    make_executable(&binary);
+}
+
+fn write_managed_generation(
+    root: &Path,
+    build_id: &str,
+    release_version: &str,
+    script: &str,
+    css: &str,
+) {
     std::fs::create_dir_all(root.join("bin")).expect("create generation bin");
     std::fs::create_dir_all(root.join("frontend/static")).expect("create generation frontend");
     std::fs::create_dir_all(root.join("python")).expect("create generation python");
@@ -999,10 +1016,7 @@ fn write_managed_generation(root: &Path, build_id: &str, script: &str, css: &str
     std::fs::write(root.join("frontend/static/app.css"), css).expect("write generation static");
     std::fs::write(
         root.join("release.json"),
-        format!(
-            r#"{{"schema":1,"build_id":"{build_id}","version":"{}"}}"#,
-            env!("CARGO_PKG_VERSION")
-        ),
+        format!(r#"{{"schema":1,"build_id":"{build_id}","version":"{release_version}"}}"#),
     )
     .expect("write release.json");
 }
@@ -1025,16 +1039,16 @@ async fn managed_daemon_uses_one_generation() {
         "raise RuntimeError('broken unrelated plugin')\n",
     )
     .expect("write failed plugin entrypoint");
+    // A file where the supervisor needs its per-plugin settings directory makes every worker
+    // spawn fail immediately, so the crash-loop breaker trips instead of waiting on Python.
+    std::fs::create_dir_all(home.0.join("settings")).expect("create settings directory");
+    std::fs::write(home.0.join("settings/broken_plugin"), b"not a directory")
+        .expect("block the broken plugin settings directory");
 
-    // A complete legacy layout sits next to the binary we start: an unmanaged daemon would
-    // resolve these assets instead.
+    // Stale legacy assets remain available, but the managed process must not serve them.
     let legacy = home.0.join("legacy");
-    std::fs::create_dir_all(legacy.join("bin")).expect("create legacy bin");
     std::fs::create_dir_all(legacy.join("frontend")).expect("create legacy frontend");
     std::fs::create_dir_all(legacy.join("python")).expect("create legacy python");
-    let legacy_binary = legacy.join("bin/zerodeckd");
-    std::fs::copy(BIN, &legacy_binary).expect("copy daemon binary into legacy layout");
-    make_executable(&legacy_binary);
     let stale_python = legacy.join("python/zerodeck_py_host");
     std::fs::create_dir_all(&stale_python).expect("create stale legacy python module");
     std::fs::write(
@@ -1047,34 +1061,60 @@ async fn managed_daemon_uses_one_generation() {
         "console.log('stale legacy frontend');\n",
     )
     .expect("write legacy frontend");
+    std::fs::create_dir_all(legacy.join("frontend/static")).expect("create legacy static dir");
+    std::fs::write(
+        legacy.join("frontend/static/app.css"),
+        ".stale-legacy-static{}",
+    )
+    .expect("write stale legacy static asset");
 
     let update_root = home.0.join("update");
     let generation_one = update_root.join("generations").join("a".repeat(64));
     let generation_two = update_root.join("generations").join("b".repeat(64));
     write_managed_generation(
         &generation_one,
-        "build-generation-one",
+        embedded_build_id(),
+        "1.2.3",
         "console.log('generation one frontend');\n",
         ".generation-one{}",
     );
     write_managed_generation(
         &generation_two,
         "build-generation-two",
+        "9.9.9",
         "console.log('generation two frontend');\n",
         ".generation-two{}",
     );
+    install_generation_binary(&generation_one);
     std::fs::write(update_root.join("current"), format!("{}\n", "a".repeat(64)))
         .expect("write active generation reference");
 
     let port = free_port("127.0.0.1");
+    let generation_binary = generation_one.join("bin/zerodeckd");
     let mut daemon = Daemon(
-        daemon_command_at(&legacy_binary, &home, "127.0.0.1", port)
+        daemon_command_at(&generation_binary, &home, "127.0.0.1", port)
             .arg("--managed-generation")
             .arg(&generation_one)
             .spawn()
-            .expect("spawn managed zerodeckd"),
+            .expect("spawn the generation's zerodeckd"),
     );
     wait_until_healthy(&home, "127.0.0.1", port);
+
+    let plugin_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let entry = get_plugin_entry(port, "BrokenPlugin").await;
+        let state = entry["state"].as_str().unwrap_or_default();
+        // The supervisor reports BackingOff while it retries the failing worker and Failed when
+        // its crash-loop breaker trips; both are the plugin's own failure state, not Running.
+        if matches!(state, "BackingOff" | "Failed") {
+            break;
+        }
+        assert!(
+            Instant::now() < plugin_deadline,
+            "broken plugin never entered its own failure state: {entry}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let client = reqwest::Client::new();
     let ready_url = format!("http://127.0.0.1:{port}/readyz");
@@ -1094,8 +1134,8 @@ async fn managed_daemon_uses_one_generation() {
         assert_eq!(
             ready,
             serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "build_id": "build-generation-one",
+                "version": "1.2.3",
+                "build_id": embedded_build_id(),
                 "python_host_ready": true,
             })
         );
@@ -1185,10 +1225,13 @@ fn managed_daemon_rejects_conflicting_overrides() {
     let generation = home.0.join("update/generations").join("c".repeat(64));
     write_managed_generation(
         &generation,
-        "build-override-test",
+        embedded_build_id(),
+        "0.1.0",
         "console.log('managed');\n",
         "body{}",
     );
+    install_generation_binary(&generation);
+    let generation_binary = generation.join("bin/zerodeckd");
     let legacy_frontend = home.0.join("legacy/frontend");
     let legacy_python = home.0.join("legacy/python");
     std::fs::create_dir_all(&legacy_frontend).expect("create legacy frontend");
@@ -1198,7 +1241,7 @@ fn managed_daemon_rejects_conflicting_overrides() {
         ("ZERODECK_FRONTEND_DIR", legacy_frontend.as_path()),
         ("PYTHONPATH", legacy_python.as_path()),
     ] {
-        let output = daemon_command(&home, "127.0.0.1", 1)
+        let output = daemon_command_at(&generation_binary, &home, "127.0.0.1", 1)
             .arg("--managed-generation")
             .arg(&generation)
             .arg("--check-config")
@@ -1215,7 +1258,7 @@ fn managed_daemon_rejects_conflicting_overrides() {
         assert!(stderr.contains("--managed-generation"), "stderr: {stderr}");
     }
 
-    let output = daemon_command(&home, "127.0.0.1", 1)
+    let output = daemon_command_at(&generation_binary, &home, "127.0.0.1", 1)
         .arg("--managed-generation")
         .arg(&generation)
         .arg("--check-config")
@@ -1228,6 +1271,41 @@ fn managed_daemon_rejects_conflicting_overrides() {
         "overrides selecting the managed generation are allowed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn managed_daemon_rejects_a_stale_running_binary() {
+    let home = TempHome::new("managed-stale-binary");
+    let generation = home.0.join("update/generations").join("d".repeat(64));
+    write_managed_generation(
+        &generation,
+        embedded_build_id(),
+        "1.0.0",
+        "console.log('managed');\n",
+        "body{}",
+    );
+    install_generation_binary(&generation);
+
+    let stale_binary = home.0.join("stale/bin/zerodeckd");
+    std::fs::create_dir_all(stale_binary.parent().expect("stale binary parent"))
+        .expect("create stale bin");
+    std::fs::copy(BIN, &stale_binary).expect("copy stale daemon binary");
+    make_executable(&stale_binary);
+
+    let output = daemon_command_at(&stale_binary, &home, "127.0.0.1", 1)
+        .arg("--managed-generation")
+        .arg(&generation)
+        .arg("--check-config")
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run a stale daemon against the managed generation");
+    assert!(
+        !output.status.success(),
+        "a daemon that is not the generation binary must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("running daemon"), "stderr: {stderr}");
+    assert!(stderr.contains("managed generation"), "stderr: {stderr}");
 }
 
 #[test]

@@ -2,13 +2,13 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use semver::Version;
 use serde_json::{Value, json};
@@ -19,7 +19,7 @@ use zerodeck_updater::{
 };
 
 const TOKEN: &str = "readiness-test-token";
-const TEST_DEADLINE: Duration = Duration::from_millis(250);
+const TEST_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy)]
 enum PingMode {
@@ -29,6 +29,9 @@ enum PingMode {
 
 #[derive(Debug)]
 struct MockState {
+    token: String,
+    token_body: String,
+    ws_token: String,
     ready_status: u16,
     ready: Value,
     frontend_status: u16,
@@ -39,6 +42,9 @@ struct MockState {
 impl MockState {
     fn healthy() -> Self {
         Self {
+            token: TOKEN.to_owned(),
+            token_body: TOKEN.to_owned(),
+            ws_token: TOKEN.to_owned(),
             ready_status: 200,
             ready: json!({
                 "version": "1.0.0",
@@ -83,8 +89,8 @@ impl Drop for MockServer {
     }
 }
 
-async fn token() -> &'static str {
-    TOKEN
+async fn token(State(state): State<Arc<MockState>>) -> String {
+    state.token_body.clone()
 }
 
 async fn readyz(
@@ -94,7 +100,7 @@ async fn readyz(
     let authorized = headers
         .get("x-decky-auth")
         .and_then(|value| value.to_str().ok())
-        == Some(TOKEN);
+        == Some(state.token.as_str());
     if !authorized {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "Forbidden"})));
     }
@@ -111,8 +117,22 @@ async fn frontend(State(state): State<Arc<MockState>>) -> (StatusCode, &'static 
     )
 }
 
-async fn ws(upgrade: WebSocketUpgrade, State(state): State<Arc<MockState>>) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws(
+    upgrade: WebSocketUpgrade,
+    State(state): State<Arc<MockState>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let authorized = query.as_deref().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|pair| pair.strip_prefix("auth=") == Some(state.ws_token.as_str()))
+    });
+    if !authorized {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+    upgrade
+        .on_upgrade(move |socket| handle_socket(socket, state))
+        .into_response()
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<MockState>) {
@@ -124,6 +144,20 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<MockState>) {
             return;
         };
         let id = call.get("id").cloned().unwrap_or(Value::Null);
+        let valid_call = call.get("type").and_then(Value::as_u64) == Some(0)
+            && call.get("route").and_then(Value::as_str) == Some("utilities/ping")
+            && call
+                .get("args")
+                .is_some_and(|args| args.as_array().is_some_and(Vec::is_empty));
+        if !valid_call {
+            let error = json!({
+                "type": 2,
+                "id": id,
+                "error": {"name": "InvalidCall", "message": "expected utilities/ping CALL"},
+            });
+            let _ = socket.send(WsMessage::Text(error.to_string().into())).await;
+            return;
+        }
         let reply = match state.ping {
             PingMode::Pong => json!({"type": 1, "id": id, "result": "pong"}),
             PingMode::ErrorReply => json!({
@@ -205,7 +239,11 @@ impl Harness {
     }
 
     async fn verify(&self) -> Result<(), UpdateError> {
-        verify_ready(&self.service, &self.expected, TEST_DEADLINE).await
+        self.verify_with(TEST_DEADLINE).await
+    }
+
+    async fn verify_with(&self, deadline: Duration) -> Result<(), UpdateError> {
+        verify_ready(&self.service, &self.expected, deadline).await
     }
 }
 
@@ -324,4 +362,69 @@ async fn readiness_rejects_authenticated_ping_failure() {
         .await
         .expect_err("a failed authenticated RPC ping must not be accepted");
     assert!(matches!(err, UpdateError::ReadinessRpc(_)), "{err}");
+}
+
+#[tokio::test]
+async fn readiness_rejects_unauthorized_ws() {
+    let mut state = MockState::healthy();
+    state.ws_token = "different-ws-token".to_owned();
+    let harness = Harness::start(state).await;
+    harness.systemctl.set("invocation-2");
+
+    let started = Instant::now();
+    let err = harness
+        .verify()
+        .await
+        .expect_err("the readiness WebSocket must require the auth token");
+    let message = err.to_string();
+    assert!(matches!(err, UpdateError::ReadinessRpc(_)), "{message}");
+    assert!(!message.contains(TOKEN), "the auth token leaked: {message}");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "an unauthorized WS is a permanent failure, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_oversized_auth_token_body() {
+    let mut state = MockState::healthy();
+    state.token_body = "x".repeat(70 * 1024);
+    let harness = Harness::start(state).await;
+    harness.systemctl.set("invocation-2");
+
+    let err = harness
+        .verify()
+        .await
+        .expect_err("an oversized auth-token body must be rejected");
+    assert!(matches!(err, UpdateError::InvalidReadyResponse(_)), "{err}");
+}
+
+#[tokio::test]
+async fn readiness_does_not_retry_permanent_failures() {
+    let mut state = MockState::healthy();
+    state.ready["build_id"] = json!("build-old");
+    let harness = Harness::start(state).await;
+    harness.systemctl.set("invocation-2");
+
+    let started = Instant::now();
+    let err = harness
+        .verify_with(Duration::from_secs(2))
+        .await
+        .expect_err("the wrong build is a permanent readiness failure");
+    assert!(
+        matches!(
+            err,
+            UpdateError::ReadinessIdentityMismatch {
+                field: "build_id",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a permanent identity mismatch must not be retried, took {:?}",
+        started.elapsed()
+    );
 }

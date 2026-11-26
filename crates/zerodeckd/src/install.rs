@@ -99,7 +99,6 @@ pub struct ManagedGeneration {
     binary: PathBuf,
     python_host_path: String,
     frontend_dir: PathBuf,
-    build_id: String,
     release_version: String,
 }
 
@@ -162,6 +161,16 @@ impl ManagedGeneration {
         if release.build_id.trim().is_empty() {
             bail!("`{}` has an empty build_id", release_path.display());
         }
+        let embedded_build_id = compile_time_build_id();
+        if release.build_id != embedded_build_id {
+            bail!(
+                "`{}` build_id `{}` does not match this binary's embedded build ID `{}`; \
+                 refusing to serve a mismatched managed generation",
+                release_path.display(),
+                release.build_id,
+                embedded_build_id
+            );
+        }
         if release.version.trim().is_empty() {
             bail!("`{}` has an empty version", release_path.display());
         }
@@ -171,7 +180,6 @@ impl ManagedGeneration {
             binary,
             python_host_path,
             frontend_dir,
-            build_id: release.build_id,
             release_version: release.version,
         })
     }
@@ -179,6 +187,25 @@ impl ManagedGeneration {
     /// Resolves a generation using the process environment's path overrides.
     pub fn resolve_from_env(root: &Path) -> Result<Self> {
         Self::resolve(root, &PathOverrides::from_env())
+    }
+
+    /// Requires the running process to be this generation's packaged `bin/zerodeckd`.
+    pub fn verify_running_binary(&self) -> Result<()> {
+        let running = std::env::current_exe().context("resolve the running daemon executable")?;
+        let running = fs::canonicalize(&running)
+            .with_context(|| format!("canonicalize running daemon `{}`", running.display()))?;
+        let expected = fs::canonicalize(&self.binary)
+            .with_context(|| format!("canonicalize `{}`", self.binary.display()))?;
+        if running != expected {
+            bail!(
+                "running daemon `{}` is not the managed generation binary `{}` for `{}`; \
+                 refusing to mix the running executable with the selected generation",
+                running.display(),
+                expected.display(),
+                self.root.display()
+            );
+        }
+        Ok(())
     }
 
     /// Canonical generation root.
@@ -203,12 +230,6 @@ impl ManagedGeneration {
     #[must_use]
     pub fn frontend_dir(&self) -> &Path {
         &self.frontend_dir
-    }
-
-    /// Build identity recorded in this generation's `release.json`.
-    #[must_use]
-    pub fn build_id(&self) -> &str {
-        &self.build_id
     }
 
     /// Release version recorded in this generation's `release.json`.
@@ -324,7 +345,10 @@ mod tests {
         }
         fs::write(
             root.join("release.json"),
-            r#"{"schema":1,"build_id":"build-one","version":"0.1.0"}"#,
+            format!(
+                r#"{{"schema":1,"build_id":"{}","version":"0.1.0"}}"#,
+                super::compile_time_build_id()
+            ),
         )
         .expect("write release.json");
     }
@@ -344,7 +368,6 @@ mod tests {
         assert_eq!(resolution.binary(), root.join("bin/zerodeckd"));
         assert!(resolution.python_host_path().ends_with("/python"));
         assert_eq!(resolution.frontend_dir(), root.join("frontend"));
-        assert_eq!(resolution.build_id(), "build-one");
         assert_eq!(resolution.release_version(), "0.1.0");
     }
 
@@ -397,5 +420,39 @@ mod tests {
             .expect_err("missing release.json must fail closed")
             .to_string();
         assert!(error.contains("release.json"), "{error}");
+    }
+
+    #[test]
+    fn managed_generation_rejects_a_different_running_binary() {
+        let dir = TestDir::new("running-binary");
+        let root = dir.0.join("generation");
+        write_generation(&root);
+        let resolution =
+            ManagedGeneration::resolve(&root, &PathOverrides::default()).expect("resolve");
+
+        let error = resolution
+            .verify_running_binary()
+            .expect_err("the test process is not the generation's binary")
+            .to_string();
+        assert!(error.contains("running daemon"), "{error}");
+        assert!(error.contains("managed generation"), "{error}");
+    }
+
+    #[test]
+    fn managed_generation_rejects_a_release_build_id_that_differs_from_the_binary() {
+        let dir = TestDir::new("build-id");
+        let root = dir.0.join("generation");
+        write_generation(&root);
+        fs::write(
+            root.join("release.json"),
+            r#"{"schema":1,"build_id":"not-the-running-binary","version":"0.1.0"}"#,
+        )
+        .expect("rewrite release.json");
+
+        let error = ManagedGeneration::resolve(&root, &PathOverrides::default())
+            .expect_err("a release build ID must match the embedded binary identity")
+            .to_string();
+        assert!(error.contains("build_id"), "{error}");
+        assert!(error.contains("embedded"), "{error}");
     }
 }

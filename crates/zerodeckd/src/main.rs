@@ -344,12 +344,13 @@ fn warn_about_writable_ancestors(paths: &PlatformPaths) {
 
 fn resolve_loader_paths(
     managed: Option<&install::ManagedGeneration>,
-) -> (PythonHostConfig, Option<PathBuf>, String) {
+) -> (PythonHostConfig, Option<PathBuf>, String, String) {
     if let Some(managed) = managed {
         info!(
             generation = %managed.root().display(),
             binary = %managed.binary().display(),
             release_version = %managed.release_version(),
+            embedded_build_id = %install::compile_time_build_id(),
             "serving one immutable managed loader generation"
         );
         (
@@ -358,7 +359,8 @@ fn resolve_loader_paths(
                 ..PythonHostConfig::default()
             },
             Some(managed.frontend_dir().to_path_buf()),
-            managed.build_id().to_owned(),
+            managed.release_version().to_owned(),
+            install::compile_time_build_id(),
         )
     } else {
         (
@@ -367,6 +369,7 @@ fn resolve_loader_paths(
                 ..PythonHostConfig::default()
             },
             resolve_frontend_path(),
+            env!("CARGO_PKG_VERSION").to_owned(),
             install::compile_time_build_id(),
         )
     }
@@ -384,7 +387,7 @@ async fn run_daemon(
     #[cfg(unix)]
     warn_about_writable_ancestors(&paths);
 
-    let (python_host, frontend_dir, build_id) = resolve_loader_paths(generation.as_ref());
+    let (python_host, frontend_dir, version, build_id) = resolve_loader_paths(generation.as_ref());
     let python_host_missing = probe_python_host(&python_host).await;
     let config = ServerConfig {
         host: cli.host,
@@ -392,7 +395,7 @@ async fn run_daemon(
         cef: CefConfig::default(),
         python_host: python_host.clone(),
         frontend_dir,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version,
         build_id,
         python_host_ready: python_host_missing.is_none(),
         ..ServerConfig::default()
@@ -485,7 +488,11 @@ async fn main() -> Result<()> {
     }
 
     let managed = match cli.managed_generation.as_deref() {
-        Some(root) => Some(install::ManagedGeneration::resolve_from_env(root)?),
+        Some(root) => {
+            let managed = install::ManagedGeneration::resolve_from_env(root)?;
+            managed.verify_running_binary()?;
+            Some(managed)
+        }
         None => None,
     };
 

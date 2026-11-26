@@ -1074,14 +1074,14 @@ async fn managed_daemon_uses_one_generation() {
     write_managed_generation(
         &generation_one,
         embedded_build_id(),
-        "1.2.3",
+        env!("CARGO_PKG_VERSION"),
         "console.log('generation one frontend');\n",
         ".generation-one{}",
     );
     write_managed_generation(
         &generation_two,
-        "build-generation-two",
-        "9.9.9",
+        embedded_build_id(),
+        env!("CARGO_PKG_VERSION"),
         "console.log('generation two frontend');\n",
         ".generation-two{}",
     );
@@ -1134,7 +1134,7 @@ async fn managed_daemon_uses_one_generation() {
         assert_eq!(
             ready,
             serde_json::json!({
-                "version": "1.2.3",
+                "version": env!("CARGO_PKG_VERSION"),
                 "build_id": embedded_build_id(),
                 "python_host_ready": true,
             })
@@ -1226,12 +1226,10 @@ fn managed_daemon_rejects_conflicting_overrides() {
     write_managed_generation(
         &generation,
         embedded_build_id(),
-        "0.1.0",
+        env!("CARGO_PKG_VERSION"),
         "console.log('managed');\n",
         "body{}",
     );
-    install_generation_binary(&generation);
-    let generation_binary = generation.join("bin/zerodeckd");
     let legacy_frontend = home.0.join("legacy/frontend");
     let legacy_python = home.0.join("legacy/python");
     std::fs::create_dir_all(&legacy_frontend).expect("create legacy frontend");
@@ -1241,7 +1239,7 @@ fn managed_daemon_rejects_conflicting_overrides() {
         ("ZERODECK_FRONTEND_DIR", legacy_frontend.as_path()),
         ("PYTHONPATH", legacy_python.as_path()),
     ] {
-        let output = daemon_command_at(&generation_binary, &home, "127.0.0.1", 1)
+        let output = daemon_command(&home, "127.0.0.1", 1)
             .arg("--managed-generation")
             .arg(&generation)
             .arg("--check-config")
@@ -1257,20 +1255,6 @@ fn managed_daemon_rejects_conflicting_overrides() {
         assert!(stderr.contains(variable), "stderr: {stderr}");
         assert!(stderr.contains("--managed-generation"), "stderr: {stderr}");
     }
-
-    let output = daemon_command_at(&generation_binary, &home, "127.0.0.1", 1)
-        .arg("--managed-generation")
-        .arg(&generation)
-        .arg("--check-config")
-        .env("PYTHONPATH", generation.join("python"))
-        .env("ZERODECK_FRONTEND_DIR", generation.join("frontend"))
-        .output()
-        .expect("run --check-config with matching overrides");
-    assert!(
-        output.status.success(),
-        "overrides selecting the managed generation are allowed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
@@ -1280,19 +1264,11 @@ fn managed_daemon_rejects_a_stale_running_binary() {
     write_managed_generation(
         &generation,
         embedded_build_id(),
-        "1.0.0",
+        env!("CARGO_PKG_VERSION"),
         "console.log('managed');\n",
         "body{}",
     );
-    install_generation_binary(&generation);
-
-    let stale_binary = home.0.join("stale/bin/zerodeckd");
-    std::fs::create_dir_all(stale_binary.parent().expect("stale binary parent"))
-        .expect("create stale bin");
-    std::fs::copy(BIN, &stale_binary).expect("copy stale daemon binary");
-    make_executable(&stale_binary);
-
-    let output = daemon_command_at(&stale_binary, &home, "127.0.0.1", 1)
+    let output = daemon_command(&home, "127.0.0.1", 1)
         .arg("--managed-generation")
         .arg(&generation)
         .arg("--check-config")
@@ -1306,6 +1282,33 @@ fn managed_daemon_rejects_a_stale_running_binary() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("running daemon"), "stderr: {stderr}");
     assert!(stderr.contains("managed generation"), "stderr: {stderr}");
+}
+
+#[test]
+fn managed_daemon_rejects_a_release_version_that_differs_from_the_binary() {
+    let home = TempHome::new("managed-stale-version");
+    let generation = home.0.join("update/generations").join("e".repeat(64));
+    write_managed_generation(
+        &generation,
+        embedded_build_id(),
+        "999.999.999",
+        "console.log('managed');\n",
+        "body{}",
+    );
+    let output = daemon_command(&home, "127.0.0.1", 1)
+        .arg("--managed-generation")
+        .arg(&generation)
+        .arg("--check-config")
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run a mismatched managed version");
+    assert!(
+        !output.status.success(),
+        "a release version that differs from the binary must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("version"), "stderr: {stderr}");
+    assert!(stderr.contains("does not match"), "stderr: {stderr}");
 }
 
 #[test]

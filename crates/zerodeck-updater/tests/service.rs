@@ -1,6 +1,7 @@
 //! Readiness verification against a local mock loader and a `systemctl` seam.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,7 @@ struct MockState {
     frontend_status: u16,
     frontend_body: &'static str,
     ping: PingMode,
+    ws_failures: AtomicUsize,
 }
 
 impl MockState {
@@ -54,6 +56,7 @@ impl MockState {
             frontend_status: 200,
             frontend_body: "console.log('managed frontend');\n",
             ping: PingMode::Pong,
+            ws_failures: AtomicUsize::new(0),
         }
     }
 }
@@ -129,6 +132,10 @@ async fn ws(
     });
     if !authorized {
         return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+    if state.ws_failures.load(Ordering::SeqCst) > 0 {
+        state.ws_failures.fetch_sub(1, Ordering::SeqCst);
+        return (StatusCode::SERVICE_UNAVAILABLE, "try later").into_response();
     }
     upgrade
         .on_upgrade(move |socket| handle_socket(socket, state))
@@ -398,6 +405,19 @@ async fn readiness_rejects_oversized_auth_token_body() {
         .await
         .expect_err("an oversized auth-token body must be rejected");
     assert!(matches!(err, UpdateError::InvalidReadyResponse(_)), "{err}");
+}
+
+#[tokio::test]
+async fn readiness_retries_transient_ws_failure() {
+    let mut state = MockState::healthy();
+    state.ws_failures = AtomicUsize::new(1);
+    let harness = Harness::start(state).await;
+    harness.systemctl.set("invocation-2");
+
+    harness
+        .verify_with(Duration::from_secs(2))
+        .await
+        .expect("a transient WebSocket failure must be retried");
 }
 
 #[tokio::test]

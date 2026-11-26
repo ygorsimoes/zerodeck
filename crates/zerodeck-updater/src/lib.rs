@@ -250,9 +250,13 @@ pub enum UpdateError {
     #[error("expected frontend asset `{path}` is unavailable: {reason}")]
     FrontendAsset { path: &'static str, reason: String },
 
-    /// The authenticated readiness RPC failed.
+    /// The authenticated readiness RPC failed permanently (auth, route or protocol reply).
     #[error("authenticated readiness RPC failed: {0}")]
     ReadinessRpc(String),
+
+    /// The authenticated readiness RPC failed at the transport layer and may be retried.
+    #[error("authenticated readiness RPC transport failed: {0}")]
+    ReadinessRpcTransport(String),
 
     /// Readiness did not pass within the activation deadline.
     #[error("readiness did not pass within the {0:?} activation deadline")]

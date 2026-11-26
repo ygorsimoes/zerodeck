@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use url::Url;
 
 use crate::UpdateError;
@@ -378,12 +378,7 @@ impl SystemdService {
 
         let (mut socket, _) = tokio_tungstenite::connect_async(url.as_str())
             .await
-            .map_err(|error| {
-                UpdateError::ReadinessRpc(format!(
-                    "cannot connect to `{}`: {error}",
-                    redacted_url(&url)
-                ))
-            })?;
+            .map_err(|error| classify_ws_connect_error(&url, &error))?;
         socket
             .send(Message::Text(
                 json!({
@@ -396,7 +391,7 @@ impl SystemdService {
                 .into(),
             ))
             .await
-            .map_err(|error| UpdateError::ReadinessRpc(format!("send failed: {error}")))?;
+            .map_err(|error| UpdateError::ReadinessRpcTransport(format!("send failed: {error}")))?;
 
         loop {
             match socket.next().await {
@@ -424,11 +419,11 @@ impl SystemdService {
                 }
                 Some(Ok(Message::Ping(payload))) => {
                     socket.send(Message::Pong(payload)).await.map_err(|error| {
-                        UpdateError::ReadinessRpc(format!("pong failed: {error}"))
+                        UpdateError::ReadinessRpcTransport(format!("pong failed: {error}"))
                     })?;
                 }
                 Some(Ok(Message::Close(_)) | Err(_)) | None => {
-                    return Err(UpdateError::ReadinessRpc(
+                    return Err(UpdateError::ReadinessRpcTransport(
                         "connection closed before the ping reply".to_owned(),
                     ));
                 }
@@ -489,11 +484,24 @@ fn is_retryable_readiness_failure(error: &UpdateError) -> bool {
         UpdateError::Systemctl { .. }
         | UpdateError::ServiceNotRunning(_)
         | UpdateError::ServiceNotRestarted(_)
-        | UpdateError::ReadyHttp { .. } => true,
-        UpdateError::ReadyStatus { status, .. } => {
-            *status == 408 || *status == 429 || (500..=599).contains(status)
-        }
+        | UpdateError::ReadyHttp { .. }
+        | UpdateError::ReadinessRpcTransport(_) => true,
+        UpdateError::ReadyStatus { status, .. } => is_retryable_http_status(*status),
         _ => false,
+    }
+}
+
+fn is_retryable_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+fn classify_ws_connect_error(url: &Url, error: &WsError) -> UpdateError {
+    let message = format!("cannot connect to `{}`: {error}", redacted_url(url));
+    match error {
+        WsError::Http(response) if !is_retryable_http_status(response.status().as_u16()) => {
+            UpdateError::ReadinessRpc(message)
+        }
+        _ => UpdateError::ReadinessRpcTransport(message),
     }
 }
 
@@ -541,5 +549,11 @@ mod tests {
         assert!(!is_retryable_readiness_failure(
             &UpdateError::PythonHostNotReady
         ));
+        assert!(is_retryable_readiness_failure(
+            &UpdateError::ReadinessRpcTransport("temporary".to_owned())
+        ));
+        assert!(!is_retryable_readiness_failure(&UpdateError::ReadinessRpc(
+            "forbidden".to_owned()
+        )));
     }
 }

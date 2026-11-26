@@ -171,8 +171,15 @@ impl ManagedGeneration {
                 embedded_build_id
             );
         }
-        if release.version.trim().is_empty() {
-            bail!("`{}` has an empty version", release_path.display());
+        let binary_version = env!("CARGO_PKG_VERSION");
+        if release.version != binary_version {
+            bail!(
+                "`{}` version `{}` does not match this binary's version `{}`; refusing to serve \
+                 a mismatched managed generation",
+                release_path.display(),
+                release.version,
+                binary_version
+            );
         }
 
         Ok(Self {
@@ -346,8 +353,9 @@ mod tests {
         fs::write(
             root.join("release.json"),
             format!(
-                r#"{{"schema":1,"build_id":"{}","version":"0.1.0"}}"#,
-                super::compile_time_build_id()
+                r#"{{"schema":1,"build_id":"{}","version":"{}"}}"#,
+                super::compile_time_build_id(),
+                env!("CARGO_PKG_VERSION")
             ),
         )
         .expect("write release.json");
@@ -368,7 +376,7 @@ mod tests {
         assert_eq!(resolution.binary(), root.join("bin/zerodeckd"));
         assert!(resolution.python_host_path().ends_with("/python"));
         assert_eq!(resolution.frontend_dir(), root.join("frontend"));
-        assert_eq!(resolution.release_version(), "0.1.0");
+        assert_eq!(resolution.release_version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -439,13 +447,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_generation_rejects_a_release_version_that_differs_from_the_binary() {
+        let dir = TestDir::new("release-version");
+        let root = dir.0.join("generation");
+        write_generation(&root);
+        fs::write(
+            root.join("release.json"),
+            format!(
+                r#"{{"schema":1,"build_id":"{}","version":"999.999.999"}}"#,
+                super::compile_time_build_id()
+            ),
+        )
+        .expect("rewrite release.json");
+
+        let error = ManagedGeneration::resolve(&root, &PathOverrides::default())
+            .expect_err("a release version must match the binary version")
+            .to_string();
+        assert!(error.contains("version"), "{error}");
+        assert!(error.contains("binary"), "{error}");
+    }
+
+    #[test]
     fn managed_generation_rejects_a_release_build_id_that_differs_from_the_binary() {
         let dir = TestDir::new("build-id");
         let root = dir.0.join("generation");
         write_generation(&root);
         fs::write(
             root.join("release.json"),
-            r#"{"schema":1,"build_id":"not-the-running-binary","version":"0.1.0"}"#,
+            format!(
+                r#"{{"schema":1,"build_id":"not-the-running-binary","version":"{}"}}"#,
+                env!("CARGO_PKG_VERSION")
+            ),
         )
         .expect("rewrite release.json");
 

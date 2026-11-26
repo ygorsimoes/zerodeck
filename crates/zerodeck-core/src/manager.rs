@@ -82,9 +82,64 @@ pub struct PluginManager {
     failure_reasons: Mutex<HashMap<String, String>>,
 }
 
+/// Builds a [`PluginManager`]; everything except paths and settings has a default (no plugins,
+/// default supervisor config, this crate's version, the production HTTP policy, default limits).
+#[derive(Debug)]
+pub struct PluginManagerBuilder {
+    paths: PlatformPaths,
+    settings: SettingsManager,
+    plugins: Vec<DiscoveredPlugin>,
+    supervisor_config: SupervisorConfig,
+    loader_version: String,
+    http_client: Option<CheckedHttpClient>,
+    installer_limits: InstallerLimits,
+}
+
+impl PluginManagerBuilder {
+    /// Plugins already discovered under `plugins_dir`.
+    #[must_use]
+    pub fn plugins(mut self, plugins: Vec<DiscoveredPlugin>) -> Self {
+        self.plugins = plugins;
+        self
+    }
+
+    /// Worker supervision settings (Python host, timeouts, restart policy).
+    #[must_use]
+    pub fn supervisor_config(mut self, config: SupervisorConfig) -> Self {
+        self.supervisor_config = config;
+        self
+    }
+
+    /// Loader version reported to plugins as `DECKY_VERSION`.
+    #[must_use]
+    pub fn loader_version(mut self, version: impl Into<String>) -> Self {
+        self.loader_version = version.into();
+        self
+    }
+
+    /// Outbound HTTP client used by the installer (defaults to the production SSRF policy).
+    #[must_use]
+    pub fn http_client(mut self, client: CheckedHttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    /// Installer size and redirect limits.
+    #[must_use]
+    pub fn installer_limits(mut self, limits: InstallerLimits) -> Self {
+        self.installer_limits = limits;
+        self
+    }
+
+    /// Creates the manager and its supervisor.
+    pub fn build(self) -> Result<PluginManager, CoreError> {
+        PluginManager::from_builder(self)
+    }
+}
+
 impl PluginManager {
     /// Opens `settings/loader.json`, discovers plugins under `paths.plugins_dir()`, and initializes
-    /// the [`PluginSupervisor`].
+    /// the [`PluginSupervisor`] with the production HTTP policy and default installer limits.
     pub fn open(
         paths: PlatformPaths,
         config: SupervisorConfig,
@@ -92,41 +147,41 @@ impl PluginManager {
     ) -> Result<Self, CoreError> {
         let settings = SettingsManager::open(paths.settings_dir().join("loader.json"))?;
         let plugins = discover_plugins(&paths.plugins_dir())?;
-        Self::from_parts(paths, settings, plugins, config, loader_version)
+        Self::builder(paths, settings)
+            .plugins(plugins)
+            .supervisor_config(config)
+            .loader_version(loader_version)
+            .build()
     }
 
-    /// Constructs a [`PluginManager`] from already-loaded settings and discovered plugins using the
-    /// production outbound HTTP policy and default installer limits.
-    pub fn from_parts(
-        paths: PlatformPaths,
-        settings: SettingsManager,
-        plugins: Vec<DiscoveredPlugin>,
-        config: SupervisorConfig,
-        loader_version: impl Into<String>,
-    ) -> Result<Self, CoreError> {
-        let http_client = CheckedHttpClient::new(OutboundHttpPolicy::production())?;
-        Self::with_http_config(
+    /// Starts a [`PluginManagerBuilder`] from already-loaded settings.
+    #[must_use]
+    pub fn builder(paths: PlatformPaths, settings: SettingsManager) -> PluginManagerBuilder {
+        PluginManagerBuilder {
+            paths,
+            settings,
+            plugins: Vec::new(),
+            supervisor_config: SupervisorConfig::default(),
+            loader_version: env!("CARGO_PKG_VERSION").to_owned(),
+            http_client: None,
+            installer_limits: InstallerLimits::default(),
+        }
+    }
+
+    fn from_builder(builder: PluginManagerBuilder) -> Result<Self, CoreError> {
+        let PluginManagerBuilder {
             paths,
             settings,
             plugins,
-            config,
+            supervisor_config: config,
             loader_version,
             http_client,
-            InstallerLimits::default(),
-        )
-    }
-
-    /// Constructs a [`PluginManager`] with an explicit [`CheckedHttpClient`] and
-    /// [`InstallerLimits`].
-    pub fn with_http_config(
-        paths: PlatformPaths,
-        settings: SettingsManager,
-        plugins: Vec<DiscoveredPlugin>,
-        config: SupervisorConfig,
-        loader_version: impl Into<String>,
-        http_client: CheckedHttpClient,
-        installer_limits: InstallerLimits,
-    ) -> Result<Self, CoreError> {
+            installer_limits,
+        } = builder;
+        let http_client = match http_client {
+            Some(client) => client,
+            None => CheckedHttpClient::new(OutboundHttpPolicy::production())?,
+        };
         let supervisor = PluginSupervisor::new(paths.clone(), config)?;
         let (loader_events_tx, _) = broadcast::channel(256);
         Ok(Self {
@@ -134,7 +189,7 @@ impl PluginManager {
             settings: Mutex::new(settings),
             plugins: Mutex::new(plugins),
             supervisor,
-            loader_version: loader_version.into(),
+            loader_version,
             http_client,
             installer_limits,
             lifecycle_lock: tokio::sync::Mutex::new(()),

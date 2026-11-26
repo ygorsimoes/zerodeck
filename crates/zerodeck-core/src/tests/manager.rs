@@ -10,22 +10,18 @@ fn test_manager_with_http(
     let settings =
         SettingsManager::open(paths.settings_dir().join("loader.json")).expect("open settings");
     std::sync::Arc::new(
-        crate::PluginManager::with_http_config(
-            paths.clone(),
-            settings,
-            Vec::new(),
-            zerodeck_plugin_host::SupervisorConfig {
+        crate::PluginManager::builder(paths.clone(), settings)
+            .supervisor_config(zerodeck_plugin_host::SupervisorConfig {
                 python_host: zerodeck_plugin_host::PythonHostConfig {
                     python_bin: "python3".to_owned(),
                     host_module_path: Some(python_host_module_path()),
                 },
                 ..zerodeck_plugin_host::SupervisorConfig::default()
-            },
-            "0.1.0",
-            client,
-            crate::InstallerLimits::default(),
-        )
-        .expect("create PluginManager with_http_config"),
+            })
+            .loader_version("0.1.0")
+            .http_client(client)
+            .build()
+            .expect("build PluginManager"),
     )
 }
 
@@ -923,4 +919,23 @@ async fn plugin_manager_migrates_legacy_disabled_plugins_and_watcher_refreshes_m
 
     drop(watcher);
     manager.shutdown_all().await;
+}
+
+#[test]
+fn plugin_manager_builder_uses_production_http_policy_by_default() {
+    let dir = TestDir::new("builder-defaults");
+    let paths = manager_test_paths(&dir.0);
+    let settings =
+        SettingsManager::open(paths.settings_dir().join("loader.json")).expect("open settings");
+    let manager = crate::PluginManager::builder(paths, settings)
+        .build()
+        .expect("build manager");
+    assert!(
+        manager
+            .http_client()
+            .policy()
+            .validate_url("http://127.0.0.1:1337/")
+            .is_err()
+    );
+    assert_eq!(manager.list_plugins(), Vec::new());
 }

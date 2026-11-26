@@ -13,6 +13,7 @@ use zerodeck_core::{
 };
 use zerodeck_plugin_host::{PluginEvent, PythonHostConfig};
 
+use crate::ServerError;
 use crate::ws_sync::WsSyncCache;
 
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
@@ -90,42 +91,63 @@ struct AppStateInner {
     ws_sync_cache: Arc<WsSyncCache>,
 }
 
-impl AppState {
-    /// Creates a new [`AppState`] with a fresh ephemeral CSRF token and no plugins.
+/// Builds an [`AppState`]. See [`AppState::builder`].
+#[derive(Debug)]
+pub struct AppStateBuilder {
+    config: ServerConfig,
+    backend: PluginBackend,
+    http_client: Option<CheckedHttpClient>,
+}
+
+impl AppStateBuilder {
+    /// Serves plugins and RPC from a live [`PluginManager`].
     #[must_use]
-    pub fn new(config: ServerConfig) -> Self {
-        Self::with_plugins(config, Vec::new())
+    pub fn manager(mut self, manager: Arc<PluginManager>) -> Self {
+        self.backend = PluginBackend::Live(manager);
+        self
     }
 
-    /// Creates a new [`AppState`] preloaded with static discovered plugin metadata.
-    #[must_use]
-    pub fn with_plugins(config: ServerConfig, plugins: Vec<DiscoveredPlugin>) -> Self {
-        let http_client = build_default_http_client(&config);
-        Self::from_parts(config, PluginBackend::Static(plugins), http_client)
-    }
-
-    /// Creates a new [`AppState`] backed by a live [`PluginManager`].
-    #[must_use]
-    pub fn with_manager(config: ServerConfig, manager: Arc<PluginManager>) -> Self {
-        let http_client = build_default_http_client(&config);
-        Self::with_manager_and_http(config, manager, http_client)
-    }
-
-    /// Creates a new [`AppState`] backed by a live [`PluginManager`] and explicit [`CheckedHttpClient`].
-    #[must_use]
-    pub fn with_manager_and_http(
-        config: ServerConfig,
-        manager: Arc<PluginManager>,
-        http_client: CheckedHttpClient,
-    ) -> Self {
-        Self::from_parts(config, PluginBackend::Live(manager), http_client)
-    }
-
-    /// Test helper constructing an [`AppState`] with a custom [`CheckedHttpClient`] and no manager.
+    /// Serves a fixed list of discovered plugins without a manager (tests and tooling).
     #[doc(hidden)]
     #[must_use]
-    pub fn with_http_for_tests(config: ServerConfig, http_client: CheckedHttpClient) -> Self {
-        Self::from_parts(config, PluginBackend::Static(Vec::new()), http_client)
+    pub fn static_plugins(mut self, plugins: Vec<DiscoveredPlugin>) -> Self {
+        self.backend = PluginBackend::Static(plugins);
+        self
+    }
+
+    /// Outbound client for `/fetch` (defaults to the production SSRF policy with the configured
+    /// timeouts).
+    #[must_use]
+    pub fn http_client(mut self, client: CheckedHttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    /// Creates the state with a fresh ephemeral auth token.
+    pub fn build(self) -> Result<AppState, ServerError> {
+        let http_client = match self.http_client {
+            Some(client) => client,
+            None => OutboundHttpPolicy::production()
+                .with_timeouts(
+                    Some(self.config.fetch_connect_timeout),
+                    Some(self.config.fetch_response_timeout),
+                )
+                .build_checked_client()?,
+        };
+        Ok(AppState::from_parts(self.config, self.backend, http_client))
+    }
+}
+
+impl AppState {
+    /// Starts an [`AppStateBuilder`]; without a manager the state serves a static, empty plugin
+    /// list, and without an HTTP client it builds one with the production SSRF policy.
+    #[must_use]
+    pub fn builder(config: ServerConfig) -> AppStateBuilder {
+        AppStateBuilder {
+            config,
+            backend: PluginBackend::Static(Vec::new()),
+            http_client: None,
+        }
     }
 
     fn from_parts(
@@ -188,12 +210,23 @@ impl AppState {
     }
 }
 
-fn build_default_http_client(config: &ServerConfig) -> CheckedHttpClient {
-    OutboundHttpPolicy::production()
-        .with_timeouts(
-            Some(config.fetch_connect_timeout),
-            Some(config.fetch_response_timeout),
-        )
-        .build_checked_client()
-        .expect("build production HTTP client")
+#[cfg(test)]
+mod tests {
+    use super::{AppState, PluginBackend, ServerConfig};
+
+    #[test]
+    fn app_state_builder_defaults_to_static_empty_backend() {
+        let state = AppState::builder(ServerConfig::default())
+            .build()
+            .expect("build app state");
+        assert!(matches!(state.backend(), PluginBackend::Static(plugins) if plugins.is_empty()));
+        assert!(
+            state
+                .http_client()
+                .policy()
+                .validate_url("http://127.0.0.1:1337/")
+                .is_err(),
+            "the default client must use the production SSRF policy"
+        );
+    }
 }

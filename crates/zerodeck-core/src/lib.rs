@@ -34,7 +34,8 @@ pub use installer::{
     commit_staged_plugin, parse_install_source, prepare_staged_plugin, sanitize_directory_name,
 };
 pub use manager::{
-    LoaderEvent, PluginFileScope, PluginManager, PluginSummary, resolve_static_file,
+    LoaderEvent, PluginFileScope, PluginManager, PluginManagerBuilder, PluginSummary,
+    resolve_static_file,
 };
 pub use settings::{PendingSettings, SettingsManager};
 pub use watcher::{DebugWatcherHandle, start_debug_watcher};

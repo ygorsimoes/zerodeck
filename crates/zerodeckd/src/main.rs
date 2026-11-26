@@ -377,16 +377,14 @@ async fn run_daemon(
         ..SupervisorConfig::default()
     };
     let manager = Arc::new(
-        PluginManager::with_http_config(
-            paths,
-            settings,
-            plugins,
-            sup_config,
-            env!("CARGO_PKG_VERSION"),
-            http_client,
-            installer_limits,
-        )
-        .context("initialize plugin manager")?,
+        PluginManager::builder(paths, settings)
+            .plugins(plugins)
+            .supervisor_config(sup_config)
+            .loader_version(env!("CARGO_PKG_VERSION"))
+            .http_client(http_client)
+            .installer_limits(installer_limits)
+            .build()
+            .context("initialize plugin manager")?,
     );
     if let Some(reason) = python_host_missing {
         error!(reason = %reason, "Python worker host unavailable; backend plugins will not start");
@@ -419,11 +417,11 @@ async fn run_daemon(
         .frontend_dir
         .as_ref()
         .map(|p| p.display().to_string());
-    let state = AppState::with_manager_and_http(
-        config,
-        Arc::clone(&manager),
-        manager.http_client().clone(),
-    );
+    let state = AppState::builder(config)
+        .manager(Arc::clone(&manager))
+        .http_client(manager.http_client().clone())
+        .build()
+        .context("initialize server state")?;
 
     info!(listen = %addr, frontend_dir = ?frontend_dir, "ZeroDeck daemon listening");
     let serve_result = serve(listener, state, shutdown_signal())

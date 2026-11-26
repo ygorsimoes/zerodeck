@@ -2989,19 +2989,9 @@ class Plugin:
         manager.shutdown_all().await;
     }
 
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn install_does_not_starve_current_thread_runtime() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-        use std::time::{Duration, Instant};
-
-        let dir = TestDir::new("install-starve");
-        let paths = manager_test_paths(&dir.0);
-        let manager = test_manager_open(&paths);
-
-        // A passive plugin (no main.py) with one large, highly compressible asset: extracting it
-        // takes long enough that doing it on the async thread would stall the ticker below.
+    /// A passive plugin (no `main.py`) with one 256 MiB, highly compressible asset: extracting
+    /// it takes long enough that doing it on the async thread stalls the runtime.
+    fn big_asset_plugin_zip() -> Vec<u8> {
         let big = vec![0u8; 256 * 1024 * 1024];
         let mut buf = Cursor::new(Vec::new());
         {
@@ -3020,8 +3010,15 @@ class Plugin:
             writer.write_all(&big).expect("write big.bin");
             writer.finish().expect("finish zip");
         }
-        drop(big);
-        let zip_bytes = buf.into_inner();
+        buf.into_inner()
+    }
+
+    /// Runs `fut` while a 10 ms ticker on the same (current-thread) runtime records the longest
+    /// gap between its ticks; returns the output and that gap in milliseconds.
+    async fn with_max_stall_ms<F: std::future::Future>(fut: F) -> (F::Output, u64) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
 
         let running = Arc::new(AtomicBool::new(true));
         let max_gap_ms = Arc::new(AtomicU64::new(0));
@@ -3041,14 +3038,28 @@ class Plugin:
             })
         };
         tokio::task::yield_now().await;
-
-        let outcome =
-            install_local_zip_with_hash(&manager, &dir.0.join("home"), "big.zip", &zip_bytes).await;
-        assert_eq!(outcome.name, "BigAssets");
-
+        let output = fut.await;
         running.store(false, Ordering::SeqCst);
         ticker.await.expect("ticker task");
-        let gap = max_gap_ms.load(Ordering::SeqCst);
+        (output, max_gap_ms.load(Ordering::SeqCst))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_does_not_starve_current_thread_runtime() {
+        let dir = TestDir::new("install-starve");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+        let zip_bytes = big_asset_plugin_zip();
+
+        let (outcome, gap) = with_max_stall_ms(install_local_zip_with_hash(
+            &manager,
+            &dir.0.join("home"),
+            "big.zip",
+            &zip_bytes,
+        ))
+        .await;
+        assert_eq!(outcome.name, "BigAssets");
         assert!(
             gap < 250,
             "async runtime stalled for {gap} ms during install"

@@ -1260,21 +1260,50 @@ mod tests {
 
         #[cfg(unix)]
         #[tokio::test]
-        async fn ws_keepalive_survives_full_queue() {
+        async fn ws_in_flight_cap_runs_calls_one_at_a_time() {
+            let config = ServerConfig {
+                ws_max_in_flight_calls: 1,
+                ws_max_queued_calls: 4,
+                ..ServerConfig::default()
+            };
+            let (manager, addr, token, dir) = spawn_slow_plugin_server(config).await;
+            let mut ws = connect(addr, &token).await;
+            // With one slot, the short call must wait for the long one; running them together
+            // would answer the short call first.
+            for (id, ms) in [(1, 600), (2, 50)] {
+                ws.send(Message::Text(slow_call(id, ms).to_string().into()))
+                    .await
+                    .expect("send call");
+            }
+
+            let first = next_text_frame(&mut ws).await;
+            let second = next_text_frame(&mut ws).await;
+            assert_eq!(first["id"], json!(1));
+            assert_eq!(second["id"], json!(2));
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_keepalive_survives_flooded_queue() {
             let config = ServerConfig {
                 ws_ping_interval: Duration::from_millis(80),
                 ..tiny_limits()
             };
             let (manager, addr, token, dir) = spawn_slow_plugin_server(config).await;
             let mut ws = connect(addr, &token).await;
-            // Two 400 ms calls with one slot: the queue stays full for ~800 ms (10 intervals).
-            for (id, ms) in [(1, 400), (2, 401)] {
+            // Two 400 ms calls fill the single slot and the single queue entry for ~800 ms
+            // (10 ping intervals); the extra calls arrive while the queue is full.
+            for (id, ms) in [(1, 400), (2, 401), (3, 402), (4, 403)] {
                 ws.send(Message::Text(slow_call(id, ms).to_string().into()))
                     .await
                     .expect("send call");
             }
 
             let mut replies = 0usize;
+            let mut rejections = 0usize;
             let mut pings_seen = 0usize;
             while replies < 2 {
                 let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
@@ -1284,14 +1313,19 @@ mod tests {
                     .expect("ws frame ok");
                 match frame {
                     Message::Text(txt) => {
-                        let reply: Value = serde_json::from_str(&txt).expect("json");
-                        assert_eq!(reply["result"], json!("waited"));
-                        replies += 1;
+                        let frame: Value = serde_json::from_str(&txt).expect("json");
+                        if frame["error"]["name"] == json!("TooManyPendingCalls") {
+                            rejections += 1;
+                        } else {
+                            assert_eq!(frame["result"], json!("waited"));
+                            replies += 1;
+                        }
                     }
                     Message::Ping(_) => pings_seen += 1,
                     _ => {}
                 }
             }
+            assert_eq!(rejections, 2);
             assert!(
                 pings_seen >= 3,
                 "expected keepalive pings, saw {pings_seen}"

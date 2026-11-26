@@ -151,6 +151,19 @@ COPY crates/ crates/
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS rust-builder
+# The build identity is compiled into `zerodeckd` and recorded in the managed generation's
+# `release.json`; the daemon refuses a generation whose manifest does not match. Local builds may
+# omit it (the binary then embeds `dev`); release builds must pass an explicit value and set
+# ZERODECK_REQUIRE_BUILD_ID=1 so an unset/placeholder identity can never be published.
+ARG ZERODECK_BUILD_ID=dev
+ARG ZERODECK_REQUIRE_BUILD_ID=0
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN test -n "${ZERODECK_BUILD_ID}" \
+    && if [[ "${ZERODECK_REQUIRE_BUILD_ID}" == "1" && "${ZERODECK_BUILD_ID}" == "dev" ]]; then \
+        echo "error: release builds must set ZERODECK_BUILD_ID to a unique value" >&2; \
+        exit 1; \
+    fi
+ENV ZERODECK_BUILD_ID=${ZERODECK_BUILD_ID}
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -159,7 +172,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --release --bin zerodeckd
+    cargo build --release --bin zerodeckd --bin zerodeckctl
 
 FROM debian:bookworm-slim AS runtime
 # x-release-please-start-version
@@ -177,10 +190,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 zerodeck \
     && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin zerodeck \
-    && mkdir -p /homebrew /run/zerodeck /opt/zerodeck/python /opt/zerodeck/frontend \
+    && mkdir -p /usr/local/lib/zerodeck/bin /homebrew /run/zerodeck \
+        /opt/zerodeck/python /opt/zerodeck/frontend \
     && chown -R zerodeck:zerodeck /homebrew /run/zerodeck /opt/zerodeck
 
 COPY --from=rust-builder /app/target/release/zerodeckd /usr/local/bin/zerodeckd
+COPY --from=rust-builder /app/target/release/zerodeckctl /usr/local/lib/zerodeck/bin/zerodeckctl
 COPY hosts/python/zerodeck_py_host /opt/zerodeck/python/zerodeck_py_host
 COPY --from=frontend-builder /app/frontend/dist /opt/zerodeck/frontend
 

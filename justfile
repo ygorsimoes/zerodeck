@@ -180,35 +180,34 @@ smoke *flags="--build":
     echo
     echo "smoke: zerodeckd is healthy"
 
-# Package a release tarball + SHA256SUMS from a runtime image into dist/
+# Package the manual/diagnostic tarball, the managed TUF generation archive and SHA256SUMS from one
+# runtime image into dist/. Set ZERODECK_BUILD_ID for a real release.
 [group('runtime')]
 dist tag image="zerodeck:runtime":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    case "$(docker image inspect --format '{{{{.Architecture}}' '{{ image }}')" in
-        amd64) arch=x86_64 ;;
-        arm64) arch=aarch64 ;;
-        *) echo "unsupported image architecture" >&2; exit 1 ;;
-    esac
-    name="zerodeck-{{ tag }}-linux-${arch}"
-    stage="dist/${name}"
-    rm -rf "${stage}" "dist/${name}.tar.gz"
-    mkdir -p "${stage}/bin" "${stage}/python" "${stage}/frontend" "${stage}/systemd"
-    cid="$(docker create '{{ image }}')"
-    trap 'docker rm -f "${cid}" >/dev/null 2>&1 || true' EXIT
-    docker cp "${cid}:/usr/local/bin/zerodeckd" "${stage}/bin/zerodeckd"
-    docker cp "${cid}:/opt/zerodeck/python/." "${stage}/python/"
-    docker cp "${cid}:/opt/zerodeck/frontend/." "${stage}/frontend/"
-    cp deploy/systemd/zerodeck.service "${stage}/systemd/zerodeck.service"
-    cp LICENSE "${stage}/LICENSE"
-    tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-    (cd dist && sha256sum "${name}.tar.gz" > SHA256SUMS.txt)
-    echo "dist/${name}.tar.gz"
+    just _dist all "{{ tag }}" "{{ image }}"
+
+# Package only the managed generation archive (archive root: release.json, bin, python, frontend)
+[group('runtime')]
+dist-managed tag image="zerodeck:runtime":
+    just _dist managed "{{ tag }}" "{{ image }}"
+
+# Validate the exact bytes of a release archive, its checksums and the failure/retry boundaries
+[group('runtime')]
+test-release-package archive:
+    just _test-release-package "{{ archive }}"
+
+[private]
+_dist mode tag image:
+    bash deploy/update/package-release.sh "{{ mode }}" "{{ tag }}" "{{ image }}" dist
+
+[private]
+_test-release-package archive:
+    bash deploy/update/tests/release.sh "{{ archive }}"
 
 # ─── Implementations (run where the public recipe decided: container or native) ─────────────────
 
 [private]
-_check: _fmt-check _clippy _doc _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test
+_check: _fmt-check _clippy _doc _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test _release-scripts
 
 [private]
 _fmt: _fe-deps
@@ -240,6 +239,12 @@ _test-privileged:
         exit 1
     fi
     cargo test --workspace --locked -- --ignored privileged_
+
+[private]
+_release-scripts:
+    bash deploy/update/tests/bootstrap.sh
+    bash deploy/update/tests/publish.sh
+    bash deploy/update/tests/promotion.sh
 
 [private]
 _coverage:

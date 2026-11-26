@@ -1,0 +1,223 @@
+name: Promote TUF authorization
+
+# Runs only after the immutable GitHub release exists. It verifies the already-published bytes and
+# their build provenance, then asks the external TUF-on-CI repository to sign and promote that exact
+# target. No container build, release artifact rebuild, or signing key lives in this workflow.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to promote (e.g. v0.1.0)
+        required: true
+        type: string
+      channel:
+        description: Signed loader channel
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - testing
+
+permissions: {}
+
+concurrency:
+  group: tuf-promotion-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify-and-request:
+    name: Verify published bytes and request TUF signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Checkout the released scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: Resolve promotion inputs
+        id: promotion
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          MIN_UPDATER: ${{ vars.TUF_MIN_UPDATER || '0.1.0' }}
+          TUF_REPOSITORY: ${{ vars.TUF_ON_CI_REPOSITORY }}
+          TUF_TOKEN: ${{ secrets.TUF_PROMOTION_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || {
+            echo "not a release SemVer tag: ${tag}" >&2
+            exit 1
+          }
+          channel="${INPUT_CHANNEL:-}"
+          if [[ -z "${channel}" ]]; then
+            if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+              channel=testing
+            else
+              channel=stable
+            fi
+          fi
+          [[ "${channel}" == "stable" || "${channel}" == "testing" ]] || {
+            echo "invalid channel: ${channel}" >&2
+            exit 1
+          }
+          [[ -n "${TUF_REPOSITORY}" ]] || {
+            echo "TUF_ON_CI_REPOSITORY is not configured; refusing to pretend a promotion happened" >&2
+            exit 1
+          }
+          [[ -n "${TUF_TOKEN}" ]] || {
+            echo "TUF_PROMOTION_TOKEN is not configured; no signing authority is available" >&2
+            exit 1
+          }
+          {
+            echo "tag=${tag}"
+            echo "channel=${channel}"
+            echo "min_updater=${MIN_UPDATER}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Download the published release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.promotion.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern "zerodeck-${TAG}-linux-x86_64.tar.gz" --dir dist
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern "zerodeck-${TAG}-linux-x86_64.managed.tar.gz" --dir dist
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern "SHA256SUMS.txt" --dir dist
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+      - name: Validate the exact published archives
+        env:
+          TAG: ${{ steps.promotion.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${TAG}"
+          ZERODECK_EXPECTED_VERSION="${tag#v}" \
+            bash deploy/update/tests/release.sh --validate-only \
+              "dist/zerodeck-${tag}-linux-x86_64.tar.gz"
+          ZERODECK_EXPECTED_VERSION="${tag#v}" \
+            bash deploy/update/tests/release.sh --validate-only \
+              "dist/zerodeck-${tag}-linux-x86_64.managed.tar.gz"
+
+      - name: Verify GitHub build provenance for the published archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.promotion.outputs.tag }}
+        run: |
+          set -euo pipefail
+          archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
+          gh attestation verify "${archive}" --repo "${GITHUB_REPOSITORY}" --format json \
+            >attestation-raw.json
+          digest="$(sha256sum "${archive}" | awk '{print $1}')"
+          printf '{"verified":true,"sha256":"%s","source":"%s"}\n' \
+            "${digest}" "${GITHUB_REPOSITORY}" >attestation.json
+          cat attestation.json
+
+      - name: Render and verify the promotion request
+        id: request
+        env:
+          TAG: ${{ steps.promotion.outputs.tag }}
+          CHANNEL: ${{ steps.promotion.outputs.channel }}
+          MIN_UPDATER: ${{ steps.promotion.outputs.min_updater }}
+        run: |
+          set -euo pipefail
+          archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
+          digest="$(sha256sum "${archive}" | awk '{print $1}')"
+          build_id="$(python3 - "${archive}" <<'PY'
+          import json, sys, tarfile
+          with tarfile.open(sys.argv[1], "r:gz") as handle:
+              print(json.load(handle.extractfile("release.json"))["build_id"])
+          PY
+          )"
+          bash deploy/update/promote.sh \
+            --archive "${archive}" --sha256 "${digest}" \
+            --tag "${TAG}" --version "${TAG#v}" --channel "${CHANNEL}" \
+            --min-updater "${MIN_UPDATER}" --build-id "${build_id}" \
+            --attestation attestation.json --verify-only | tee target-descriptor.txt
+
+      - name: Write the external signing request
+        env:
+          TAG: ${{ steps.promotion.outputs.tag }}
+          CHANNEL: ${{ steps.promotion.outputs.channel }}
+          MIN_UPDATER: ${{ steps.promotion.outputs.min_updater }}
+          TUF_REPOSITORY: ${{ vars.TUF_ON_CI_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
+          digest="$(sha256sum "${archive}" | awk '{print $1}')"
+          size="$(wc -c <"${archive}" | tr -d ' ')"
+          version="${TAG#v}"
+          build_id="$(python3 - "${archive}" <<'PY'
+          import json, sys, tarfile
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              print(json.load(archive.extractfile("release.json"))["build_id"])
+          PY
+          )"
+          python3 - "${TAG}" "${version}" "${build_id}" "${CHANNEL}" "${MIN_UPDATER}" \
+            "${digest}" "${size}" "${TUF_REPOSITORY}" >promotion-request.json <<'PY'
+          import json, os, sys
+          tag, version, build_id, channel, min_updater, digest, size, tuf_repository = sys.argv[1:9]
+          document = {
+              "schema": 1,
+              "tag": tag,
+              "version": version,
+              "build_id": build_id,
+              "channel": channel,
+              "min_updater": min_updater,
+              "target": f"linux-x86_64/zerodeck-{version}.tar.gz",
+              "sha256": digest,
+              "length": int(size),
+              "source_repository": os.environ["GITHUB_REPOSITORY"],
+              "source_release": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{tag}",
+              "tuf_repository": tuf_repository,
+          }
+          print(json.dumps(document, indent=2))
+          PY
+          cat promotion-request.json
+
+      - name: Upload the promotion request evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tuf-promotion-request
+          path: |
+            promotion-request.json
+            attestation-raw.json
+            target-descriptor.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Dispatch the request to the external TUF-on-CI repository
+        env:
+          GH_TOKEN: ${{ secrets.TUF_PROMOTION_TOKEN }}
+          TUF_REPOSITORY: ${{ vars.TUF_ON_CI_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN}" || -z "${TUF_REPOSITORY}" ]]; then
+            echo "TUF promotion authority is not configured" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          payload = {"event_type": "zerodeck-loader-release", "client_payload": json.load(open("promotion-request.json"))}
+          json.dump(payload, open("dispatch.json", "w"))
+          PY
+          gh api --method POST "repos/${TUF_REPOSITORY}/dispatches" --input dispatch.json
+          echo "promotion requested; the external TUF repository must sign and publish before Stable resolves to this version"

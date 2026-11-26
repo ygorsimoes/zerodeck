@@ -13,7 +13,8 @@ use zerodeck_updater::{
     ACTIVATION_DEADLINE, APPLY_UNIT, ApplyRequestStore, AuthorizedRelease, Catalog, Channel,
     DAEMON_UNIT, GenerationId, GenerationStore, RecoveryMode, SelectionPolicy, StateStore,
     SystemdService, UpdateError, UpgradeOutcome, acquire_maintenance_exclusive, apply_pending,
-    enqueue_rollback, enqueue_upgrade, recover, recover_before_boot, stage_release,
+    bootstrap_generation, enqueue_rollback, enqueue_upgrade, recover, recover_before_boot,
+    stage_release,
 };
 
 const DEFAULT_ROOT: &str = "/var/lib/zerodeck";
@@ -70,6 +71,18 @@ enum Command {
     Status,
     /// Request offline restoration of the retained rollback target.
     Rollback,
+    /// Administrative first install or conversion to an already extracted verified generation.
+    Bootstrap {
+        /// Generation digest extracted under the update root's `generations/` directory.
+        #[arg(long)]
+        generation: String,
+        /// Retain an existing active generation as the rollback target.
+        #[arg(long)]
+        convert_existing_zerodeck: bool,
+        /// Validate refusal conditions and print the plan without changing state.
+        #[arg(long)]
+        check: bool,
+    },
     /// Remove a digest from the failed-trial quarantine after it was reviewed.
     Unquarantine {
         /// Quarantined generation digest.
@@ -115,6 +128,11 @@ async fn run(cli: Cli) -> Result<(), UpdateError> {
         Command::Upgrade { start } => run_upgrade(&cli.root, start).await,
         Command::Status => run_status(&cli.root),
         Command::Rollback => run_rollback(&cli.root).await,
+        Command::Bootstrap {
+            generation,
+            convert_existing_zerodeck,
+            check,
+        } => run_bootstrap(&cli.root, &generation, convert_existing_zerodeck, check),
         Command::Unquarantine { digest } => run_unquarantine(&cli.root, &digest),
         Command::Apply => run_apply(&cli.root).await,
         Command::RecoverAfterApply => {
@@ -216,6 +234,41 @@ async fn run_rollback(root: &Path) -> Result<(), UpdateError> {
     let (store, state, _service) = open_runtime(root)?;
     let request = enqueue_rollback(&store, &state)?;
     start_apply_and_report(&state, &request.generation).await
+}
+
+fn run_bootstrap(
+    root: &Path,
+    generation: &str,
+    convert: bool,
+    check: bool,
+) -> Result<(), UpdateError> {
+    let outcome = bootstrap_generation(root, generation, convert, check)?;
+    if check {
+        println!(
+            "zerodeckctl: bootstrap check passed for {} (previous: {}, rollback: {})",
+            outcome.generation,
+            outcome
+                .previous
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            outcome
+                .rollback_target
+                .map_or_else(|| "none".to_owned(), |value| value.to_string())
+        );
+    } else if outcome.changed {
+        println!(
+            "zerodeckctl: bootstrapped {} (rollback: {})",
+            outcome.generation,
+            outcome
+                .rollback_target
+                .map_or_else(|| "none".to_owned(), |value| value.to_string())
+        );
+    } else {
+        println!(
+            "zerodeckctl: generation {} is already active",
+            outcome.generation
+        );
+    }
+    Ok(())
 }
 
 fn run_unquarantine(root: &Path, digest: &str) -> Result<(), UpdateError> {

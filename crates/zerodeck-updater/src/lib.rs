@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod activation;
+mod bootstrap;
 mod catalog;
 mod generation;
 mod request;
@@ -23,6 +24,7 @@ pub use activation::{
     acquire_maintenance_exclusive, acquire_maintenance_shared, apply_pending, apply_pending_with,
     enqueue_rollback, enqueue_upgrade, recover, recover_before_boot, recover_with,
 };
+pub use bootstrap::{BootstrapOutcome, bootstrap_generation};
 pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
 pub use generation::{GenerationId, GenerationLayout, GenerationRelease, GenerationStore};
 pub use request::{APPLY_REQUEST_SCHEMA, ApplyKind, ApplyRequest, ApplyRequestStore};
@@ -240,6 +242,10 @@ pub enum UpdateError {
     /// The managed service is stopped and activation requires an explicit start.
     #[error("the managed service is stopped; rerun the command with `--start` to activate")]
     StartRequired,
+
+    /// An administrative bootstrap cannot safely replace the current controller or generation.
+    #[error("bootstrap refused: {0}")]
+    BootstrapRefused(String),
 
     /// No release is authorized by the persisted trusted metadata.
     #[error("no staged release is authorized; run `zerodeckctl update` first")]

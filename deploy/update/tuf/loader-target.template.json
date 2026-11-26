@@ -1,0 +1,16 @@
+{
+  "targets": {
+    "linux-x86_64/zerodeck-__VERSION__.tar.gz": {
+      "length": __LENGTH__,
+      "hashes": {
+        "sha256": "__SHA256__"
+      },
+      "custom": {
+        "channel": "__CHANNEL__",
+        "version": "__VERSION__",
+        "build_id": "__BUILD_ID__",
+        "min_updater": "__MIN_UPDATER__"
+      }
+    }
+  }
+}

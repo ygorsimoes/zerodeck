@@ -1058,7 +1058,10 @@ mod tests {
         )
         .await
         .expect_err("slow response must hit CheckedHttpClient response timeout");
-        assert!(matches!(err_timeout, CoreError::HttpRequest(_)));
+        assert!(
+            matches!(err_timeout, CoreError::HttpTimeout(_)),
+            "expected HttpTimeout, got {err_timeout:?}"
+        );
 
         server.abort();
     }

@@ -578,6 +578,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    async fn fetch_status_for(upstream_port: u16, path: &str) -> StatusCode {
+        let policy =
+            zerodeck_core::OutboundHttpPolicy::for_loopback_ports_for_testing(vec![upstream_port])
+                .with_timeouts(None, Some(std::time::Duration::from_millis(200)));
+        let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
+        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let token = state.csrf_token().to_owned();
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/fetch?fetch_url=http://127.0.0.1:{upstream_port}{path}"
+                    ))
+                    .header("X-Decky-Auth", &token)
+                    .body(Body::empty())
+                    .expect("fetch req"),
+            )
+            .await
+            .expect("fetch resp")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_maps_upstream_timeout_to_504() {
+        let slow = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow upstream");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move { axum::serve(listener, slow).await });
+
+        assert_eq!(
+            fetch_status_for(port, "/slow").await,
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_maps_connection_refused_to_502() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        assert_eq!(
+            fetch_status_for(port, "/gone").await,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
     async fn spawn_mock_upstream() -> std::net::SocketAddr {
         use axum::routing::{get, post};
         let mock = axum::Router::new()

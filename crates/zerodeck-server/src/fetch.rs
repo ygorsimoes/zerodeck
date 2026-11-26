@@ -69,7 +69,7 @@ pub async fn handle_fetch(
     let req_body = if body_bytes.is_empty() {
         None
     } else {
-        Some(reqwest::Body::from(body_bytes.to_vec()))
+        Some(reqwest::Body::from(body_bytes))
     };
 
     match send_checked_request(
@@ -84,15 +84,8 @@ pub async fn handle_fetch(
     {
         Ok(upstream) => stream_upstream_response(upstream),
         Err(CoreError::HttpPolicy(msg)) => (StatusCode::FORBIDDEN, msg).into_response(),
-        Err(CoreError::HttpRequest(msg)) => {
-            let lower = msg.to_ascii_lowercase();
-            let status = if lower.contains("timed out") || lower.contains("timeout") {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            (status, msg).into_response()
-        }
+        Err(CoreError::HttpTimeout(msg)) => (StatusCode::GATEWAY_TIMEOUT, msg).into_response(),
+        Err(CoreError::HttpRequest(msg)) => (StatusCode::BAD_GATEWAY, msg).into_response(),
         Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     }
 }

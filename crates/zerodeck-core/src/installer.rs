@@ -646,7 +646,13 @@ async fn download_bounded_bytes(
     let mut buf = Vec::with_capacity(cap);
 
     while let Some(chunk) = response.chunk().await.map_err(|err| {
-        CoreError::HttpRequest(format!("failed reading response body from `{url}`: {err}"))
+        if err.is_timeout() {
+            CoreError::HttpTimeout(format!(
+                "timed out reading response body from `{url}`: {err}"
+            ))
+        } else {
+            CoreError::HttpRequest(format!("failed reading response body from `{url}`: {err}"))
+        }
     })? {
         if chunk.len() > max_bytes.saturating_sub(buf.len()) {
             return Err(CoreError::DownloadSizeExceeded { max_bytes });

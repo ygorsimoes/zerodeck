@@ -1,0 +1,361 @@
+use std::collections::BTreeSet;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
+
+use crate::{UpdateError, UpdateState};
+
+const GENERATIONS_DIR: &str = "generations";
+const CURRENT_FILE: &str = "current";
+
+/// A validated lowercase SHA-256 generation digest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GenerationId(String);
+
+impl GenerationId {
+    /// Validates a lowercase 64-character SHA-256 hex digest.
+    pub fn new(value: impl Into<String>) -> Result<Self, UpdateError> {
+        let value = value.into();
+        let valid = value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid {
+            return Err(UpdateError::InvalidGenerationId(value));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the digest as a lowercase hex string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GenerationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for GenerationId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for GenerationId {
+    type Err = UpdateError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for GenerationId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GenerationId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Immutable loader generations under one owned root and their active reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationStore {
+    root: PathBuf,
+    generations: PathBuf,
+    current: PathBuf,
+}
+
+impl GenerationStore {
+    /// Opens the generation store rooted at `root`, creating its generations directory.
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, UpdateError> {
+        let requested = root.as_ref();
+        let root = fs::canonicalize(requested).map_err(|source| UpdateError::Io {
+            path: requested.to_path_buf(),
+            source,
+        })?;
+
+        let generations = root.join(GENERATIONS_DIR);
+        fs::create_dir_all(&generations).map_err(|source| UpdateError::Io {
+            path: generations.clone(),
+            source,
+        })?;
+        let generations = fs::canonicalize(&generations).map_err(|source| UpdateError::Io {
+            path: generations,
+            source,
+        })?;
+        if !generations.starts_with(&root) {
+            return Err(UpdateError::PathEscape {
+                path: generations,
+                root,
+            });
+        }
+
+        Ok(Self {
+            current: root.join(CURRENT_FILE),
+            root,
+            generations,
+        })
+    }
+
+    /// Returns the directory reserved for `generation`.
+    #[must_use]
+    pub fn generation_dir(&self, generation: &GenerationId) -> PathBuf {
+        self.generations.join(generation.as_str())
+    }
+
+    /// Reads the active generation reference, or `None` before the first switch.
+    pub fn current(&self) -> Result<Option<GenerationId>, UpdateError> {
+        let reference = match fs::read_to_string(&self.current) {
+            Ok(reference) => reference,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(UpdateError::Io {
+                    path: self.current.clone(),
+                    source,
+                });
+            }
+        };
+        let generation = GenerationId::new(reference.trim())?;
+        self.ensure_generation(&generation)?;
+        Ok(Some(generation))
+    }
+
+    /// Atomically switches the active reference to `generation`.
+    pub fn switch_to(&self, generation: &GenerationId) -> Result<(), UpdateError> {
+        self.switch_to_with(generation, sync_directory)
+    }
+
+    /// Switches the active reference using `sync_directory` as the durability barrier.
+    ///
+    /// This exists so fault tests can observe the window where the rename is already visible but
+    /// its directory sync fails. Production callers use [`Self::switch_to`].
+    #[doc(hidden)]
+    pub fn switch_to_with<F>(
+        &self,
+        generation: &GenerationId,
+        sync_directory: F,
+    ) -> Result<(), UpdateError>
+    where
+        F: FnOnce(&Path) -> io::Result<()>,
+    {
+        self.ensure_generation(generation)?;
+
+        let temp = self
+            .root
+            .join(format!(".{CURRENT_FILE}.tmp.{}", Uuid::new_v4()));
+        let write_result = (|| -> io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(generation.as_str().as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp, &self.current)?;
+            Ok(())
+        })();
+
+        if let Err(source) = write_result {
+            let _ = fs::remove_file(&temp);
+            return Err(UpdateError::Io {
+                path: self.current.clone(),
+                source,
+            });
+        }
+
+        sync_directory(&self.root).map_err(|source| UpdateError::Io {
+            path: self.root.clone(),
+            source,
+        })
+    }
+
+    /// Deletes generations that are neither confirmed, a rollback target, nor pending.
+    pub fn gc(&self, state: &UpdateState) -> Result<(), UpdateError> {
+        let mut keep = BTreeSet::new();
+        if let Some(generation) = &state.last_confirmed {
+            keep.insert(generation.clone());
+        }
+        if let Some(generation) = &state.rollback_target {
+            keep.insert(generation.clone());
+        }
+        if let Some(pending) = &state.pending {
+            if let Some(previous) = &pending.previous {
+                keep.insert(previous.clone());
+            }
+            keep.insert(pending.candidate.clone());
+        }
+
+        let entries = fs::read_dir(&self.generations).map_err(|source| UpdateError::Io {
+            path: self.generations.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| UpdateError::Io {
+                path: self.generations.clone(),
+                source,
+            })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(generation) = GenerationId::new(name) else {
+                continue;
+            };
+            if keep.contains(&generation) {
+                continue;
+            }
+
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| UpdateError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            fs::remove_dir_all(&path).map_err(|source| UpdateError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+
+        sync_directory(&self.generations).map_err(|source| UpdateError::Io {
+            path: self.generations.clone(),
+            source,
+        })
+    }
+
+    fn ensure_generation(&self, generation: &GenerationId) -> Result<(), UpdateError> {
+        let path = self.generation_dir(generation);
+        let canonical = match fs::canonicalize(&path) {
+            Ok(canonical) => canonical,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                return Err(UpdateError::MissingGeneration(generation.clone()));
+            }
+            Err(source) => return Err(UpdateError::Io { path, source }),
+        };
+
+        if !canonical.starts_with(&self.generations) {
+            return Err(UpdateError::PathEscape {
+                path: canonical,
+                root: self.root.clone(),
+            });
+        }
+        let metadata = fs::metadata(&canonical).map_err(|source| UpdateError::Io {
+            path: canonical.clone(),
+            source,
+        })?;
+        if !metadata.is_dir() {
+            return Err(UpdateError::MissingGeneration(generation.clone()));
+        }
+        Ok(())
+    }
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use uuid::Uuid;
+
+    use super::{GenerationId, GenerationStore};
+    use crate::{PendingTransaction, TransactionPhase, UpdateError, UpdateState};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "zerodeck-generation-{label}-{}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("create temp test dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn generation_id(fill: char) -> GenerationId {
+        GenerationId::new(fill.to_string().repeat(64)).expect("valid generation id")
+    }
+
+    #[test]
+    fn generation_id_requires_lowercase_sha256_hex() {
+        assert!(GenerationId::new("a".repeat(64)).is_ok());
+        for invalid in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+            let err = GenerationId::new(invalid).expect_err("must reject invalid digest");
+            assert!(matches!(err, UpdateError::InvalidGenerationId(_)));
+        }
+    }
+
+    #[test]
+    fn gc_keeps_confirmed_rollback_and_pending_generations() {
+        let dir = TestDir::new("gc");
+        let store = GenerationStore::new(&dir.0).expect("open generation store");
+        let confirmed = generation_id('a');
+        let rollback = generation_id('b');
+        let pending_previous = generation_id('c');
+        let pending_candidate = generation_id('d');
+        let orphan = generation_id('e');
+        for generation in [
+            &confirmed,
+            &rollback,
+            &pending_previous,
+            &pending_candidate,
+            &orphan,
+        ] {
+            fs::create_dir(store.generation_dir(generation)).expect("create generation");
+        }
+
+        let state = UpdateState {
+            last_confirmed: Some(confirmed.clone()),
+            rollback_target: Some(rollback.clone()),
+            pending: Some(PendingTransaction {
+                id: Uuid::new_v4(),
+                previous: Some(pending_previous.clone()),
+                candidate: pending_candidate.clone(),
+                phase: TransactionPhase::Switched,
+                was_running: true,
+            }),
+            ..UpdateState::new()
+        };
+
+        store.gc(&state).expect("collect stale generations");
+
+        for generation in [&confirmed, &rollback, &pending_previous, &pending_candidate] {
+            assert!(
+                store.generation_dir(generation).is_dir(),
+                "protected generation {generation} must survive"
+            );
+        }
+        assert!(!store.generation_dir(&orphan).exists());
+    }
+}

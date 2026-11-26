@@ -22,6 +22,12 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 
+[profile.release]
+# Smaller, faster daemon binary. panic stays "unwind": a panicking task must not abort the daemon.
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
 [workspace.dependencies]
 # x-release-please-start-version
 zerodeck-protocol = { version = "0.1.0", path = "crates/zerodeck-protocol" }

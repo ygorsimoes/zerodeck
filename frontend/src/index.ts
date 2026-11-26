@@ -1,3 +1,4 @@
+import { daemonOrigin, webSocketBase } from './origin.ts';
 import { WSRouter } from './wsrouter.ts';
 
 declare global {
@@ -8,8 +9,11 @@ declare global {
   }
 }
 
+// The daemon serves this bundle, so its URL names the daemon's host and port.
+const origin = daemonOrigin(import.meta.url);
+
 async function fetchAuthToken(): Promise<string> {
-  const res = await fetch('http://127.0.0.1:1337/auth/token');
+  const res = await fetch(`${origin}/auth/token`);
   if (!res.ok) {
     throw new Error(`auth token request failed with HTTP ${res.status}`);
   }
@@ -21,6 +25,9 @@ async function fetchAuthToken(): Promise<string> {
 
 // `start()` retries with backoff until zerodeckd is reachable, so the UI recovers even when Steam
 // loads before the daemon is listening.
-const router = new WSRouter({ refreshAuthToken: fetchAuthToken });
+const router = new WSRouter({
+  baseUrl: webSocketBase(origin),
+  refreshAuthToken: fetchAuthToken,
+});
 window.DeckyBackend = router;
 router.start();

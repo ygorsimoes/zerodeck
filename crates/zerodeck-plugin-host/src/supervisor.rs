@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
-use zerodeck_platform::{PlatformPaths, PrivilegeTarget};
+use zerodeck_platform::{PlatformPaths, PrivilegeTarget, lock_unpoisoned};
 use zerodeck_protocol::{PluginIpcFromWorker, PluginIpcToWorker};
 
 #[cfg(unix)]
@@ -1068,12 +1068,6 @@ fn fail_pending_calls(pending: &SharedPendingCalls) {
     for tx in waiters {
         let _ = tx.send(Err(HostError::WorkerStopped));
     }
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

@@ -120,7 +120,7 @@ impl SettingsManager {
     ///
     /// Callers write the result with [`PendingSettings::write`] (blocking I/O) and then commit it
     /// with [`SettingsManager::apply`], so readers never wait on `fsync`.
-    pub fn prepare_update<F>(&self, mutate: F) -> Result<Option<PendingSettings>, CoreError>
+    pub(crate) fn prepare_update<F>(&self, mutate: F) -> Result<Option<PendingSettings>, CoreError>
     where
         F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
     {
@@ -137,14 +137,14 @@ impl SettingsManager {
     }
 
     /// Makes a successfully written [`PendingSettings`] the current in-memory values.
-    pub fn apply(&mut self, pending: PendingSettings) {
+    pub(crate) fn apply(&mut self, pending: PendingSettings) {
         self.values = pending.values;
     }
 }
 
 /// Settings computed by [`SettingsManager::prepare_update`], waiting to be written and applied.
 #[derive(Debug)]
-pub struct PendingSettings {
+pub(crate) struct PendingSettings {
     values: Map<String, Value>,
     bytes: Vec<u8>,
     path: PathBuf,
@@ -152,7 +152,7 @@ pub struct PendingSettings {
 
 impl PendingSettings {
     /// Atomically writes these settings to disk (temp file, `fsync`, rename, directory sync).
-    pub fn write(&self) -> Result<(), CoreError> {
+    pub(crate) fn write(&self) -> Result<(), CoreError> {
         atomic_write(&self.path, &self.bytes)?;
         Ok(())
     }

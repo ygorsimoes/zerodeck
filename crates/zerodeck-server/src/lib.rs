@@ -1,13 +1,18 @@
 //! Axum HTTP and WebSocket server foundation for `ZeroDeck`.
 
+#![forbid(unsafe_code)]
+
 mod auth;
 mod error;
 mod fetch;
-mod router;
+mod routes;
+mod state;
+mod ws;
 mod ws_sync;
 
 pub use error::ServerError;
-pub use router::{AppState, ServerConfig, build_router, serve};
+pub use routes::{build_router, serve};
+pub use state::{AppState, AppStateBuilder, ServerConfig};
 pub use ws_sync::WsSyncCache;
 
 #[cfg(test)]
@@ -22,7 +27,9 @@ mod tests {
 
     #[tokio::test]
     async fn server_auth_health_and_csrf_middleware_behave_as_specced() {
-        let state = AppState::new(ServerConfig::default());
+        let state = AppState::builder(ServerConfig::default())
+            .build()
+            .expect("build app state");
         let expected_token = state.csrf_token().to_owned();
         let app = build_router(state);
 
@@ -115,7 +122,11 @@ mod tests {
     }
 
     async fn status_for_host(host: &str) -> StatusCode {
-        let app = build_router(AppState::new(ServerConfig::default()));
+        let app = build_router(
+            AppState::builder(ServerConfig::default())
+                .build()
+                .expect("build app state"),
+        );
         app.oneshot(
             Request::builder()
                 .uri("/auth/token")
@@ -164,12 +175,12 @@ mod tests {
     fn redacted_uri_hides_auth_token_but_keeps_other_query_params() {
         let uri: axum::http::Uri = "/ws?foo=1&auth=secret-token&bar=2".parse().expect("uri");
         assert_eq!(
-            crate::router::redacted_uri(&uri),
+            crate::routes::redacted_uri(&uri),
             "/ws?foo=1&auth=[redacted]&bar=2"
         );
 
         let plain: axum::http::Uri = "/healthz".parse().expect("uri");
-        assert_eq!(crate::router::redacted_uri(&plain), "/healthz");
+        assert_eq!(crate::routes::redacted_uri(&plain), "/healthz");
     }
 
     async fn get_status(app: &axum::Router, uri: &str, header: Option<&str>) -> StatusCode {
@@ -186,7 +197,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_auth_paths_require_a_valid_token() {
-        let state = AppState::new(ServerConfig::default());
+        let state = AppState::builder(ServerConfig::default())
+            .build()
+            .expect("build app state");
         let token = state.csrf_token().to_owned();
         let app = build_router(state);
 
@@ -214,7 +227,11 @@ mod tests {
 
     #[tokio::test]
     async fn percent_encoded_traversal_is_not_treated_as_public() {
-        let app = build_router(AppState::new(ServerConfig::default()));
+        let app = build_router(
+            AppState::builder(ServerConfig::default())
+                .build()
+                .expect("build app state"),
+        );
         for uri in [
             "/plugins/demo/assets/%2e%2e/%2e%2e/secret",
             "/plugins/demo/assets/%2E%2e/secret",
@@ -301,7 +318,11 @@ mod tests {
             ("webm", "video/webm"),
         ] {
             let path = std::path::PathBuf::from(format!("file.{ext}"));
-            assert_eq!(crate::router::mime_for_path(&path), mime, "{ext}");
+            assert_eq!(
+                crate::routes::static_files::mime_for_path(&path),
+                mime,
+                "{ext}"
+            );
         }
     }
 
@@ -311,7 +332,7 @@ mod tests {
             name: "Alpha".to_owned(),
             directory: "alpha".to_owned(),
         };
-        match crate::router::core_error_to_ws(7, err) {
+        match crate::ws::errors::core_error_to_ws(7, err) {
             zerodeck_protocol::WsServerMessage::Error { id, error } => {
                 assert_eq!(id, 7);
                 assert_eq!(error.name, "DuplicatePluginNameError");
@@ -330,7 +351,12 @@ mod tests {
             frontend_dir: Some(frontend),
             ..ServerConfig::default()
         };
-        let app = build_router(AppState::with_manager(cfg, mgr));
+        let app = build_router(
+            AppState::builder(cfg)
+                .manager(mgr)
+                .build()
+                .expect("build app state"),
+        );
         for method in ["GET", "HEAD"] {
             let (st, hdrs, _) = call_get(&app, method, "/plugins/Demo/assets/a.png").await;
             assert_eq!(st, StatusCode::OK);
@@ -349,7 +375,12 @@ mod tests {
             frontend_dir: Some(frontend),
             ..ServerConfig::default()
         };
-        let app = build_router(AppState::with_manager(cfg, mgr));
+        let app = build_router(
+            AppState::builder(cfg)
+                .manager(mgr)
+                .build()
+                .expect("build app state"),
+        );
         let uri = "/plugins/Demo/assets/a.png";
         let (_, hdrs, _) = call_get(&app, "GET", uri).await;
         let lm = hdrs
@@ -391,7 +422,12 @@ mod tests {
             frontend_dir: Some(frontend),
             ..ServerConfig::default()
         };
-        let app = build_router(AppState::with_manager(cfg, mgr));
+        let app = build_router(
+            AppState::builder(cfg)
+                .manager(mgr)
+                .build()
+                .expect("build app state"),
+        );
         // RFC 7232 section 3.3: a date later than the server's current time is invalid.
         let future = httpdate::fmt_http_date(
             std::time::SystemTime::now() + std::time::Duration::from_hours(24),
@@ -418,7 +454,12 @@ mod tests {
             frontend_dir: Some(frontend),
             ..ServerConfig::default()
         };
-        let app = build_router(AppState::with_manager(cfg, mgr));
+        let app = build_router(
+            AppState::builder(cfg)
+                .manager(mgr)
+                .build()
+                .expect("build app state"),
+        );
         for uri in ["/plugins/Demo/frontend_bundle", "/plugins/load_main/Demo"] {
             let (_, hdrs, _) = call_get(&app, "GET", uri).await;
             let lm = hdrs
@@ -504,7 +545,12 @@ mod tests {
             frontend_dir: Some(frontend),
             ..ServerConfig::default()
         };
-        let app = build_router(AppState::with_manager(cfg, mgr));
+        let app = build_router(
+            AppState::builder(cfg)
+                .manager(mgr)
+                .build()
+                .expect("build app state"),
+        );
 
         for (uri, mime, expected_body) in [
             (
@@ -571,7 +617,11 @@ mod tests {
             assert_eq!(st, StatusCode::NOT_FOUND, "{missing}");
         }
 
-        let no_fe_app = build_router(AppState::new(ServerConfig::default()));
+        let no_fe_app = build_router(
+            AppState::builder(ServerConfig::default())
+                .build()
+                .expect("build app state"),
+        );
         let (st, _, _) = call_get(&no_fe_app, "GET", "/static/app.css").await;
         assert_eq!(st, StatusCode::NOT_FOUND);
 
@@ -583,7 +633,10 @@ mod tests {
             zerodeck_core::OutboundHttpPolicy::for_loopback_ports_for_testing(vec![upstream_port])
                 .with_timeouts(None, Some(std::time::Duration::from_millis(200)));
         let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
-        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let state = AppState::builder(ServerConfig::default())
+            .http_client(client)
+            .build()
+            .expect("build app state");
         let token = state.csrf_token().to_owned();
         build_router(state)
             .oneshot(
@@ -731,7 +784,10 @@ mod tests {
             mock_addr.port(),
         ]);
         let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
-        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let state = AppState::builder(ServerConfig::default())
+            .http_client(client)
+            .build()
+            .expect("build app state");
         let token = state.csrf_token().to_owned();
         let app = build_router(state);
 
@@ -830,7 +886,10 @@ mod tests {
             mock_addr.port(),
         ]);
         let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
-        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let state = AppState::builder(ServerConfig::default())
+            .http_client(client)
+            .build()
+            .expect("build app state");
         let token = state.csrf_token().to_owned();
         let app = build_router(state);
 
@@ -885,7 +944,7 @@ mod tests {
         async fn spawn_server(config: ServerConfig) -> (SocketAddr, String) {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
-            let state = AppState::new(config);
+            let state = AppState::builder(config).build().expect("build app state");
             let token = state.csrf_token().to_owned();
             tokio::spawn(serve(listener, state, std::future::pending()));
             (addr, token)
@@ -1039,7 +1098,10 @@ mod tests {
         ) -> (SocketAddr, String) {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
-            let state = AppState::with_manager(config, manager);
+            let state = AppState::builder(config)
+                .manager(manager)
+                .build()
+                .expect("build app state");
             let token = state.csrf_token().to_owned();
             tokio::spawn(serve(listener, state, std::future::pending()));
             (addr, token)
@@ -1530,7 +1592,10 @@ class Plugin:
             );
             manager.start_all().await.expect("start_all");
 
-            let state = AppState::with_manager(ServerConfig::default(), manager.clone());
+            let state = AppState::builder(ServerConfig::default())
+                .manager(manager.clone())
+                .build()
+                .expect("build app state");
             let token = state.csrf_token().to_owned();
             let app = crate::build_router(state);
 

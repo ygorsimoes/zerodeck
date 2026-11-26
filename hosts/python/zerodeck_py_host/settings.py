@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -70,18 +71,30 @@ class SettingsManager:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp_path, self.path)
+                _fsync_directory(self.settings_directory)
             except BaseException:
-                try:
+                with suppress(OSError):
                     tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
                 raise
 
-    def getSetting(self, key: str, default: Any = None) -> Any:  # noqa: N802
+    def getSetting(self, key: str, default: Any = None) -> Any:
         with self._lock:
             return self.settings.get(key, default)
 
-    def setSetting(self, key: str, value: Any) -> None:  # noqa: N802
+    def setSetting(self, key: str, value: Any) -> None:
         with self._lock:
             self.settings[key] = value
         self.commit()
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flushes a directory entry change (the rename above) to disk, where the platform allows it."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        with suppress(OSError):
+            os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)

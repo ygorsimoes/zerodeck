@@ -28,6 +28,7 @@ uuid.workspace = true
 zerodeck-cef.workspace = true
 zerodeck-core.workspace = true
 zerodeck-plugin-host.workspace = true
+zerodeck-platform.workspace = true
 zerodeck-protocol.workspace = true
 
 [dev-dependencies]
@@ -35,5 +36,4 @@ futures-util.workspace = true
 hex.workspace = true
 sha2.workspace = true
 tokio-tungstenite.workspace = true
-zerodeck-platform.workspace = true
 zip.workspace = true

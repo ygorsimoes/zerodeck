@@ -1,5 +1,8 @@
 //! Steam Chromium Embedded Framework (CEF) CDP discovery and injection foundation.
 
+// `deny`, not `forbid`: Phase 4 CDP work may need a reviewed `#[allow(unsafe_code)]`.
+#![deny(unsafe_code)]
+
 mod error;
 mod tab;
 

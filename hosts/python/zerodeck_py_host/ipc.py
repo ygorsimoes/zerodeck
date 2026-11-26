@@ -4,6 +4,7 @@ import asyncio
 import json
 import socket
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any
 
 IPC_READER_LIMIT = 4 * 1024 * 1024  # 4 MiB line buffer for large plugin IPC payloads
@@ -76,7 +77,5 @@ class JsonLineTransport:
 
     async def close(self) -> None:
         self._writer.close()
-        try:
+        with suppress(OSError):
             await self._writer.wait_closed()
-        except OSError:
-            pass

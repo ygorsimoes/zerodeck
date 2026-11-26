@@ -9,6 +9,13 @@ pub enum PlatformError {
     #[error("path `{candidate}` escapes allowed root `{root}`")]
     PathEscape { candidate: PathBuf, root: PathBuf },
 
+    /// Target path lies outside every root of a multi-root path jail.
+    #[error("path `{candidate}` is outside the allowed roots {roots:?}")]
+    PathOutsideRoots {
+        candidate: PathBuf,
+        roots: Vec<PathBuf>,
+    },
+
     /// No canonical root could be resolved for a path-jail set.
     #[error("no valid root paths configured")]
     EmptyRootSet,

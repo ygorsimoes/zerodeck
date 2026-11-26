@@ -12,6 +12,7 @@ use uuid::Uuid;
 use zerodeck_platform::{PlatformError, PlatformPaths, SafePath, SafePathSet, atomic_write};
 use zerodeck_protocol::{PackageManifest, PluginManifest};
 
+use crate::blocking::run_blocking;
 use crate::{
     CheckedHttpClient, CoreError, DEFAULT_MAX_REDIRECTS, ExtractLimits, InstallSource,
     extract_zip_safely_with_limits, send_checked_request, verify_sha256_policy,
@@ -22,21 +23,6 @@ pub const DEFAULT_MAX_ZIP_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 /// Default maximum size of a single `remote_binary` download (256 MiB).
 pub const DEFAULT_MAX_REMOTE_BINARY_BYTES: usize = 256 * 1024 * 1024;
-
-/// Runs blocking filesystem or CPU-heavy work on tokio's blocking pool so it never stalls the
-/// async runtime (WebSocket keepalives, concurrent RPCs).
-pub(crate) async fn run_blocking<T, F>(work: F) -> Result<T, CoreError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, CoreError> + Send + 'static,
-{
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|join_err| CoreError::Io {
-            path: PathBuf::new(),
-            source: std::io::Error::other(format!("blocking task failed: {join_err}")),
-        })?
-}
 
 /// Source of a plugin archive to stage and install.
 #[derive(Debug, Clone, PartialEq, Eq)]

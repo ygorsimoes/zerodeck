@@ -122,10 +122,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1 0.10.7",
+ "sha1",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite 0.29.0",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -433,7 +433,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1174,7 +1174,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1358,7 +1358,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1415,7 +1415,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1576,17 +1576,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
-]
-
-[[package]]
-name = "sha1"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.1",
- "digest 0.11.3",
 ]
 
 [[package]]
@@ -1821,19 +1810,7 @@ dependencies = [
  "futures-util",
  "log",
  "tokio",
- "tungstenite 0.29.0",
-]
-
-[[package]]
-name = "tokio-tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
- "tungstenite 0.30.0",
+ "tungstenite",
 ]
 
 [[package]]
@@ -2005,23 +1982,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
- "sha1 0.10.7",
- "thiserror",
-]
-
-[[package]]
-name = "tungstenite"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.10.4",
- "sha1 0.11.0",
+ "sha1",
  "thiserror",
 ]
 
@@ -2242,7 +2203,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2396,7 +2357,7 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
- "tokio-tungstenite 0.30.0",
+ "tokio-tungstenite",
  "zerodeck-protocol",
 ]
 
@@ -2470,7 +2431,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
- "tokio-tungstenite 0.30.0",
+ "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http 0.7.1",
@@ -2496,7 +2457,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.30.0",
+ "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
  "zerodeck-cef",

@@ -6,6 +6,7 @@ import shutil
 import time
 import types
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -56,10 +57,8 @@ def _build_logger(plugin_name: str, log_dir: str) -> tuple[logging.Logger, str]:
             reverse=True,
         )
         for stale in existing_logs[4:]:
-            try:
+            with suppress(OSError):
                 stale.unlink()
-            except OSError:
-                pass
 
         timestamp = time.strftime("%Y-%m-%d %H.%M.%S")
         target_log = log_path / f"{timestamp}.log"

@@ -7,14 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
 use tracing::{info_span, warn};
-use zerodeck_platform::{OwnershipViolation, PlatformError, PlatformPaths, SafePath};
+use zerodeck_platform::{
+    OwnershipViolation, PlatformError, PlatformPaths, SafePath, lock_unpoisoned,
+};
 use zerodeck_plugin_host::{
     HostError, PluginEvent, PluginSpawnSpec, PluginState, PluginSupervisor, SupervisorConfig,
 };
 use zerodeck_protocol::PluginLoadType;
 
+use crate::blocking::run_blocking;
 use crate::discovery::discover_single_plugin;
-use crate::installer::run_blocking;
 use crate::preflight::{PreflightInput, preflight};
 use crate::settings::insert_dotted;
 use crate::{
@@ -80,9 +82,64 @@ pub struct PluginManager {
     failure_reasons: Mutex<HashMap<String, String>>,
 }
 
+/// Builds a [`PluginManager`]; everything except paths and settings has a default (no plugins,
+/// default supervisor config, this crate's version, the production HTTP policy, default limits).
+#[derive(Debug)]
+pub struct PluginManagerBuilder {
+    paths: PlatformPaths,
+    settings: SettingsManager,
+    plugins: Vec<DiscoveredPlugin>,
+    supervisor_config: SupervisorConfig,
+    loader_version: String,
+    http_client: Option<CheckedHttpClient>,
+    installer_limits: InstallerLimits,
+}
+
+impl PluginManagerBuilder {
+    /// Plugins already discovered under `plugins_dir`.
+    #[must_use]
+    pub fn plugins(mut self, plugins: Vec<DiscoveredPlugin>) -> Self {
+        self.plugins = plugins;
+        self
+    }
+
+    /// Worker supervision settings (Python host, timeouts, restart policy).
+    #[must_use]
+    pub fn supervisor_config(mut self, config: SupervisorConfig) -> Self {
+        self.supervisor_config = config;
+        self
+    }
+
+    /// Loader version reported to plugins as `DECKY_VERSION`.
+    #[must_use]
+    pub fn loader_version(mut self, version: impl Into<String>) -> Self {
+        self.loader_version = version.into();
+        self
+    }
+
+    /// Outbound HTTP client used by the installer (defaults to the production SSRF policy).
+    #[must_use]
+    pub fn http_client(mut self, client: CheckedHttpClient) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    /// Installer size and redirect limits.
+    #[must_use]
+    pub fn installer_limits(mut self, limits: InstallerLimits) -> Self {
+        self.installer_limits = limits;
+        self
+    }
+
+    /// Creates the manager and its supervisor.
+    pub fn build(self) -> Result<PluginManager, CoreError> {
+        PluginManager::from_builder(self)
+    }
+}
+
 impl PluginManager {
     /// Opens `settings/loader.json`, discovers plugins under `paths.plugins_dir()`, and initializes
-    /// the [`PluginSupervisor`].
+    /// the [`PluginSupervisor`] with the production HTTP policy and default installer limits.
     pub fn open(
         paths: PlatformPaths,
         config: SupervisorConfig,
@@ -90,41 +147,41 @@ impl PluginManager {
     ) -> Result<Self, CoreError> {
         let settings = SettingsManager::open(paths.settings_dir().join("loader.json"))?;
         let plugins = discover_plugins(&paths.plugins_dir())?;
-        Self::from_parts(paths, settings, plugins, config, loader_version)
+        Self::builder(paths, settings)
+            .plugins(plugins)
+            .supervisor_config(config)
+            .loader_version(loader_version)
+            .build()
     }
 
-    /// Constructs a [`PluginManager`] from already-loaded settings and discovered plugins using the
-    /// production outbound HTTP policy and default installer limits.
-    pub fn from_parts(
-        paths: PlatformPaths,
-        settings: SettingsManager,
-        plugins: Vec<DiscoveredPlugin>,
-        config: SupervisorConfig,
-        loader_version: impl Into<String>,
-    ) -> Result<Self, CoreError> {
-        let http_client = CheckedHttpClient::new(OutboundHttpPolicy::production())?;
-        Self::with_http_config(
+    /// Starts a [`PluginManagerBuilder`] from already-loaded settings.
+    #[must_use]
+    pub fn builder(paths: PlatformPaths, settings: SettingsManager) -> PluginManagerBuilder {
+        PluginManagerBuilder {
+            paths,
+            settings,
+            plugins: Vec::new(),
+            supervisor_config: SupervisorConfig::default(),
+            loader_version: env!("CARGO_PKG_VERSION").to_owned(),
+            http_client: None,
+            installer_limits: InstallerLimits::default(),
+        }
+    }
+
+    fn from_builder(builder: PluginManagerBuilder) -> Result<Self, CoreError> {
+        let PluginManagerBuilder {
             paths,
             settings,
             plugins,
-            config,
+            supervisor_config: config,
             loader_version,
             http_client,
-            InstallerLimits::default(),
-        )
-    }
-
-    /// Constructs a [`PluginManager`] with an explicit [`CheckedHttpClient`] and
-    /// [`InstallerLimits`].
-    pub fn with_http_config(
-        paths: PlatformPaths,
-        settings: SettingsManager,
-        plugins: Vec<DiscoveredPlugin>,
-        config: SupervisorConfig,
-        loader_version: impl Into<String>,
-        http_client: CheckedHttpClient,
-        installer_limits: InstallerLimits,
-    ) -> Result<Self, CoreError> {
+            installer_limits,
+        } = builder;
+        let http_client = match http_client {
+            Some(client) => client,
+            None => CheckedHttpClient::new(OutboundHttpPolicy::production())?,
+        };
         let supervisor = PluginSupervisor::new(paths.clone(), config)?;
         let (loader_events_tx, _) = broadcast::channel(256);
         Ok(Self {
@@ -132,7 +189,7 @@ impl PluginManager {
             settings: Mutex::new(settings),
             plugins: Mutex::new(plugins),
             supervisor,
-            loader_version: loader_version.into(),
+            loader_version,
             http_client,
             installer_limits,
             lifecycle_lock: tokio::sync::Mutex::new(()),
@@ -821,6 +878,11 @@ impl PluginManager {
     /// Applies `mutate` to a copy of the settings, writes it on the blocking pool, then makes it
     /// current. Writes are ordered by `settings_writer`; readers keep seeing the previous values
     /// until the write succeeds and never wait on `fsync`.
+    ///
+    /// Not cancel-safe: if this future is dropped while the write runs, the file may hold the
+    /// new values while memory keeps the old ones until the next write. Call it only from tasks
+    /// that run to completion (every caller today runs in a detached WebSocket or lifecycle
+    /// task).
     async fn persist_settings<F>(&self, mutate: F) -> Result<(), CoreError>
     where
         F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
@@ -1055,10 +1117,4 @@ fn strip_name_from_array_key(map: &mut Map<String, Value>, key: &str, name: &str
     let before = items.len();
     items.retain(|entry| entry.as_str() != Some(name));
     items.len() != before
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

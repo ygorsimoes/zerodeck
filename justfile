@@ -310,7 +310,7 @@ _fe-build: _fe-deps
 
 [private]
 _fe-test: _fe-deps
-    node --test frontend/tests/wsrouter.test.ts
+    node --test frontend/tests/
 
 [private]
 _fuzz target seconds:

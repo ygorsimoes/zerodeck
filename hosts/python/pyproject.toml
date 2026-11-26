@@ -14,7 +14,11 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ASYNC", "C4", "PIE"]
+
+[tool.ruff.lint.per-file-ignores]
+# Async test cases set up fixtures with ordinary blocking file and process calls.
+"tests/*" = ["ASYNC"]
 
 [tool.pyright]
 pythonVersion = "3.10"

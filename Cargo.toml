@@ -43,7 +43,7 @@ axum = { version = "0.8.9", features = ["ws"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "stream", "json"] }
-tokio-tungstenite = "0.30.0"
+tokio-tungstenite = "0.29.0"
 tokio-util = { version = "0.7.20", features = ["io"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["async-await", "sink", "std"] }
 url = "2.5.9"

@@ -106,9 +106,9 @@ impl SafePathSet {
         if self.roots.iter().any(|root| canonical.starts_with(root)) {
             Ok(canonical)
         } else {
-            Err(PlatformError::PathEscape {
+            Err(PlatformError::PathOutsideRoots {
                 candidate: canonical,
-                root: self.roots[0].clone(),
+                roots: self.roots.clone(),
             })
         }
     }

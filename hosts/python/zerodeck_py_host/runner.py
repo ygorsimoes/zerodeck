@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -38,6 +39,8 @@ class PluginRunner:
         self.plugin: Any = None
         self.uninstalling = False
         self.main_task: asyncio.Task[Any] | None = None
+        self.main_thread: threading.Thread | None = None
+        self._stopping = False
         self._decky_logger: Any = None
         self._stop_event: asyncio.Event | None = stop_event
 
@@ -111,10 +114,49 @@ class PluginRunner:
                         return await awaitable
 
                     self.main_task = asyncio.create_task(_await_task(coro))
+                self.main_task.add_done_callback(self._log_main_task_result)
             else:
-                self.main_task = asyncio.create_task(self._invoke("_main"))
-            self.main_task.add_done_callback(self._log_main_task_result)
+                # A synchronous _main cannot be cancelled. Running it in a daemon thread (not the
+                # default executor, which asyncio.run waits for) lets the worker exit on shutdown.
+                self.main_thread = threading.Thread(
+                    target=self._run_sync_main,
+                    args=(callable_fn, prefix, asyncio.get_running_loop()),
+                    name=f"{self.plugin_name}-main",
+                    daemon=True,
+                )
+                self.main_thread.start()
             await asyncio.sleep(0)
+
+    def _run_sync_main(
+        self,
+        callable_fn: Callable[..., Any],
+        prefix: tuple[Any, ...],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        try:
+            result = callable_fn(*prefix)
+            if inspect.isawaitable(result):
+                # A plain function returning a coroutine (e.g. `async def _main` behind an
+                # ordinary decorator): run it on the event loop like an async _main.
+                loop.call_soon_threadsafe(self._adopt_main_awaitable, result)
+        except Exception as exc:
+            if self._decky_logger is not None:
+                self._decky_logger.error(
+                    "plugin _main task failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+    def _adopt_main_awaitable(self, awaitable: Awaitable[Any]) -> None:
+        if self._stopping:
+            if inspect.iscoroutine(awaitable):
+                awaitable.close()
+            return
+
+        async def _await_main() -> Any:
+            return await awaitable
+
+        self.main_task = asyncio.get_running_loop().create_task(_await_main())
+        self.main_task.add_done_callback(self._log_main_task_result)
 
     def _log_main_task_result(self, task: asyncio.Task[Any]) -> None:
         if task.cancelled():
@@ -127,6 +169,7 @@ class PluginRunner:
             )
 
     async def stop_lifecycle(self) -> None:
+        self._stopping = True
         if self.main_task is not None and not self.main_task.done():
             self.main_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -185,7 +228,7 @@ class PluginRunner:
                 else:
                     raise ValueError("args must be a JSON array")
                 response["res"] = await self._invoke(method_name, args=tuple(args))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             response["success"] = False
             response["res"] = str(exc)
             response["error"] = _error_detail(exc)
@@ -235,10 +278,8 @@ async def _run_worker(args: argparse.Namespace) -> None:
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop_event.set)
-            except NotImplementedError:
-                pass
 
         serve_task = asyncio.create_task(transport.serve(runner.handle_message))
         stop_task = asyncio.create_task(stop_event.wait())

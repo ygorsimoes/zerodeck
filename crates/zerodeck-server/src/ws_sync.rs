@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
+use zerodeck_platform::lock_unpoisoned;
 use zerodeck_protocol::{WsCallPayload, WsServerMessage};
 
 /// Namespace for cached WS calls. The frontend restarts call ids at 1 on every page load, so each
@@ -262,12 +263,6 @@ impl WsSyncCache {
 fn canonical_key(scope: SyncScope, call: &WsCallPayload) -> WsSyncKey {
     let args_json = serde_json::to_string(&call.args).unwrap_or_default();
     (scope, call.id, call.route.clone(), args_json)
-}
-
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
-    "test": "node --test tests/wsrouter.test.ts"
+    "test": "node --test tests/"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.9",

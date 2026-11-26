@@ -24,6 +24,7 @@ use crate::{GenerationId, UpdateError};
 pub const LOADER_TARGET_ARCH: &str = "linux-x86_64";
 
 const TUF_DATASTORE_DIR: &str = "tuf";
+const STATE_DIR: &str = "state";
 const CATALOG_STATE_FILE: &str = "catalog.json";
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,7 +41,9 @@ pub enum Channel {
 }
 
 impl Channel {
-    fn parse(value: &str) -> Option<Self> {
+    /// Parses the two signed channel names.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "stable" => Some(Self::Stable),
             "testing" => Some(Self::Testing),
@@ -216,7 +219,8 @@ impl Catalog {
                 root: update_root,
             });
         }
-        let state_store = CatalogStateStore::new(update_root.join(CATALOG_STATE_FILE));
+        let state_store =
+            CatalogStateStore::new(update_root.join(STATE_DIR).join(CATALOG_STATE_FILE));
 
         let previous = state_store.read()?;
         let now = now_seconds()?;
@@ -275,7 +279,7 @@ impl Catalog {
             path: requested.to_path_buf(),
             source,
         })?;
-        let state = CatalogStateStore::new(root.join(CATALOG_STATE_FILE));
+        let state = CatalogStateStore::new(root.join(STATE_DIR).join(CATALOG_STATE_FILE));
         let persisted = state.read()?;
         Ok(Self {
             repository: None,
@@ -317,6 +321,11 @@ impl Catalog {
             self.state.write(&next)?;
         }
         Ok(selected)
+    }
+
+    /// Returns the release selected by the freshest trusted metadata, without network access.
+    pub fn persisted_authorization(&self) -> Result<Option<AuthorizedRelease>, UpdateError> {
+        Ok(self.state.read()?.authorization)
     }
 
     /// Revalidates a staged release against the freshest local authorization without network access.

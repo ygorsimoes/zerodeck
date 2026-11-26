@@ -20,6 +20,8 @@ pub const ACTIVATION_DEADLINE: Duration = Duration::from_secs(60);
 const READINESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
+const SYSTEMCTL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+const SYSTEMCTL_START_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TOKEN_PATH: &str = "/auth/token";
 const READY_PATH: &str = "/readyz";
 const FRONTEND_ASSET_PATH: &str = "/frontend/index.js";
@@ -31,10 +33,43 @@ const MAX_FRONTEND_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Boxed future returned by [`Systemctl`] operations.
 pub type SystemctlFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, UpdateError>> + Send + 'a>>;
 
-/// Process seam for the `systemctl` queries used by activation.
+/// Process seam for the `systemctl` queries and transitions used by activation.
+///
+/// The default implementations fail closed so older mocks that only provide
+/// [`Systemctl::invocation_id`] keep compiling without gaining process powers.
 pub trait Systemctl: std::fmt::Debug + Send + Sync {
     /// Returns the unit's current systemd `InvocationID`, or an empty string when inactive.
     fn invocation_id<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, String>;
+
+    /// Returns whether the unit is currently active.
+    fn is_active<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, bool> {
+        Box::pin(async move {
+            Err(UpdateError::SystemctlUnsupported {
+                unit: unit.to_owned(),
+                operation: "is-active",
+            })
+        })
+    }
+
+    /// Stops the unit and waits for it to become inactive.
+    fn stop<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
+        Box::pin(async move {
+            Err(UpdateError::SystemctlUnsupported {
+                unit: unit.to_owned(),
+                operation: "stop",
+            })
+        })
+    }
+
+    /// Starts the unit without waiting for its readiness notification.
+    fn start<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
+        Box::pin(async move {
+            Err(UpdateError::SystemctlUnsupported {
+                unit: unit.to_owned(),
+                operation: "start",
+            })
+        })
+    }
 }
 
 /// Production [`Systemctl`] backed by the host's `systemctl` binary.
@@ -44,29 +79,98 @@ pub struct TokioSystemctl;
 impl Systemctl for TokioSystemctl {
     fn invocation_id<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, String> {
         Box::pin(async move {
-            let mut command = tokio::process::Command::new("systemctl");
-            command
-                .args(["show", "--property=InvocationID", "--value", "--", unit])
-                .kill_on_drop(true);
-            let output = tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.output())
-                .await
-                .map_err(|_| UpdateError::Systemctl {
-                    unit: unit.to_owned(),
-                    reason: format!("timed out after {SYSTEMCTL_TIMEOUT:?}"),
-                })?
-                .map_err(|error| UpdateError::Systemctl {
-                    unit: unit.to_owned(),
-                    reason: error.to_string(),
-                })?;
+            let output = run_systemctl(
+                unit,
+                "invocation-id",
+                &["show", "--property=InvocationID", "--value"],
+                SYSTEMCTL_TIMEOUT,
+            )
+            .await?;
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(UpdateError::Systemctl {
-                    unit: unit.to_owned(),
-                    reason: format!("exited with {}: {}", output.status, stderr.trim()),
-                });
+                return Err(systemctl_status_error(unit, "invocation-id", &output));
             }
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         })
+    }
+
+    fn is_active<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, bool> {
+        Box::pin(async move {
+            let output = run_systemctl(
+                unit,
+                "is-active",
+                &["is-active", "--quiet"],
+                SYSTEMCTL_TIMEOUT,
+            )
+            .await?;
+            match output.status.code() {
+                Some(0) => Ok(true),
+                Some(3 | 4) => Ok(false),
+                _ => Err(systemctl_status_error(unit, "is-active", &output)),
+            }
+        })
+    }
+
+    fn stop<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
+        Box::pin(async move {
+            let output = run_systemctl(unit, "stop", &["stop"], SYSTEMCTL_STOP_TIMEOUT).await?;
+            if !output.status.success() {
+                return Err(systemctl_status_error(unit, "stop", &output));
+            }
+            Ok(())
+        })
+    }
+
+    fn start<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
+        Box::pin(async move {
+            // Readiness is owned by `verify_ready`; do not let systemd's default start timeout
+            // outlive the activation deadline.
+            let output = run_systemctl(
+                unit,
+                "start",
+                &["start", "--no-block"],
+                SYSTEMCTL_START_TIMEOUT,
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(systemctl_status_error(unit, "start", &output));
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn run_systemctl(
+    unit: &str,
+    operation: &'static str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, UpdateError> {
+    let mut command = tokio::process::Command::new("systemctl");
+    command.args(args).args(["--", unit]).kill_on_drop(true);
+    tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| UpdateError::Systemctl {
+            unit: unit.to_owned(),
+            operation,
+            reason: format!("timed out after {timeout:?}"),
+        })?
+        .map_err(|error| UpdateError::Systemctl {
+            unit: unit.to_owned(),
+            operation,
+            reason: error.to_string(),
+        })
+}
+
+fn systemctl_status_error(
+    unit: &str,
+    operation: &'static str,
+    output: &std::process::Output,
+) -> UpdateError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    UpdateError::Systemctl {
+        unit: unit.to_owned(),
+        operation,
+        reason: format!("exited with {}: {}", output.status, stderr.trim()),
     }
 }
 
@@ -151,6 +255,21 @@ impl SystemdService {
             .map_err(|_| UpdateError::ReadinessStatePoisoned)?;
         *baseline = Some(invocation);
         Ok(())
+    }
+
+    /// Returns whether the managed daemon is currently active.
+    pub async fn is_active(&self) -> Result<bool, UpdateError> {
+        self.systemctl.is_active(&self.unit).await
+    }
+
+    /// Stops the managed daemon and waits for it to become inactive.
+    pub async fn stop(&self) -> Result<(), UpdateError> {
+        self.systemctl.stop(&self.unit).await
+    }
+
+    /// Starts the managed daemon without waiting for readiness.
+    pub async fn start(&self) -> Result<(), UpdateError> {
+        self.systemctl.start(&self.unit).await
     }
 
     fn baseline(&self) -> Result<Option<String>, UpdateError> {

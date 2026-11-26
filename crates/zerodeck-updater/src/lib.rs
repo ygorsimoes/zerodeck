@@ -2,8 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod activation;
 mod catalog;
 mod generation;
+mod request;
 pub mod service;
 mod stage;
 mod state;
@@ -16,8 +18,14 @@ use semver::Version;
 use thiserror::Error;
 use zerodeck_platform::PlatformError;
 
+pub use activation::{
+    APPLY_UNIT, ActivationCheckpoint, ActivationFault, DAEMON_UNIT, RecoveryMode, UpgradeOutcome,
+    acquire_maintenance_exclusive, acquire_maintenance_shared, apply_pending, apply_pending_with,
+    enqueue_rollback, enqueue_upgrade, recover,
+};
 pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
-pub use generation::{GenerationId, GenerationStore};
+pub use generation::{GenerationId, GenerationLayout, GenerationRelease, GenerationStore};
+pub use request::{APPLY_REQUEST_SCHEMA, ApplyKind, ApplyRequest, ApplyRequestStore};
 pub use service::{
     ACTIVATION_DEADLINE, ReleaseIdentity, Systemctl, SystemctlFuture, SystemdService,
     TokioSystemctl, verify_ready,
@@ -194,9 +202,101 @@ pub enum UpdateError {
     #[error("cached generation `{0}` is incomplete or corrupt")]
     CorruptGeneration(GenerationId),
 
-    /// A `systemctl` query for the activation service failed.
-    #[error("systemctl query for `{unit}` failed: {reason}")]
-    Systemctl { unit: String, reason: String },
+    /// Another maintenance operation holds the shared/exclusive guard.
+    #[error("another ZeroDeck maintenance operation is in progress")]
+    Busy,
+
+    /// The privileged apply unit has no request to consume.
+    #[error("no apply request is pending")]
+    MissingApplyRequest,
+
+    /// The single apply request slot already holds an unconsumed request.
+    #[error("an apply request is already pending")]
+    RequestPending,
+
+    /// The apply request document is malformed or unsafe.
+    #[error("invalid apply request: {0}")]
+    InvalidApplyRequest(String),
+
+    /// The request was prepared for a different active generation.
+    #[error("stale apply request: prepared for active `{expected:?}` but `{found:?}` is active")]
+    StaleRequest {
+        expected: Option<GenerationId>,
+        found: Option<GenerationId>,
+    },
+
+    /// A transaction is already in flight for this state.
+    #[error("another activation transaction is already in flight")]
+    DuplicateTransaction,
+
+    /// The request kind does not match the persisted target it names.
+    #[error("the apply request kind does not match the persisted generation role")]
+    RequestKindMismatch,
+
+    /// The requested generation was rejected by a failed trial.
+    #[error("generation `{0}` is quarantined and requires explicit review")]
+    Quarantined(GenerationId),
+
+    /// The managed service is stopped and activation requires an explicit start.
+    #[error("the managed service is stopped; rerun the command with `--start` to activate")]
+    StartRequired,
+
+    /// No release is authorized by the persisted trusted metadata.
+    #[error("no staged release is authorized; run `zerodeckctl update` first")]
+    NoStagedRelease,
+
+    /// No previously confirmed generation is retained for offline rollback.
+    #[error("no rollback target is retained")]
+    NoRollbackTarget,
+
+    /// No active generation reference exists.
+    #[error("no managed generation is active")]
+    NoActiveGeneration,
+
+    /// The requested generation is already active.
+    #[error("generation `{0}` is already active")]
+    AlreadyActive(GenerationId),
+
+    /// The CLI channel is not one of the signed loader channels.
+    #[error("unsupported update channel `{0}`")]
+    InvalidChannel(String),
+
+    /// A `systemctl` query or transition for the activation service failed.
+    #[error("systemctl operation `{operation}` for `{unit}` failed: {reason}")]
+    Systemctl {
+        unit: String,
+        operation: &'static str,
+        reason: String,
+    },
+
+    /// A `Systemctl` test seam did not implement a required transition.
+    #[error("systemctl operation `{operation}` is not supported for `{unit}`")]
+    SystemctlUnsupported {
+        unit: String,
+        operation: &'static str,
+    },
+
+    /// A test fault stopped the process at a durable activation boundary.
+    #[error("simulated process loss at activation checkpoint {0:?}")]
+    SimulatedCrash(crate::activation::ActivationCheckpoint),
+
+    /// Activation failed and no healthy previous generation could be restored.
+    #[error(
+        "activation failed and no healthy previous generation is available; service is stopped"
+    )]
+    NoGoodGeneration,
+
+    /// The apply unit did not confirm the requested generation.
+    #[error("managed activation did not confirm: {0}")]
+    ActivationFailed(String),
+
+    /// A required update source environment variable is missing.
+    #[error("required environment variable `{0}` is not set")]
+    MissingEnvironment(&'static str),
+
+    /// A configured update source URL is invalid.
+    #[error("environment variable `{name}` is not a valid URL: {reason}")]
+    InvalidEnvironmentUrl { name: &'static str, reason: String },
 
     /// No pre-activation invocation was recorded for the service.
     #[error("no pre-activation invocation was recorded for service `{0}`")]

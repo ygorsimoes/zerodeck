@@ -32,6 +32,12 @@ pub struct UpdateState {
     /// The single in-flight activation transaction, when one exists.
     #[serde(default)]
     pub pending: Option<PendingTransaction>,
+    /// Redacted terminal result of the most recent activation or recovery, for `status`.
+    #[serde(default)]
+    pub last_result: Option<String>,
+    /// Redacted failure reason of the most recent activation or recovery, for `status`.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 impl UpdateState {
@@ -44,6 +50,8 @@ impl UpdateState {
             rollback_target: None,
             quarantined: Vec::new(),
             pending: None,
+            last_result: None,
+            last_error: None,
         }
     }
 

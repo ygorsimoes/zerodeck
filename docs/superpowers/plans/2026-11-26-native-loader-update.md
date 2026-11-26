@@ -44,7 +44,7 @@ failing and passing run. The current verification recipe is `just check`.
 
 ---
 
-### Task L1: Durable state and generation switching
+### Task 1: Durable state and generation switching
 
 **Files:** `crates/zerodeck-platform/src/{lib,maintenance}.rs`,
 `crates/zerodeck-updater/{Cargo.toml,src/{lib,state,generation}.rs,tests/generation.rs}`,
@@ -76,7 +76,7 @@ recent distinct healthy generation. A newly confirmed apply moves the old
   during GC.
 - [ ] Rerun the focused command; both tests pass. Commit `feat(updater): persist generation transactions`.
 
-### Task L2: Verified selection and preparation
+### Task 2: Verified selection and preparation
 
 **Files:** `crates/zerodeck-updater/src/{catalog,stage,state}.rs`,
 `crates/zerodeck-updater/tests/{catalog,stage}.rs`, `crates/zerodeck-updater/Cargo.toml`,
@@ -111,7 +111,7 @@ without fetching over the network. L4 calls it again immediately before a new ac
 - [ ] Rerun the focused command and `just deny`; expect all tests and dependency checks to
   pass. Commit `feat(updater): stage TUF-authorized loader releases`.
 
-### Task L3: One running generation and meaningful readiness
+### Task 3: One running generation and meaningful readiness
 
 **Files:** `crates/zerodeckd/src/{main,install}.rs`, `crates/zerodeckd/tests/daemon.rs`,
 `crates/zerodeck-server/src/{state.rs,routes/mod.rs}`, `crates/zerodeck-updater/src/service.rs`,
@@ -137,7 +137,7 @@ Python import and authenticated `utilities/ping`.
 - [ ] Rerun both focused suites; verify the normal daemon tests still pass. Commit
   `feat(updater): verify managed daemon build and readiness`.
 
-### Task L4: Managed apply, boot recovery, and CLI
+### Task 4: Managed apply, boot recovery, and CLI
 
 **Files:** `crates/zerodeck-updater/src/{main,state,service}.rs`,
 `crates/zerodeck-updater/tests/activation.rs`, `deploy/systemd/zerodeck.service`,
@@ -173,7 +173,7 @@ Declare the native service tool as binary `zerodeckctl` in the updater crate man
 - [ ] Rerun the focused suite and `just check`; expect PASS. Commit
   `feat(updater): activate and recover zero deck with systemd`.
 
-### Task L5: Build, publish, and bootstrap the trust chain
+### Task 5: Build, publish, and bootstrap the trust chain
 
 **Files:** `.github/workflows/release-please.yml`, `release-please-config.json`,
 `Dockerfile`, `justfile`, `deploy/update/{bootstrap,tests/release.sh,RELEASE.md}`.
@@ -209,7 +209,7 @@ The verified administrative bootstrap exposes `--convert-existing-zerodeck` and
 - [ ] Rerun the packaging test and `just ci`; record a staging release, retry, expiry,
   and rotation drill. Commit `build(release): publish and authorize complete immutable releases`.
 
-### Task L6: VM and Steam Deck release gate
+### Task 6: VM and Steam Deck release gate
 
 **Files:** `deploy/update/tests/{vm.sh,README.md}`, `justfile`, `README.md`.
 

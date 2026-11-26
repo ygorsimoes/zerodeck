@@ -47,7 +47,7 @@ mount/unmount entry points from Phase 4; headless operations and their tests shi
 
 ---
 
-### Task P1: Catalog contract and identity
+### Task 1: Catalog contract and identity
 
 **Files:** `docs/architecture/wire-protocol.md`, `crates/zerodeck-core/src/catalog.rs`,
 `crates/zerodeck-core/src/{lib.rs,tests/catalog.rs,tests/mod.rs}`.
@@ -75,7 +75,7 @@ where selection is an exact version or a documented upstream recommendation.
   Don't invent URLs or copy Decky implementation code.
 - [ ] Rerun the focused tests; commit `feat(plugins): read verified decky catalog candidates`.
 
-### Task P2: Verified ZIP and dependency staging with bounded resources
+### Task 2: Verified ZIP and dependency staging with bounded resources
 
 **Files:** `crates/zerodeck-core/src/{installer,archive}.rs`,
 `crates/zerodeck-core/src/tests/{installer,archive}.rs`.
@@ -102,7 +102,7 @@ before any lifecycle mutation.
 - [ ] Rerun installer and archive tests; commit
   `perf(plugins): stream verified plugin artifacts into staging`.
 
-### Task P3: Backend readiness and validation on every spawn
+### Task 3: Backend readiness and validation on every spawn
 
 **Files:** `crates/zerodeck-protocol/src/ipc.rs`,
 `crates/zerodeck-plugin-host/src/{supervisor,env,lib}.rs`,
@@ -130,7 +130,7 @@ every spawn. P4 uses `wait_ready` only for the candidate it is activating.
   and never trust a CEF client as evidence of backend readiness.
 - [ ] Rerun the three suites; commit `feat(plugins): confirm worker readiness before activation`.
 
-### Task P4: Durable activation, checkpoints and safe recovery
+### Task 4: Durable activation, checkpoints and safe recovery
 
 **Files:** `crates/zerodeck-core/src/{plugin_update,installer,manager,discovery,watcher}.rs`,
 `crates/zerodeck-core/src/tests/plugin_update.rs`, `crates/zerodeckd/src/main.rs`.
@@ -166,7 +166,7 @@ checkout changed after review. That fingerprint is not treated as an upstream ar
 - [ ] Rerun the focused suite and `just check`; commit
   `feat(plugins): persist upgrades and recover previous generations`.
 
-### Task P5: Headless commands and legacy compatibility
+### Task 5: Headless commands and legacy compatibility
 
 **Files:** `crates/zerodeck-server/src/{admin.rs,lib.rs,ws/args.rs,ws/dispatch.rs,ws/socket.rs}`,
 `crates/zerodeck-server/src/ws_sync.rs`, `crates/zerodeckd/tests/daemon.rs`,
@@ -206,7 +206,7 @@ Administrative approval binds an operation ID and digest; a session token or leg
   commands and operator recovery.
   Commit `feat(plugins): expose durable plugin updates through the local API`.
 
-### Task P6: Confirm frontends in Game Mode and publish compatibility evidence
+### Task 6: Confirm frontends in Game Mode and publish compatibility evidence
 
 **Files:** `crates/zerodeck-server/src/routes/static_files.rs`,
 `crates/zerodeck-server/src/ws/dispatch.rs`, `crates/zerodeck-core/src/plugin_update.rs`,

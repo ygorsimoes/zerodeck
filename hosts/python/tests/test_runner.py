@@ -910,5 +910,145 @@ class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
                 right.close()
 
 
+
+HOST_PYTHONPATH = str(Path(__file__).resolve().parents[1])
+
+
+class SyncMainLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def _write_plugin(self, root: Path, body: list[str]) -> Path:
+        plugin_dir = root / "plugin"
+        plugin_dir.mkdir(parents=True)
+        entrypoint = plugin_dir / "main.py"
+        entrypoint.write_text("\n".join(body) + "\n", encoding="utf-8")
+        return entrypoint
+
+    def test_worker_exits_promptly_with_blocking_sync_main(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entrypoint = self._write_plugin(
+                Path(tmp),
+                [
+                    "import time",
+                    "",
+                    "class Plugin:",
+                    "    def _main(self):",
+                    "        time.sleep(30)",
+                ],
+            )
+            script = "\n".join(
+                [
+                    "import asyncio, sys",
+                    "from pathlib import Path",
+                    "from zerodeck_py_host.runner import PluginRunner",
+                    "",
+                    "async def main():",
+                    "    async def sink(_payload):",
+                    "        return None",
+                    "    runner = PluginRunner(",
+                    "        entrypoint=Path(sys.argv[1]),",
+                    "        plugin_name='Blocky',",
+                    "        api_version=1,",
+                    "        emit_sink=sink,",
+                    "    )",
+                    "    runner.load()",
+                    "    await runner.start_lifecycle()",
+                    "    await runner.stop_lifecycle()",
+                    "",
+                    "asyncio.run(main())",
+                ]
+            )
+            env = {**os.environ, "PYTHONPATH": HOST_PYTHONPATH, "PYTHONDONTWRITEBYTECODE": "1"}
+            # A blocking synchronous _main must not keep the worker alive after shutdown.
+            completed = subprocess.run(
+                [sys.executable, "-c", script, str(entrypoint)],
+                env=env,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+
+    async def test_sync_main_runs_in_daemon_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entrypoint = self._write_plugin(
+                Path(tmp),
+                [
+                    "import threading",
+                    "",
+                    "class Plugin:",
+                    "    def __init__(self):",
+                    "        self.release = threading.Event()",
+                    "",
+                    "    def _main(self):",
+                    "        self.release.wait(30)",
+                ],
+            )
+
+            async def sink(_payload: dict[str, object]) -> None:
+                return None
+
+            runner = PluginRunner(
+                entrypoint=entrypoint, plugin_name="Threaded", api_version=1, emit_sink=sink
+            )
+            runner.load()
+            await runner.start_lifecycle()
+            thread = runner.main_thread
+            assert thread is not None
+            self.assertTrue(thread.daemon)
+            self.assertTrue(thread.is_alive())
+            await asyncio.wait_for(runner.stop_lifecycle(), timeout=1.0)
+            runner.plugin.release.set()
+            thread.join(timeout=5)
+
+    async def test_sync_main_exception_is_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = root / "logs"
+            entrypoint = self._write_plugin(
+                root,
+                [
+                    "class Plugin:",
+                    "    def _main(self):",
+                    "        raise RuntimeError('sync main boom')",
+                ],
+            )
+
+            async def sink(_payload: dict[str, object]) -> None:
+                return None
+
+            with patch.dict(os.environ, {"DECKY_PLUGIN_LOG_DIR": str(log_dir)}, clear=False):
+                runner = PluginRunner(
+                    entrypoint=entrypoint, plugin_name="Boom", api_version=1, emit_sink=sink
+                )
+                runner.load()
+                await runner.start_lifecycle()
+                thread = runner.main_thread
+                assert thread is not None
+                thread.join(timeout=5)
+                await runner.stop_lifecycle()
+
+            logged = "".join(p.read_text(encoding="utf-8") for p in log_dir.glob("*.log"))
+            self.assertIn("plugin _main task failed", logged)
+            self.assertIn("sync main boom", logged)
+
+
+class SettingsDurabilityTests(unittest.TestCase):
+    def test_settings_commit_fsyncs_file_and_directory(self) -> None:
+        import stat
+
+        synced_dirs: list[bool] = []
+        real_fsync = os.fsync
+
+        def recording_fsync(fd: int) -> None:
+            synced_dirs.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            real_fsync(fd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = SettingsManager("demo", settings_directory=tmp)
+            with patch("os.fsync", recording_fsync):
+                settings.setSetting("k", 1)
+
+        self.assertEqual(synced_dirs, [False, True])
+
+
 if __name__ == "__main__":
     unittest.main()

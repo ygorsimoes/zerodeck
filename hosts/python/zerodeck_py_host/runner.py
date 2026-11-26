@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -38,6 +39,7 @@ class PluginRunner:
         self.plugin: Any = None
         self.uninstalling = False
         self.main_task: asyncio.Task[Any] | None = None
+        self.main_thread: threading.Thread | None = None
         self._decky_logger: Any = None
         self._stop_event: asyncio.Event | None = stop_event
 
@@ -111,10 +113,28 @@ class PluginRunner:
                         return await awaitable
 
                     self.main_task = asyncio.create_task(_await_task(coro))
+                self.main_task.add_done_callback(self._log_main_task_result)
             else:
-                self.main_task = asyncio.create_task(self._invoke("_main"))
-            self.main_task.add_done_callback(self._log_main_task_result)
+                # A synchronous _main cannot be cancelled. Running it in a daemon thread (not the
+                # default executor, which asyncio.run waits for) lets the worker exit on shutdown.
+                self.main_thread = threading.Thread(
+                    target=self._run_sync_main,
+                    args=(callable_fn, prefix),
+                    name=f"{self.plugin_name}-main",
+                    daemon=True,
+                )
+                self.main_thread.start()
             await asyncio.sleep(0)
+
+    def _run_sync_main(self, callable_fn: Callable[..., Any], prefix: tuple[Any, ...]) -> None:
+        try:
+            callable_fn(*prefix)
+        except Exception as exc:  # noqa: BLE001
+            if self._decky_logger is not None:
+                self._decky_logger.error(
+                    "plugin _main task failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
 
     def _log_main_task_result(self, task: asyncio.Task[Any]) -> None:
         if task.cancelled():

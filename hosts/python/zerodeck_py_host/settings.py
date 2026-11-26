@@ -70,6 +70,7 @@ class SettingsManager:
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp_path, self.path)
+                _fsync_directory(self.settings_directory)
             except BaseException:
                 try:
                     tmp_path.unlink(missing_ok=True)
@@ -85,3 +86,17 @@ class SettingsManager:
         with self._lock:
             self.settings[key] = value
         self.commit()
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flushes a directory entry change (the rename above) to disk, where the platform allows it."""
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)

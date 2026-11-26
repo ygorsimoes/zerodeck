@@ -578,6 +578,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    async fn fetch_status_for(upstream_port: u16, path: &str) -> StatusCode {
+        let policy =
+            zerodeck_core::OutboundHttpPolicy::for_loopback_ports_for_testing(vec![upstream_port])
+                .with_timeouts(None, Some(std::time::Duration::from_millis(200)));
+        let client = zerodeck_core::CheckedHttpClient::new(policy).expect("checked client");
+        let state = AppState::with_http_for_tests(ServerConfig::default(), client);
+        let token = state.csrf_token().to_owned();
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/fetch?fetch_url=http://127.0.0.1:{upstream_port}{path}"
+                    ))
+                    .header("X-Decky-Auth", &token)
+                    .body(Body::empty())
+                    .expect("fetch req"),
+            )
+            .await
+            .expect("fetch resp")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_maps_upstream_timeout_to_504() {
+        let slow = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind slow upstream");
+        let port = listener.local_addr().expect("addr").port();
+        let server = tokio::spawn(async move { axum::serve(listener, slow).await });
+
+        assert_eq!(
+            fetch_status_for(port, "/slow").await,
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_maps_connection_refused_to_502() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        assert_eq!(
+            fetch_status_for(port, "/gone").await,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
     async fn spawn_mock_upstream() -> std::net::SocketAddr {
         use axum::routing::{get, post};
         let mock = axum::Router::new()
@@ -1085,6 +1141,195 @@ mod tests {
             assert_eq!(replies[0]["result"], json!("pong"));
             assert_eq!(replies[1]["id"], json!(1));
             assert_eq!(replies[1]["result"], json!("waited"));
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Starts a manager with one async `SlowPlug` plugin (`wait_ms(ms)` sleeps then returns
+        /// `"waited"`) behind a server built from `config`.
+        #[cfg(unix)]
+        async fn spawn_slow_plugin_server(
+            config: ServerConfig,
+        ) -> (
+            std::sync::Arc<zerodeck_core::PluginManager>,
+            SocketAddr,
+            String,
+            std::path::PathBuf,
+        ) {
+            let dir = std::env::temp_dir().join(format!("zd-srv-limits-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let plug = paths.plugins_dir().join("slow");
+            std::fs::create_dir_all(&plug).expect("plug dir");
+            std::fs::write(
+                plug.join("plugin.json"),
+                r#"{"name":"SlowPlug","author":"Tester","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            std::fs::write(
+                plug.join("main.py"),
+                "import asyncio\nclass Plugin:\n    async def wait_ms(self, ms):\n        await asyncio.sleep(ms / 1000.0)\n        return 'waited'\n",
+            )
+            .expect("main.py");
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+            let (addr, token) = spawn_manager_server(config, manager.clone()).await;
+            (manager, addr, token, dir)
+        }
+
+        fn slow_call(id: u64, ms: u64) -> Value {
+            json!({
+                "type": 0, "id": id, "route": "loader/call_plugin_method",
+                "args": ["SlowPlug", "wait_ms", ms]
+            })
+        }
+
+        fn tiny_limits() -> ServerConfig {
+            ServerConfig {
+                ws_max_in_flight_calls: 1,
+                ws_max_queued_calls: 1,
+                ..ServerConfig::default()
+            }
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_rejects_calls_beyond_pending_capacity() {
+            let (manager, addr, token, dir) = spawn_slow_plugin_server(tiny_limits()).await;
+            let mut ws = connect(addr, &token).await;
+            for (id, ms) in [(1, 400), (2, 401), (3, 402)] {
+                ws.send(Message::Text(slow_call(id, ms).to_string().into()))
+                    .await
+                    .expect("send call");
+            }
+
+            let rejected = next_text_frame(&mut ws).await;
+            assert_eq!(rejected["id"], json!(3));
+            assert_eq!(rejected["error"]["name"], json!("TooManyPendingCalls"));
+            let first = next_text_frame(&mut ws).await;
+            let second = next_text_frame(&mut ws).await;
+            assert_eq!(first["id"], json!(1));
+            assert_eq!(first["result"], json!("waited"));
+            assert_eq!(second["id"], json!(2));
+            assert_eq!(second["result"], json!("waited"));
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_full_sync_rejects_only_excess_messages() {
+            let (manager, addr, token, dir) = spawn_slow_plugin_server(tiny_limits()).await;
+            let mut ws = connect(addr, &token).await;
+            let full_sync = json!({
+                "type": 4,
+                "messages": [slow_call(1, 300), slow_call(2, 301), slow_call(3, 302)]
+            });
+            ws.send(Message::Text(full_sync.to_string().into()))
+                .await
+                .expect("send FULL_SYNC");
+
+            let mut rejected = Vec::new();
+            let mut replied = Vec::new();
+            while rejected.len() + replied.len() < 3 {
+                let frame = next_text_frame(&mut ws).await;
+                if frame["error"]["name"] == json!("TooManyPendingCalls") {
+                    rejected.push(frame["id"].clone());
+                } else {
+                    assert_eq!(frame["result"], json!("waited"));
+                    replied.push(frame["id"].clone());
+                }
+            }
+            assert_eq!(rejected, vec![json!(3)]);
+            assert_eq!(replied, vec![json!(1), json!(2)]);
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_in_flight_cap_runs_calls_one_at_a_time() {
+            let config = ServerConfig {
+                ws_max_in_flight_calls: 1,
+                ws_max_queued_calls: 4,
+                ..ServerConfig::default()
+            };
+            let (manager, addr, token, dir) = spawn_slow_plugin_server(config).await;
+            let mut ws = connect(addr, &token).await;
+            // With one slot, the short call must wait for the long one; running them together
+            // would answer the short call first.
+            for (id, ms) in [(1, 600), (2, 50)] {
+                ws.send(Message::Text(slow_call(id, ms).to_string().into()))
+                    .await
+                    .expect("send call");
+            }
+
+            let first = next_text_frame(&mut ws).await;
+            let second = next_text_frame(&mut ws).await;
+            assert_eq!(first["id"], json!(1));
+            assert_eq!(second["id"], json!(2));
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn ws_keepalive_survives_flooded_queue() {
+            let config = ServerConfig {
+                ws_ping_interval: Duration::from_millis(80),
+                ..tiny_limits()
+            };
+            let (manager, addr, token, dir) = spawn_slow_plugin_server(config).await;
+            let mut ws = connect(addr, &token).await;
+            // Two 400 ms calls fill the single slot and the single queue entry for ~800 ms
+            // (10 ping intervals); the extra calls arrive while the queue is full.
+            for (id, ms) in [(1, 400), (2, 401), (3, 402), (4, 403)] {
+                ws.send(Message::Text(slow_call(id, ms).to_string().into()))
+                    .await
+                    .expect("send call");
+            }
+
+            let mut replies = 0usize;
+            let mut rejections = 0usize;
+            let mut pings_seen = 0usize;
+            while replies < 2 {
+                let frame = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .expect("ws frame timeout")
+                    .expect("ws stream open")
+                    .expect("ws frame ok");
+                match frame {
+                    Message::Text(txt) => {
+                        let frame: Value = serde_json::from_str(&txt).expect("json");
+                        if frame["error"]["name"] == json!("TooManyPendingCalls") {
+                            rejections += 1;
+                        } else {
+                            assert_eq!(frame["result"], json!("waited"));
+                            replies += 1;
+                        }
+                    }
+                    Message::Ping(_) => pings_seen += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(rejections, 2);
+            assert!(
+                pings_seen >= 3,
+                "expected keepalive pings, saw {pings_seen}"
+            );
 
             manager.shutdown_all().await;
             let _ = std::fs::remove_dir_all(&dir);

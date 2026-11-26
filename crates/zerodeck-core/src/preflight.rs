@@ -12,6 +12,16 @@ pub(crate) struct PreflightInput<'a> {
     pub python_host_missing: Option<&'a str>,
 }
 
+impl PreflightInput<'_> {
+    /// Whether [`preflight`] will call its `tree_check` for this input.
+    pub(crate) fn needs_tree_check(&self) -> bool {
+        self.python_host_missing.is_none()
+            && self.requires_root
+            && self.daemon_is_root
+            && !self.allow_unsafe_root_plugins
+    }
+}
+
 /// Returns the reason a plugin must not start, or `Ok` when it may.
 ///
 /// A missing Python host blocks every backend plugin. A `"root"` plugin started by a root daemon
@@ -112,6 +122,24 @@ mod tests {
                 Err("zerodeck_py_host is not importable".to_owned()),
                 "requires_root={requires_root} daemon_is_root={daemon_is_root} allow={allow}"
             );
+        }
+    }
+
+    #[test]
+    fn needs_tree_check_is_true_exactly_when_preflight_calls_the_tree_check() {
+        for bits in 0u8..16 {
+            let input = PreflightInput {
+                requires_root: bits & 1 != 0,
+                daemon_is_root: bits & 2 != 0,
+                allow_unsafe_root_plugins: bits & 4 != 0,
+                python_host_missing: (bits & 8 != 0).then_some("missing"),
+            };
+            let mut called = false;
+            let _ = preflight(&input, || {
+                called = true;
+                Ok(())
+            });
+            assert_eq!(input.needs_tree_check(), called, "input {input:?}");
         }
     }
 }

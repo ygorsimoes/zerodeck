@@ -95,6 +95,10 @@ pub enum CoreError {
     #[error("outbound HTTP request failed: {0}")]
     HttpRequest(String),
 
+    /// Outbound HTTP request hit the client's connect or response timeout.
+    #[error("outbound HTTP request timed out: {0}")]
+    HttpTimeout(String),
+
     /// Remote download exceeded the configured maximum byte budget.
     #[error("download exceeded maximum allowed size of {max_bytes} bytes")]
     DownloadSizeExceeded { max_bytes: usize },

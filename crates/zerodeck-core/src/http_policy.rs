@@ -425,6 +425,8 @@ pub async fn send_checked_request(
         let response = req_builder.send().await.map_err(|err| {
             if let Some(msg) = extract_dns_policy_block(&err) {
                 CoreError::HttpPolicy(msg)
+            } else if err.is_timeout() {
+                CoreError::HttpTimeout(format!("request to `{current_url}` timed out: {err}"))
             } else {
                 CoreError::HttpRequest(format!("request to `{current_url}` failed: {err}"))
             }

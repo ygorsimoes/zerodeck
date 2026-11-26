@@ -87,6 +87,7 @@ If a plugin worker crashes or stops while a call is in flight (or is in `Backing
 Connection limits:
 - Inbound messages and frames above 16 MiB (`ServerConfig::ws_max_message_bytes`) close the connection.
 - The server sends a WebSocket `ping` every 30 s (`ServerConfig::ws_ping_interval`); a client that has not answered the previous ping with a `pong` by the next one is disconnected. Browsers answer pings automatically.
+- Each connection runs at most 64 calls at once (`ServerConfig::ws_max_in_flight_calls`); up to 1024 more wait for a free slot (`ServerConfig::ws_max_queued_calls`). A `CALL`, or a message inside `FULL_SYNC`, that arrives while in-flight + queued calls are at that limit is answered immediately with `ERROR (-1)` named `TooManyPendingCalls`; the rest of a `FULL_SYNC` batch is still processed. Waiting calls never block the connection, so keepalive pongs and other frames keep flowing.
 - Clients reconnect with exponential backoff (1 s doubling up to 30 s, reset after a successful open) and fetch a fresh token from `/auth/token` before each attempt.
 
 ## 2. Plugin Backend IPC (JSON Lines over Unix Domain Socket / Inherited FD)

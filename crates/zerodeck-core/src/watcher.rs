@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::{broadcast, oneshot};
@@ -57,8 +58,16 @@ impl Drop for DebugWatcherHandle {
 /// Uses Linux `inotify` (`ISC`) combined with a lightweight `mtime` sweep (`2s` fallback on Linux
 /// for bind-mounted filesystems, `500ms` on non-Linux hosts) and a `300ms` burst debounce.
 pub fn start_debug_watcher(manager: Arc<PluginManager>) -> Result<DebugWatcherHandle, CoreError> {
+    start_debug_watcher_with_sweep_counter(manager, Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`start_debug_watcher`] with an injected counter of mtime sweeps (observable by tests).
+fn start_debug_watcher_with_sweep_counter(
+    manager: Arc<PluginManager>,
+    sweeps: Arc<AtomicUsize>,
+) -> Result<DebugWatcherHandle, CoreError> {
     let loader_events = manager.subscribe_loader_events();
-    let mut state = WatcherState::new(manager);
+    let mut state = WatcherState::new(manager, sweeps);
     state.sync_with_manager(false);
 
     #[cfg(target_os = "linux")]
@@ -107,16 +116,18 @@ struct WatcherState {
     plugins_dir: PathBuf,
     tracked: HashMap<String, TrackedPlugin>,
     pending: HashMap<(String, DirtyScope), Instant>,
+    sweeps: Arc<AtomicUsize>,
 }
 
 impl WatcherState {
-    fn new(manager: Arc<PluginManager>) -> Self {
+    fn new(manager: Arc<PluginManager>, sweeps: Arc<AtomicUsize>) -> Self {
         let plugins_dir = manager.paths().plugins_dir();
         Self {
             manager,
             plugins_dir,
             tracked: HashMap::new(),
             pending: HashMap::new(),
+            sweeps,
         }
     }
 
@@ -293,6 +304,10 @@ async fn run_watcher_loop(
     sweep_interval.tick().await;
 
     loop {
+        // With nothing tracked there is nothing to sweep: skip the timer so an idle daemon does
+        // not wake up every few seconds. inotify stays registered; an idle descriptor costs no
+        // wakeups.
+        let was_idle = state.tracked.is_empty();
         let debounce_sleep = async {
             match state.next_deadline() {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -325,7 +340,8 @@ async fn run_watcher_loop(
                     &mut linux_watches,
                 );
             }
-            _ = sweep_interval.tick() => {
+            _ = sweep_interval.tick(), if !was_idle => {
+                state.sweeps.fetch_add(1, Ordering::Relaxed);
                 sync_state_and_watches(
                     &mut state,
                     true,
@@ -361,6 +377,9 @@ async fn run_watcher_loop(
                     &mut linux_watches,
                 );
             }
+        }
+        if was_idle && !state.tracked.is_empty() {
+            sweep_interval.reset();
         }
     }
 }
@@ -788,5 +807,114 @@ mod linux {
                 collect_watch_dirs(&child, directory, scope, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    use super::start_debug_watcher_with_sweep_counter;
+    use crate::{InstallPluginRequest, InstallPluginSource, PluginManager};
+
+    fn temp_manager() -> (Arc<PluginManager>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("zerodeck-watcher-{}", Uuid::new_v4()));
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).expect("create home");
+        let root_str = root.display().to_string();
+        let home_str = home.display().to_string();
+        let lookup = std::collections::HashMap::from([
+            ("UNPRIVILEGED_PATH", root_str.clone()),
+            ("PRIVILEGED_PATH", root_str),
+            ("DECKY_USER_HOME", home_str.clone()),
+            ("HOME", home_str),
+        ]);
+        let paths = zerodeck_platform::PlatformPaths::from_lookup(|k| lookup.get(k).cloned());
+        let manager = PluginManager::open(
+            paths,
+            zerodeck_plugin_host::SupervisorConfig::default(),
+            "0.1.0",
+        )
+        .expect("open manager");
+        (Arc::new(manager), root)
+    }
+
+    /// A passive (no `main.py`) plugin flagged `"debug"`, so the watcher tracks it without any
+    /// worker process.
+    fn debug_plugin_zip() -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default();
+            writer.start_file("plugin.json", opts).expect("start");
+            writer
+                .write_all(br#"{"name":"DebugPassive","author":"T","flags":["debug"]}"#)
+                .expect("write");
+            writer.start_file("dist/index.js", opts).expect("start");
+            writer.write_all(b"export default 1;").expect("write");
+            writer.finish().expect("finish");
+        }
+        buf.into_inner()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_without_debug_plugins_does_not_sweep() {
+        let (manager, root) = temp_manager();
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let watcher = start_debug_watcher_with_sweep_counter(manager, Arc::clone(&sweeps))
+            .expect("start watcher");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), 0);
+
+        watcher.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_resumes_sweeping_after_debug_plugin_appears() {
+        let (manager, root) = temp_manager();
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let watcher =
+            start_debug_watcher_with_sweep_counter(Arc::clone(&manager), Arc::clone(&sweeps))
+                .expect("start watcher");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), 0);
+
+        let zip_bytes = debug_plugin_zip();
+        let zip_path = root.join("home").join("debug.zip");
+        std::fs::write(&zip_path, &zip_bytes).expect("write zip");
+        manager
+            .install_plugin(InstallPluginRequest {
+                source: InstallPluginSource::LocalZip {
+                    path: zip_path,
+                    sha256: Some(hex::encode(Sha256::digest(&zip_bytes))),
+                    user_confirmed: false,
+                },
+                directory_hint: None,
+                expected_name: None,
+                expected_version: None,
+            })
+            .await
+            .expect("install debug plugin");
+
+        let before = sweeps.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            sweeps.load(Ordering::SeqCst) >= before + 2,
+            "expected sweeps to resume once a debug plugin is tracked"
+        );
+
+        watcher.stop().await;
+        manager.shutdown_all().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 }

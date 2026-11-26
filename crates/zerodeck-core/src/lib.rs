@@ -34,7 +34,7 @@ pub use installer::{
 pub use manager::{
     LoaderEvent, PluginFileScope, PluginManager, PluginSummary, resolve_static_file,
 };
-pub use settings::SettingsManager;
+pub use settings::{PendingSettings, SettingsManager};
 pub use watcher::{DebugWatcherHandle, start_debug_watcher};
 
 #[cfg(test)]
@@ -1058,7 +1058,10 @@ mod tests {
         )
         .await
         .expect_err("slow response must hit CheckedHttpClient response timeout");
-        assert!(matches!(err_timeout, CoreError::HttpRequest(_)));
+        assert!(
+            matches!(err_timeout, CoreError::HttpTimeout(_)),
+            "expected HttpTimeout, got {err_timeout:?}"
+        );
 
         server.abort();
     }
@@ -2327,6 +2330,7 @@ class Plugin:
         ] {
             let err = manager
                 .set_setting(protected, serde_json::json!(["x"]))
+                .await
                 .expect_err(&format!("must reject managed key `{protected}`"));
             assert!(matches!(err, CoreError::InvalidSetting(_)));
         }
@@ -2336,6 +2340,7 @@ class Plugin:
                 "developer.allow_unverified_installs",
                 serde_json::json!(true),
             )
+            .await
             .expect("persist dotted developer setting");
         assert!(manager.allow_unverified_installs());
         assert_eq!(
@@ -2856,6 +2861,7 @@ class Plugin:
 
         let fp = manager
             .list_files(crate::FilePickerQuery::default())
+            .await
             .expect("list_files");
         assert_eq!(
             fp.realpath,
@@ -2981,5 +2987,151 @@ class Plugin:
 
         watcher.stop().await;
         manager.shutdown_all().await;
+    }
+
+    /// A passive plugin (no `main.py`) with one 256 MiB, highly compressible asset: extracting
+    /// it takes long enough that doing it on the async thread stalls the runtime.
+    fn big_asset_plugin_zip() -> Vec<u8> {
+        let big = vec![0u8; 256 * 1024 * 1024];
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut buf);
+            let deflated =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("plugin.json", deflated)
+                .expect("start plugin.json");
+            writer
+                .write_all(br#"{"name":"BigAssets","author":"Alice","api_version":1}"#)
+                .expect("write plugin.json");
+            writer
+                .start_file("assets/big.bin", deflated)
+                .expect("start big.bin");
+            writer.write_all(&big).expect("write big.bin");
+            writer.finish().expect("finish zip");
+        }
+        buf.into_inner()
+    }
+
+    /// Runs `fut` while a 10 ms ticker on the same (current-thread) runtime records the longest
+    /// gap between its ticks; returns the output and that gap in milliseconds.
+    async fn with_max_stall_ms<F: std::future::Future>(fut: F) -> (F::Output, u64) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let running = Arc::new(AtomicBool::new(true));
+        let max_gap_ms = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let running = Arc::clone(&running);
+            let max_gap_ms = Arc::clone(&max_gap_ms);
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                while running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let now = Instant::now();
+                    let gap =
+                        u64::try_from(now.duration_since(last).as_millis()).unwrap_or(u64::MAX);
+                    max_gap_ms.fetch_max(gap, Ordering::SeqCst);
+                    last = now;
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+        let output = fut.await;
+        running.store(false, Ordering::SeqCst);
+        ticker.await.expect("ticker task");
+        (output, max_gap_ms.load(Ordering::SeqCst))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_does_not_starve_current_thread_runtime() {
+        let dir = TestDir::new("install-starve");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+        let zip_bytes = big_asset_plugin_zip();
+
+        let (outcome, gap) = with_max_stall_ms(install_local_zip_with_hash(
+            &manager,
+            &dir.0.join("home"),
+            "big.zip",
+            &zip_bytes,
+        ))
+        .await;
+        assert_eq!(outcome.name, "BigAssets");
+        assert!(
+            gap < 250,
+            "async runtime stalled for {gap} ms during install"
+        );
+        manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_setting_writes_leave_disk_and_memory_consistent() {
+        let dir = TestDir::new("settings-concurrent");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+
+        let mut writes = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let manager = std::sync::Arc::clone(&manager);
+            writes.spawn(async move {
+                manager
+                    .set_setting("k", serde_json::json!(i))
+                    .await
+                    .expect("set_setting");
+            });
+        }
+        while let Some(joined) = writes.join_next().await {
+            joined.expect("write task");
+        }
+
+        let on_disk: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.settings_dir().join("loader.json")).expect("read loader.json"),
+        )
+        .expect("parse loader.json");
+        assert_eq!(on_disk["k"], manager.get_setting(Some("k")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reads_are_not_blocked_by_settings_writes() {
+        use std::time::{Duration, Instant};
+
+        let dir = TestDir::new("settings-reads");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+
+        let mut writes = tokio::task::JoinSet::new();
+        for i in 0..20 {
+            let manager = std::sync::Arc::clone(&manager);
+            writes.spawn(async move {
+                manager
+                    .set_setting(&format!("key{i}"), serde_json::json!(i))
+                    .await
+                    .expect("set_setting");
+            });
+        }
+        let reader = {
+            let manager = std::sync::Arc::clone(&manager);
+            tokio::spawn(async move {
+                let started = Instant::now();
+                for _ in 0..100 {
+                    let _ = manager.list_plugins();
+                    tokio::task::yield_now().await;
+                }
+                started.elapsed()
+            })
+        };
+        let elapsed = reader.await.expect("reader task");
+        while let Some(joined) = writes.join_next().await {
+            joined.expect("write task");
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100 reads took {elapsed:?} during writes"
+        );
     }
 }

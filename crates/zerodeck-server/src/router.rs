@@ -3,6 +3,7 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -17,7 +18,7 @@ use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -63,6 +64,11 @@ pub struct ServerConfig {
     pub ws_sync_cache_capacity: usize,
     /// Time-to-live for completed [`WsSyncCache`] entries.
     pub ws_sync_cache_ttl: Duration,
+    /// Maximum number of calls one WebSocket connection runs at the same time.
+    pub ws_max_in_flight_calls: usize,
+    /// Maximum number of calls one connection may have waiting for a free slot; calls beyond
+    /// in-flight + queued are rejected with `TooManyPendingCalls`.
+    pub ws_max_queued_calls: usize,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +87,8 @@ impl Default for ServerConfig {
             fetch_response_timeout: Duration::from_secs(60),
             ws_sync_cache_capacity: 256,
             ws_sync_cache_ttl: Duration::from_secs(300),
+            ws_max_in_flight_calls: 64,
+            ws_max_queued_calls: 1024,
         }
     }
 }
@@ -899,11 +907,20 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket, scope: SyncSco
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
     keepalive.tick().await;
     let mut awaiting_pong = false;
+    let limiter = CallLimiter::new(
+        state.config().ws_max_in_flight_calls,
+        state.config().ws_max_queued_calls,
+    );
 
     loop {
         tokio::select! {
             inbound = socket.recv() => match inbound {
-                Some(Ok(Message::Text(text))) => handle_ws_text(&state, &scope, &text, &outbox),
+                Some(Ok(Message::Text(text))) => {
+                    let rejections = handle_ws_text(&state, &scope, &limiter, &text, &outbox);
+                    if send_frames(&mut socket, rejections).await.is_err() {
+                        break;
+                    }
+                }
                 Some(Ok(Message::Pong(_))) => awaiting_pong = false,
                 Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                 Some(Ok(Message::Binary(_) | Message::Ping(_))) => {}
@@ -941,16 +958,72 @@ async fn handle_ws_socket(state: AppState, mut socket: WebSocket, scope: SyncSco
     debug!("WebSocket client disconnected");
 }
 
+/// Per-connection bound on WebSocket calls: at most `in_flight` run at once and at most
+/// `in_flight + queued` are pending (running or waiting for a slot). It never blocks the socket
+/// loop, so keepalive pongs keep flowing while the queue is full.
+#[derive(Debug, Clone)]
+struct CallLimiter {
+    permits: Arc<Semaphore>,
+    pending: Arc<AtomicUsize>,
+    capacity: usize,
+}
+
+impl CallLimiter {
+    fn new(in_flight: usize, queued: usize) -> Self {
+        let in_flight = in_flight.max(1);
+        Self {
+            permits: Arc::new(Semaphore::new(in_flight)),
+            pending: Arc::new(AtomicUsize::new(0)),
+            capacity: in_flight.saturating_add(queued),
+        }
+    }
+
+    /// Reserves a pending slot, or `None` when the connection is at capacity.
+    fn try_admit(&self) -> Option<PendingGuard> {
+        self.pending
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                (pending < self.capacity).then_some(pending + 1)
+            })
+            .ok()
+            .map(|_| PendingGuard {
+                pending: Arc::clone(&self.pending),
+            })
+    }
+}
+
+/// Releases one pending slot of a [`CallLimiter`] when the call finishes (or is dropped).
+#[derive(Debug)]
+struct PendingGuard {
+    pending: Arc<AtomicUsize>,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Handles one inbound text frame; returns the frames to send right away (calls rejected
+/// because the connection is at capacity).
 fn handle_ws_text(
     state: &AppState,
     scope: &SyncScope,
+    limiter: &CallLimiter,
     text: &str,
     outbox: &mpsc::Sender<WsServerMessage>,
-) {
+) -> Vec<WsServerMessage> {
+    let mut rejections = Vec::new();
+    let mut admit = |call: WsCallPayload| match limiter.try_admit() {
+        Some(guard) => spawn_ws_call(state, scope, limiter, guard, call, outbox),
+        None => rejections.push(ws_error(
+            call.id,
+            "TooManyPendingCalls",
+            "too many pending calls on this connection",
+            None,
+        )),
+    };
     match WsClientMessage::from_json_str(text) {
-        Ok(WsClientMessage::Call(call)) => {
-            spawn_ws_call(state.clone(), scope.clone(), call, outbox.clone());
-        }
+        Ok(WsClientMessage::Call(call)) => admit(call),
         Ok(WsClientMessage::ReceivedResponse { id }) => {
             debug!(call_id = id, "client acknowledged response");
             state.ws_sync_cache().evict_id(scope, id);
@@ -958,23 +1031,49 @@ fn handle_ws_text(
         Ok(WsClientMessage::FullSync { messages }) => {
             debug!(count = messages.len(), "replaying FULL_SYNC calls");
             for call in messages {
-                spawn_ws_call(state.clone(), scope.clone(), call, outbox.clone());
+                admit(call);
             }
         }
         Err(err) => {
             warn!(error = %err, "rejected malformed WebSocket frame");
         }
     }
+    rejections
+}
+
+/// Sends frames on the socket in order, stopping at the first write error.
+async fn send_frames(socket: &mut WebSocket, frames: Vec<WsServerMessage>) -> Result<(), ()> {
+    for frame in frames {
+        let Ok(encoded) = serde_json::to_string(&frame) else {
+            continue;
+        };
+        socket
+            .send(Message::Text(encoded.into()))
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 fn spawn_ws_call(
-    state: AppState,
-    scope: SyncScope,
+    state: &AppState,
+    scope: &SyncScope,
+    limiter: &CallLimiter,
+    pending: PendingGuard,
     call: WsCallPayload,
-    outbox: mpsc::Sender<WsServerMessage>,
+    outbox: &mpsc::Sender<WsServerMessage>,
 ) {
+    let state = state.clone();
+    let scope = scope.clone();
+    let permits = Arc::clone(&limiter.permits);
+    let outbox = outbox.clone();
     let cache = Arc::clone(state.ws_sync_cache());
     tokio::spawn(async move {
+        let _pending = pending;
+        // The semaphore is never closed, so acquiring only waits for a free slot.
+        let Ok(_permit) = permits.acquire_owned().await else {
+            return;
+        };
         let reply = cache
             .execute(scope, call, |c| dispatch_call(state.clone(), c))
             .await;

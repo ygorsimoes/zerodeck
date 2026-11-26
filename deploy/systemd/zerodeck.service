@@ -1,7 +1,8 @@
 [Unit]
 Description=ZeroDeck Plugin Loader Daemon
 After=network.target zerodeck-recovery.service
-Wants=zerodeck-recovery.service
+# Do not add a weak dependency on the recovery unit: recovery is enabled at boot on its own, and
+# a daemon start from the apply unit must not pull recovery in while apply holds the exclusive lock.
 # The launcher resolves the active immutable generation from this root-owned reference. Without
 # it the daemon must not start; recovery clears it when no good generation remains.
 ConditionPathExists=/var/lib/zerodeck/current

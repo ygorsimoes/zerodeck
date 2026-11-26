@@ -105,6 +105,11 @@ pub struct PendingTransaction {
     /// Whether the daemon was running before the apply stopped it.
     #[serde(default)]
     pub was_running: bool,
+    /// Whether the candidate was durably attempted for startup.
+    ///
+    /// Pre-start failures remain recoverable without quarantining the candidate.
+    #[serde(default)]
+    pub start_attempted: bool,
 }
 
 /// Durable progress markers for a pending activation.
@@ -313,6 +318,7 @@ mod tests {
             candidate,
             phase: TransactionPhase::Switched,
             was_running: true,
+            start_attempted: true,
         }
     }
 

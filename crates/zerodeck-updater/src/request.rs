@@ -110,6 +110,11 @@ impl ApplyRequest {
                         "a rollback request must not carry catalog metadata".to_owned(),
                     ));
                 }
+                if self.start_service {
+                    return Err(UpdateError::InvalidApplyRequest(
+                        "a rollback request must not request a service start".to_owned(),
+                    ));
+                }
             }
         }
         Ok(())

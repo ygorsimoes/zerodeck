@@ -146,17 +146,30 @@ pub struct GenerationStore {
 impl GenerationStore {
     /// Opens the generation store rooted at `root`, creating its generations directory.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, UpdateError> {
-        let requested = root.as_ref();
+        Self::open(root.as_ref(), true)
+    }
+
+    /// Opens an existing generation store without creating or repairing directories.
+    ///
+    /// `zerodeckctl status` uses this so a read-only summary never mutates the host layout.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, UpdateError> {
+        Self::open(root.as_ref(), false)
+    }
+
+    fn open(root: &Path, create: bool) -> Result<Self, UpdateError> {
+        let requested = root;
         let root = fs::canonicalize(requested).map_err(|source| UpdateError::Io {
             path: requested.to_path_buf(),
             source,
         })?;
 
         let generations = root.join(GENERATIONS_DIR);
-        fs::create_dir_all(&generations).map_err(|source| UpdateError::Io {
-            path: generations.clone(),
-            source,
-        })?;
+        if create {
+            fs::create_dir_all(&generations).map_err(|source| UpdateError::Io {
+                path: generations.clone(),
+                source,
+            })?;
+        }
         let generations = fs::canonicalize(&generations).map_err(|source| UpdateError::Io {
             path: generations,
             source,
@@ -670,6 +683,7 @@ mod tests {
                 candidate: pending_candidate.clone(),
                 phase: TransactionPhase::Switched,
                 was_running: true,
+                start_attempted: true,
             }),
             ..UpdateState::new()
         };

@@ -680,3 +680,89 @@ async fn catalog_rejects_wrong_arch_floor_version_reuse_and_expiry() {
         Version::parse("0.1.3").expect("parse restored version")
     );
 }
+
+#[tokio::test]
+async fn preview_candidate_does_not_supersede_a_staged_authorization() {
+    let fixture = Fixture::new().await;
+    let update_root = TestDir::new("preview-root");
+    let stable_012 = TargetSpec::new(
+        "linux-x86_64",
+        "0.1.2",
+        "stable",
+        "build-0.1.2",
+        "0.1.0",
+        "preview-012",
+    );
+    let stable_013 = TargetSpec::new(
+        "linux-x86_64",
+        "0.1.3",
+        "stable",
+        "build-0.1.3",
+        "0.1.0",
+        "preview-013",
+    );
+    fixture
+        .publish(&PublishSpec {
+            root_version: 1,
+            metadata_version: 1,
+            expires: FAR_FUTURE,
+            targets: vec![stable_012.clone()],
+        })
+        .await;
+    let catalog = load_catalog(&fixture, &update_root.0).await;
+    let policy = SelectionPolicy::new(Version::parse("1.0.0").expect("updater version"))
+        .with_installed(
+            Version::parse("0.1.1").expect("installed version"),
+            generation_id('c'),
+        );
+    let staged = catalog
+        .candidate(&policy)
+        .expect("select staged release")
+        .expect("0.1.2 is eligible");
+    assert_eq!(staged.digest, stable_012.digest());
+    let before_expiry = SystemTime::now() + Duration::from_secs(3600);
+
+    fixture
+        .publish(&PublishSpec {
+            root_version: 1,
+            metadata_version: 2,
+            expires: FAR_FUTURE,
+            targets: vec![stable_012.clone(), stable_013.clone()],
+        })
+        .await;
+    let reloaded = load_catalog(&fixture, &update_root.0).await;
+    let preview = reloaded
+        .preview_candidate(&policy)
+        .expect("preview newer release")
+        .expect("0.1.3 is eligible");
+    assert_eq!(preview.digest, stable_013.digest());
+
+    let offline = Catalog::open_offline(&update_root.0).expect("open persisted authorization");
+    let persisted = offline
+        .persisted_authorization()
+        .expect("read persisted authorization")
+        .expect("staged authorization remains");
+    assert_eq!(persisted.digest, staged.digest);
+    offline
+        .authorize_staged(&staged, before_expiry)
+        .expect("check-only must not invalidate the staged release");
+    assert!(matches!(
+        offline.authorize_staged(&preview, before_expiry),
+        Err(UpdateError::ReleaseSuperseded { .. })
+    ));
+
+    let selected = reloaded
+        .candidate(&policy)
+        .expect("persisting selection succeeds")
+        .expect("0.1.3 is eligible");
+    assert_eq!(selected.digest, stable_013.digest());
+    assert_eq!(
+        Catalog::open_offline(&update_root.0)
+            .expect("open after selection")
+            .persisted_authorization()
+            .expect("read selected authorization")
+            .expect("selection is persisted")
+            .digest,
+        stable_013.digest()
+    );
+}

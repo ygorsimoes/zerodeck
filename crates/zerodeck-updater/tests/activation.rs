@@ -7,7 +7,7 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,7 +31,7 @@ use zerodeck_updater::{
     CatalogStateStore, Channel, DAEMON_UNIT, GenerationId, GenerationStore, PendingTransaction,
     RecoveryMode, StateStore, Systemctl, SystemctlFuture, SystemdService, TransactionPhase,
     UpdateError, UpdateState, UpgradeOutcome, apply_pending, apply_pending_with, enqueue_rollback,
-    enqueue_upgrade, recover,
+    enqueue_upgrade, recover, recover_with,
 };
 
 const TOKEN: &str = "activation-test-token";
@@ -97,6 +97,8 @@ struct Runtime {
     calls: Mutex<Vec<ServiceCall>>,
     current_file: PathBuf,
     fail_build: Mutex<Option<String>>,
+    fail_invocation: AtomicBool,
+    fail_stop: AtomicBool,
     readiness_hits: AtomicUsize,
 }
 
@@ -109,6 +111,8 @@ impl Runtime {
             calls: Mutex::new(Vec::new()),
             current_file,
             fail_build: Mutex::new(None),
+            fail_invocation: AtomicBool::new(false),
+            fail_stop: AtomicBool::new(false),
             readiness_hits: AtomicUsize::new(0),
         }
     }
@@ -131,6 +135,14 @@ impl Runtime {
         let mut fail = self.fail_build.lock().expect("fail build lock");
         *fail = build_id.map(str::to_owned);
     }
+
+    fn fail_invocation(&self, fail: bool) {
+        self.fail_invocation.store(fail, Ordering::SeqCst);
+    }
+
+    fn fail_stop(&self, fail: bool) {
+        self.fail_stop.store(fail, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug)]
@@ -139,8 +151,15 @@ struct MockSystemctl {
 }
 
 impl Systemctl for MockSystemctl {
-    fn invocation_id<'a>(&'a self, _unit: &'a str) -> SystemctlFuture<'a, String> {
+    fn invocation_id<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, String> {
         Box::pin(async move {
+            if self.runtime.fail_invocation.load(Ordering::SeqCst) {
+                return Err(UpdateError::Systemctl {
+                    unit: unit.to_owned(),
+                    operation: "invocation-id",
+                    reason: "injected invocation failure".to_owned(),
+                });
+            }
             Ok(self
                 .runtime
                 .invocation
@@ -154,8 +173,15 @@ impl Systemctl for MockSystemctl {
         Box::pin(async move { Ok(self.runtime.active.load(Ordering::SeqCst)) })
     }
 
-    fn stop<'a>(&'a self, _unit: &'a str) -> SystemctlFuture<'a, ()> {
+    fn stop<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
         Box::pin(async move {
+            if self.runtime.fail_stop.load(Ordering::SeqCst) {
+                return Err(UpdateError::Systemctl {
+                    unit: unit.to_owned(),
+                    operation: "stop",
+                    reason: "injected stop failure".to_owned(),
+                });
+            }
             self.runtime
                 .calls
                 .lock()
@@ -435,6 +461,14 @@ impl Harness {
         self.runtime.fail_build(build_id);
     }
 
+    fn fail_invocation(&self, fail: bool) {
+        self.runtime.fail_invocation(fail);
+    }
+
+    fn fail_stop(&self, fail: bool) {
+        self.runtime.fail_stop(fail);
+    }
+
     fn catalog(&self) -> Catalog {
         Catalog::open_offline(&self.root).expect("open offline catalog")
     }
@@ -547,7 +581,9 @@ async fn activation_recovers_after_every_interrupted_transition() {
                 assert!(harness.runtime.active.load(Ordering::SeqCst));
                 candidate.clone()
             }
-            ActivationCheckpoint::AfterLock => unreachable!(),
+            ActivationCheckpoint::AfterLock | ActivationCheckpoint::BeforePreviousRestart => {
+                unreachable!()
+            }
         };
         assert_eq!(harness.current(), Some(expected_current), "{checkpoint:?}");
 
@@ -607,14 +643,38 @@ async fn activation_recovers_after_every_interrupted_transition() {
             catalog_before,
             "recovery must not change trusted metadata"
         );
-        assert!(
-            harness
-                .requests
-                .read_optional()
-                .expect("read request")
-                .is_none(),
-            "recovery must consume the owned request"
-        );
+        if checkpoint == ActivationCheckpoint::BeforeIntent {
+            assert!(
+                harness
+                    .requests
+                    .read_optional()
+                    .expect("read request")
+                    .is_some(),
+                "no-pending recovery must not delete an unowned request"
+            );
+        } else {
+            assert!(
+                harness
+                    .requests
+                    .read_optional()
+                    .expect("read request")
+                    .is_none(),
+                "recovery must consume its own request"
+            );
+        }
+        if checkpoint != ActivationCheckpoint::BeforeIntent {
+            let recovered = harness.read_state();
+            assert!(
+                recovered.last_error.is_none(),
+                "{checkpoint:?} success must clear last_error"
+            );
+            assert!(
+                recovered.last_result.as_deref().is_some_and(
+                    |result| result.contains("recovered") || result.contains("confirmed")
+                ),
+                "{checkpoint:?} must record a successful result"
+            );
+        }
 
         let state_before = fs::read(harness.state.path()).expect("state bytes");
         let calls_before_second = harness.calls();
@@ -1542,6 +1602,7 @@ async fn duplicate_pending_transaction_is_rejected_without_touching_the_service(
             candidate: generation_id('b'),
             phase: TransactionPhase::Switched,
             was_running: true,
+            start_attempted: true,
         }),
         ..UpdateState::new()
     });
@@ -1558,4 +1619,497 @@ async fn duplicate_pending_transaction_is_rejected_without_touching_the_service(
         "{error:?}"
     );
     assert_eq!(harness.calls(), Vec::new());
+}
+
+#[tokio::test]
+async fn recovery_restarts_previous_after_a_fault_window() {
+    let harness = crashed_at(ActivationCheckpoint::AfterStop).await;
+    let error = recover_with(
+        &harness.store,
+        &harness.state,
+        &harness.service,
+        RecoveryMode::AfterApply,
+        &CrashAt {
+            checkpoint: ActivationCheckpoint::BeforePreviousRestart,
+        },
+    )
+    .await
+    .expect_err("the recovery process is lost before restarting previous");
+    assert!(matches!(error, UpdateError::SimulatedCrash(_)));
+    let interrupted = harness.read_state();
+    let pending = interrupted
+        .pending
+        .expect("reverting transaction remains durable");
+    assert_eq!(pending.phase, TransactionPhase::Reverting);
+    assert!(pending.was_running);
+    assert_eq!(harness.current(), Some(generation_id('a')));
+    assert!(!harness.runtime.active.load(Ordering::SeqCst));
+    assert!(
+        harness
+            .requests
+            .read_optional()
+            .expect("read request")
+            .is_some()
+    );
+
+    recover(
+        &harness.store,
+        &harness.state,
+        &harness.service,
+        RecoveryMode::AfterApply,
+    )
+    .await
+    .expect("second recovery restarts the previous daemon");
+    let recovered = harness.read_state();
+    assert!(recovered.pending.is_none());
+    assert!(recovered.last_error.is_none());
+    assert!(
+        recovered
+            .last_result
+            .as_deref()
+            .is_some_and(|result| result.contains("recovered"))
+    );
+    assert!(harness.runtime.active.load(Ordering::SeqCst));
+    assert!(
+        harness
+            .requests
+            .read_optional()
+            .expect("read request")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_enqueue_never_overwrites_the_single_request() {
+    let harness = Harness::new("concurrent-enqueue").await;
+    let (previous, _) = harness.add_generation('a', "1.0.0", "build-old");
+    let (_, candidate_release) = harness.add_generation('b', "2.0.0", "build-new");
+    let (rollback, _) = harness.add_generation('c', "0.9.0", "build-older");
+    harness
+        .store
+        .switch_to(&previous)
+        .expect("activate previous");
+    harness.write_state(&UpdateState {
+        last_confirmed: Some(previous.clone()),
+        rollback_target: Some(rollback),
+        ..UpdateState::new()
+    });
+    harness.set_catalog(candidate_release, now() - 10, now() + 3_600);
+    harness.set_running(true);
+
+    let (upgrade, rollback) = tokio::join!(
+        enqueue_upgrade(&harness.store, &harness.state, &harness.service, false),
+        async { enqueue_rollback(&harness.store, &harness.state) }
+    );
+    let upgrade_won = matches!(upgrade, Ok(UpgradeOutcome::Requested { .. }));
+    let rollback_won = rollback.is_ok();
+    assert!(
+        upgrade_won ^ rollback_won,
+        "exactly one enqueue must win: upgrade={upgrade:?} rollback={rollback:?}"
+    );
+    let upgrade_result = upgrade.map(|_| ());
+    let rollback_result = rollback.map(|_| ());
+    let loser = if upgrade_won {
+        rollback_result
+    } else {
+        upgrade_result
+    };
+    assert!(
+        matches!(loser, Err(UpdateError::Busy | UpdateError::RequestPending)),
+        "losing enqueue must be Busy or RequestPending: {loser:?}"
+    );
+    let stored = harness.requests.read().expect("one request remains");
+    assert_eq!(
+        stored.kind,
+        if upgrade_won {
+            ApplyKind::Upgrade
+        } else {
+            ApplyKind::Rollback
+        }
+    );
+    assert!(harness.read_state().pending.is_none());
+    assert_eq!(harness.current(), Some(previous));
+    assert_eq!(harness.calls(), Vec::new());
+}
+
+#[tokio::test]
+async fn pre_start_failures_do_not_quarantine_a_candidate() {
+    let previous = Harness::new("pre-start-previous").await;
+    let (old, _) = previous.add_generation('a', "1.0.0", "build-old");
+    let (_, candidate_release) = previous.add_generation('b', "2.0.0", "build-new");
+    previous.store.switch_to(&old).expect("activate previous");
+    previous.write_state(&UpdateState {
+        last_confirmed: Some(old.clone()),
+        ..UpdateState::new()
+    });
+    previous.set_catalog(candidate_release.clone(), now() - 10, now() + 3_600);
+    previous.set_running(true);
+    previous.enqueue(&ApplyRequest::upgrade(
+        candidate_release,
+        Some(old.clone()),
+        false,
+    ));
+    previous.fail_stop(true);
+    let error = previous
+        .apply()
+        .await
+        .expect_err("the injected stop failure aborts before start");
+    assert!(matches!(error, UpdateError::Systemctl { .. }), "{error:?}");
+    let state = previous.read_state();
+    assert!(state.pending.is_none());
+    assert!(
+        state.quarantined.is_empty(),
+        "a candidate that was never started must not be quarantined"
+    );
+    assert_eq!(previous.current(), Some(old.clone()));
+    assert!(previous.runtime.active.load(Ordering::SeqCst));
+    assert!(
+        previous
+            .requests
+            .read_optional()
+            .expect("read request")
+            .is_none()
+    );
+
+    let first = Harness::new("pre-start-first").await;
+    let (_, candidate_release) = first.add_generation('b', "2.0.0", "build-new");
+    first.set_catalog(candidate_release.clone(), now() - 10, now() + 3_600);
+    first.set_running(false);
+    first.enqueue(&ApplyRequest::upgrade(candidate_release, None, true));
+    first.fail_invocation(true);
+    let error = first
+        .apply()
+        .await
+        .expect_err("the injected invocation failure aborts before start");
+    assert!(matches!(error, UpdateError::NoGoodGeneration), "{error:?}");
+    assert!(
+        first
+            .read_state()
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected invocation failure")),
+        "the underlying systemctl failure must remain visible"
+    );
+    let state = first.read_state();
+    assert!(state.pending.is_none());
+    assert!(
+        state.quarantined.is_empty(),
+        "a pre-start first-install failure must remain retryable"
+    );
+    assert_eq!(first.current(), None);
+    assert!(!first.runtime.active.load(Ordering::SeqCst));
+    assert!(
+        first
+            .requests
+            .read_optional()
+            .expect("read request")
+            .is_none()
+    );
+}
+
+#[test]
+fn unquarantine_is_exclusive_atomic_and_idempotent() {
+    use std::process::Command;
+
+    let dir = TestDir::new("unquarantine");
+    let root = dir.0.join("root");
+    fs::create_dir_all(&root).expect("create root");
+    let store = GenerationStore::new(&root).expect("open generation store");
+    let generation = generation_id('d');
+    fs::create_dir_all(store.generation_dir(&generation)).expect("create generation stub");
+    let state = StateStore::new(root.join("state/update.json"));
+    state
+        .write(&UpdateState {
+            quarantined: vec![generation.clone()],
+            ..UpdateState::new()
+        })
+        .expect("seed quarantine");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["--root"])
+        .arg(&root)
+        .args(["unquarantine", generation.as_str()])
+        .output()
+        .expect("run unquarantine");
+    assert!(
+        output.status.success(),
+        "unquarantine failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !state
+            .read()
+            .expect("read state")
+            .quarantined
+            .contains(&generation)
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["--root"])
+        .arg(&root)
+        .args(["unquarantine", generation.as_str()])
+        .output()
+        .expect("rerun unquarantine");
+    assert!(output.status.success(), "unquarantine must be idempotent");
+
+    let unknown = generation_id('e');
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["--root"])
+        .arg(&root)
+        .args(["unquarantine", unknown.as_str()])
+        .output()
+        .expect("run unknown unquarantine");
+    assert!(
+        !output.status.success(),
+        "an unknown digest must be rejected"
+    );
+}
+
+#[test]
+fn status_redacts_paths_and_never_creates_directories() {
+    use std::process::Command;
+
+    let dir = TestDir::new("status");
+    let missing = dir.0.join("missing-root");
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["status", "--root"])
+        .arg(&missing)
+        .output()
+        .expect("run status on a missing root");
+    assert!(!output.status.success());
+    assert!(!missing.exists(), "status must not create a missing root");
+
+    let root = dir.0.join("status-root");
+    fs::create_dir_all(root.join("generations")).expect("create generations");
+    let secret = root.join("private/state");
+    StateStore::new(root.join("state/update.json"))
+        .write(&UpdateState {
+            last_result: Some("recovered build-old".to_owned()),
+            last_error: Some(format!(
+                "filesystem error at `{}`: denied",
+                secret.display()
+            )),
+            ..UpdateState::new()
+        })
+        .expect("write state");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["status", "--root"])
+        .arg(&root)
+        .output()
+        .expect("run status");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("recovered build-old"), "{stdout}");
+    assert!(
+        !stdout.contains(&root.to_string_lossy().to_string()),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("private/state"), "{stdout}");
+}
+
+#[test]
+fn boot_recovery_does_not_require_a_readiness_url() {
+    use std::process::Command;
+
+    let dir = TestDir::new("boot-no-url");
+    let root = dir.0.join("root");
+    fs::create_dir_all(&root).expect("create root");
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["recover-boot", "--root"])
+        .arg(&root)
+        .env("ZERODECK_READY_URL", "::not-a-url")
+        .output()
+        .expect("run boot recovery");
+    assert!(
+        output.status.success(),
+        "boot recovery must not parse the readiness URL: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn update_treats_a_corrupt_current_as_unknown() {
+    use std::process::Command;
+
+    let dir = TestDir::new("corrupt-current-update");
+    let root = dir.0.join("root");
+    fs::create_dir_all(&root).expect("create root");
+    fs::write(root.join("current"), b"not-a-generation-digest").expect("seed corrupt current");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["update", "--check-only", "--root"])
+        .arg(&root)
+        .env_remove("ZERODECK_UPDATE_METADATA_URL")
+        .env_remove("ZERODECK_UPDATE_TARGETS_URL")
+        .env_remove("ZERODECK_UPDATE_TRUSTED_ROOT")
+        .output()
+        .expect("run update");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("treating the installed version as unknown"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("invalid generation id"), "{stderr}");
+}
+
+#[tokio::test]
+async fn rollback_succeeds_with_corrupt_catalog_state_and_rejects_start_requests() {
+    let harness = Harness::new("rollback-corrupt-catalog").await;
+    let (target, _) = harness.add_generation('a', "1.0.0", "build-old");
+    let (current, _) = harness.add_generation('b', "2.0.0", "build-new");
+    harness.store.switch_to(&current).expect("activate current");
+    harness.write_state(&UpdateState {
+        last_confirmed: Some(current.clone()),
+        rollback_target: Some(target.clone()),
+        ..UpdateState::new()
+    });
+    harness.set_running(true);
+    fs::create_dir_all(harness.root.join("state")).expect("create state dir");
+    fs::write(
+        harness.root.join("state/catalog.json"),
+        b"this is not catalog JSON",
+    )
+    .expect("corrupt catalog state");
+    let catalog_bytes = harness.catalog_bytes();
+
+    let mut invalid = ApplyRequest::rollback(target.clone(), Some(current.clone()));
+    invalid.start_service = true;
+    let error = harness
+        .requests
+        .write(&invalid)
+        .expect_err("rollback start requests are invalid");
+    assert!(
+        matches!(error, UpdateError::InvalidApplyRequest(_)),
+        "{error:?}"
+    );
+
+    enqueue_rollback(&harness.store, &harness.state).expect("enqueue offline rollback");
+    harness
+        .apply()
+        .await
+        .expect("corrupt catalog must not block an offline rollback");
+    assert_eq!(harness.current(), Some(target));
+    assert_eq!(harness.catalog_bytes(), catalog_bytes);
+    assert!(harness.runtime.active.load(Ordering::SeqCst));
+}
+
+#[test]
+fn systemd_units_do_not_pull_boot_recovery_from_the_daemon() {
+    let units = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/systemd");
+    let daemon = fs::read_to_string(units.join("zerodeck.service")).expect("read daemon unit");
+    let apply = fs::read_to_string(units.join("zerodeck-apply.service")).expect("read apply unit");
+    let recovery =
+        fs::read_to_string(units.join("zerodeck-recovery.service")).expect("read recovery unit");
+
+    assert!(
+        daemon.contains("After=network.target zerodeck-recovery.service"),
+        "daemon must remain ordered after boot recovery"
+    );
+    assert!(
+        !daemon.contains("Wants=zerodeck-recovery.service"),
+        "apply/start must not pull boot recovery while holding the lock"
+    );
+    assert!(
+        !apply.contains("zerodeck-recovery.service"),
+        "the independent apply unit must not pull boot recovery"
+    );
+    assert!(recovery.contains("Before=zerodeck.service"));
+    assert!(recovery.contains("WantedBy=multi-user.target"));
+}
+
+#[tokio::test]
+async fn post_apply_recovery_does_not_delete_a_new_request() {
+    let harness = Harness::new("post-apply-new-request").await;
+    let (previous, _) = harness.add_generation('a', "1.0.0", "build-old");
+    let (candidate, candidate_release) = harness.add_generation('b', "2.0.0", "build-new");
+    let (next, next_release) = harness.add_generation('c', "3.0.0", "build-next");
+    harness
+        .store
+        .switch_to(&previous)
+        .expect("activate previous");
+    harness.write_state(&UpdateState {
+        last_confirmed: Some(previous.clone()),
+        ..UpdateState::new()
+    });
+    harness.set_catalog(candidate_release.clone(), now() - 10, now() + 3_600);
+    harness.set_running(true);
+    harness.enqueue(&ApplyRequest::upgrade(
+        candidate_release,
+        Some(previous.clone()),
+        false,
+    ));
+    harness.apply().await.expect("first apply succeeds");
+    assert!(
+        harness
+            .requests
+            .read_optional()
+            .expect("read request")
+            .is_none()
+    );
+    assert_eq!(harness.current(), Some(candidate.clone()));
+
+    let next_request = ApplyRequest::upgrade(next_release, Some(candidate), false);
+    harness.enqueue(&next_request);
+    harness
+        .requests
+        .read()
+        .expect("next request remains durable");
+    recover(
+        &harness.store,
+        &harness.state,
+        &harness.service,
+        RecoveryMode::AfterApply,
+    )
+    .await
+    .expect("post-apply recovery with no pending transaction is a no-op");
+    let remaining = harness
+        .requests
+        .read()
+        .expect("the independent request must not be deleted");
+    assert_eq!(remaining.id, next_request.id);
+    assert_eq!(remaining.generation, next);
+}
+
+#[tokio::test]
+async fn first_install_pre_start_interruption_does_not_quarantine() {
+    let harness = Harness::new("first-install-pre-start").await;
+    let (candidate, _) = harness.add_generation('b', "2.0.0", "build-new");
+    harness.write_state(&UpdateState {
+        pending: Some(PendingTransaction {
+            id: Uuid::new_v4(),
+            previous: None,
+            candidate: candidate.clone(),
+            phase: TransactionPhase::Prepared,
+            was_running: false,
+            start_attempted: false,
+        }),
+        ..UpdateState::new()
+    });
+    let calls = harness.calls();
+    let result = recover(
+        &harness.store,
+        &harness.state,
+        &harness.service,
+        RecoveryMode::AfterApply,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(UpdateError::NoGoodGeneration)),
+        "{result:?}"
+    );
+    assert_eq!(harness.current(), None);
+    assert_eq!(harness.calls(), calls);
+    let state = harness.read_state();
+    assert!(state.pending.is_none());
+    assert!(
+        state.quarantined.is_empty(),
+        "a pre-start first install stays retryable after recovery"
+    );
+    assert!(state.last_error.is_some());
 }

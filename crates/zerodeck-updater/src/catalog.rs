@@ -279,14 +279,25 @@ impl Catalog {
             path: requested.to_path_buf(),
             source,
         })?;
+        // Parsing is deferred to the authorization check. Rollback never consults the catalog, so
+        // corrupt or absent persisted metadata must not block an offline rollback; an upgrade
+        // still fails closed when `authorize_staged` reads the document.
         let state = CatalogStateStore::new(root.join(STATE_DIR).join(CATALOG_STATE_FILE));
-        let persisted = state.read()?;
+        // Tolerate a corrupt document so rollback can construct this handle; selection and
+        // authorization still parse it and fail closed.
+        let (verified_at, expires_at) = match state.read() {
+            Ok(persisted) => (
+                persisted.last_verified_at.unwrap_or(0),
+                persisted.expires_at.unwrap_or(0),
+            ),
+            Err(_) => (0, 0),
+        };
         Ok(Self {
             repository: None,
             targets_url: None,
             state,
-            verified_at: persisted.last_verified_at.unwrap_or(0),
-            expires_at: persisted.expires_at.unwrap_or(0),
+            verified_at,
+            expires_at,
         })
     }
 
@@ -321,6 +332,20 @@ impl Catalog {
             self.state.write(&next)?;
         }
         Ok(selected)
+    }
+
+    /// Selects without persisting a new authorization.
+    ///
+    /// `update --check-only` uses this so merely reporting a newer release cannot supersede the
+    /// release that is already staged for activation.
+    pub fn preview_candidate(
+        &self,
+        policy: &SelectionPolicy,
+    ) -> Result<Option<AuthorizedRelease>, UpdateError> {
+        let now = now_seconds()?;
+        let state = self.state.read()?;
+        self.ensure_fresh(&state, now)?;
+        self.select(policy)
     }
 
     /// Returns the release selected by the freshest trusted metadata, without network access.

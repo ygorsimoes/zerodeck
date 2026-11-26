@@ -11,20 +11,24 @@ use semver::Version;
 use url::Url;
 use zerodeck_updater::{
     ACTIVATION_DEADLINE, APPLY_UNIT, ApplyRequestStore, AuthorizedRelease, Catalog, Channel,
-    DAEMON_UNIT, GenerationStore, RecoveryMode, SelectionPolicy, StateStore, SystemdService,
-    UpdateError, UpgradeOutcome, apply_pending, enqueue_rollback, enqueue_upgrade, recover,
-    stage_release,
+    DAEMON_UNIT, GenerationId, GenerationStore, RecoveryMode, SelectionPolicy, StateStore,
+    SystemdService, UpdateError, UpgradeOutcome, acquire_maintenance_exclusive, apply_pending,
+    enqueue_rollback, enqueue_upgrade, recover, recover_before_boot, stage_release,
 };
 
 const DEFAULT_ROOT: &str = "/var/lib/zerodeck";
 const DEFAULT_READY_URL: &str = "http://127.0.0.1:1337";
 const APPLY_WAIT: Duration = Duration::from_secs(ACTIVATION_DEADLINE.as_secs() + 120);
+/// Distinct exit status for a staged candidate that needs an explicit `--start`.
+const EXIT_REQUIRES_START: i32 = 75;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "zerodeckctl",
     version,
-    about = "ZeroDeck managed loader controller"
+    about = "ZeroDeck managed loader controller",
+    after_help = "Exit codes: 0 success; 75 candidate staged but the managed service is stopped \
+                  (rerun `upgrade --start`); 1 error."
 )]
 struct Cli {
     /// Root-owned update root (`current`, `generations/`, `state/`, `tuf/`).
@@ -66,6 +70,11 @@ enum Command {
     Status,
     /// Request offline restoration of the retained rollback target.
     Rollback,
+    /// Remove a digest from the failed-trial quarantine after it was reviewed.
+    Unquarantine {
+        /// Quarantined generation digest.
+        digest: String,
+    },
     /// Internal: consume the single apply request (runs in `zerodeck-apply.service`).
     #[command(hide = true)]
     Apply,
@@ -85,7 +94,15 @@ async fn main() {
     let cli = Cli::parse();
     if let Err(error) = run(cli).await {
         eprintln!("zerodeckctl: {error}");
-        std::process::exit(1);
+        std::process::exit(exit_code(&error));
+    }
+}
+
+fn exit_code(error: &UpdateError) -> i32 {
+    if matches!(error, UpdateError::StartRequired) {
+        EXIT_REQUIRES_START
+    } else {
+        1
     }
 }
 
@@ -98,6 +115,7 @@ async fn run(cli: Cli) -> Result<(), UpdateError> {
         Command::Upgrade { start } => run_upgrade(&cli.root, start).await,
         Command::Status => run_status(&cli.root),
         Command::Rollback => run_rollback(&cli.root).await,
+        Command::Unquarantine { digest } => run_unquarantine(&cli.root, &digest),
         Command::Apply => run_apply(&cli.root).await,
         Command::RecoverAfterApply => {
             let (store, state, service) = open_runtime(&cli.root)?;
@@ -106,8 +124,11 @@ async fn run(cli: Cli) -> Result<(), UpdateError> {
             Ok(())
         }
         Command::RecoverBoot => {
-            let (store, state, service) = open_runtime(&cli.root)?;
-            recover(&store, &state, &service, RecoveryMode::BeforeBootStart).await?;
+            // Boot recovery is disk-only: do not parse a readiness URL or construct an HTTP
+            // client that the ordered daemon start does not need.
+            let store = GenerationStore::new(&cli.root)?;
+            let state = state_store(&cli.root);
+            recover_before_boot(&store, &state).await?;
             print!("{}", summary_line(&state.read()?));
             Ok(())
         }
@@ -126,6 +147,7 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     let state = state_store(root);
     let _guard = zerodeck_updater::acquire_maintenance_shared(&store)?;
 
+    let installed = installed_release(&store);
     let metadata_url = environment_url("ZERODECK_UPDATE_METADATA_URL")?;
     let targets_url = environment_url("ZERODECK_UPDATE_TARGETS_URL")?;
     let trusted_root_path = std::env::var("ZERODECK_UPDATE_TRUSTED_ROOT")
@@ -136,16 +158,19 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     })?;
 
     let catalog = Catalog::load(root, metadata_url, targets_url, &trusted_root).await?;
-    let current = store.current_reference()?;
     let mut policy = SelectionPolicy::new(crate_version())
         .with_channel(channel)
         .with_prereleases(channel == Channel::Testing);
-    if let Some(generation) = &current {
-        let layout = store.verify_generation(generation)?;
-        policy = policy.with_installed(layout.release().version().clone(), generation.clone());
+    if let Some((version, generation)) = installed {
+        policy = policy.with_installed(version, generation);
     }
 
-    let candidate = catalog.candidate(&policy)?;
+    // `--check-only` must not supersede the authorization of the release already staged.
+    let candidate = if check_only {
+        catalog.preview_candidate(&policy)?
+    } else {
+        catalog.candidate(&policy)?
+    };
     let Some(release) = candidate else {
         println!(
             "zerodeckctl: no newer {} release is available",
@@ -179,7 +204,7 @@ async fn run_upgrade(root: &Path, start: bool) -> Result<(), UpdateError> {
                 "zerodeckctl: candidate {candidate} is staged but the managed service is stopped; \
                  rerun with `--start` to activate it"
             );
-            Ok(())
+            Err(UpdateError::StartRequired)
         }
         UpgradeOutcome::Requested { request } => {
             start_apply_and_report(&state, &request.generation).await
@@ -193,17 +218,37 @@ async fn run_rollback(root: &Path) -> Result<(), UpdateError> {
     start_apply_and_report(&state, &request.generation).await
 }
 
-fn run_status(root: &Path) -> Result<(), UpdateError> {
+fn run_unquarantine(root: &Path, digest: &str) -> Result<(), UpdateError> {
+    let generation = GenerationId::new(digest)?;
     let store = GenerationStore::new(root)?;
+    let _guard = acquire_maintenance_exclusive(&store)?;
+    if !store.generation_dir(&generation).is_dir() {
+        return Err(UpdateError::MissingGeneration(generation));
+    }
     let state = state_store(root);
-    let persisted = state.read()?;
+    let mut persisted = state.read()?;
+    if persisted.quarantined.contains(&generation) {
+        persisted.quarantined.retain(|entry| entry != &generation);
+        state.write(&persisted)?;
+        println!("zerodeckctl: unquarantined {generation}");
+    } else {
+        // Idempotent for a known installed generation; a digest with no generation directory was
+        // rejected above as unknown.
+        println!("zerodeckctl: {generation} is not quarantined");
+    }
+    Ok(())
+}
+
+fn run_status(root: &Path) -> Result<(), UpdateError> {
+    let store = GenerationStore::open_existing(root).map_err(status_unavailable)?;
+    let state = state_store(root);
+    let persisted = state.read().map_err(status_unavailable)?;
     let requests = ApplyRequestStore::for_state(&state);
 
+    let active = store.current_reference().map_err(status_unavailable)?;
     println!(
         "active: {}",
-        store
-            .current_reference()?
-            .map_or_else(|| "none".to_owned(), |generation| generation.to_string())
+        active.map_or_else(|| "none".to_owned(), |generation| generation.to_string())
     );
     println!(
         "rollback: {}",
@@ -213,10 +258,10 @@ fn run_status(root: &Path) -> Result<(), UpdateError> {
             .map_or_else(|| "none".to_owned(), ToString::to_string)
     );
 
-    let catalog = Catalog::open_offline(root)?;
-    match catalog.persisted_authorization()? {
-        Some(release) => print_release("candidate", &release),
-        None => println!("candidate: none"),
+    match Catalog::open_offline(root).and_then(|catalog| catalog.persisted_authorization()) {
+        Ok(Some(release)) => print_release("candidate", &release),
+        Ok(None) => println!("candidate: none"),
+        Err(_) => println!("candidate: unknown"),
     }
 
     if persisted.quarantined.is_empty() {
@@ -252,11 +297,11 @@ fn run_status(root: &Path) -> Result<(), UpdateError> {
     }
     println!(
         "last_result: {}",
-        persisted.last_result.as_deref().unwrap_or("none")
+        redact_status_text(persisted.last_result.as_deref().unwrap_or("none"), root)
     );
     println!(
         "last_error: {}",
-        persisted.last_error.as_deref().unwrap_or("none")
+        redact_status_text(persisted.last_error.as_deref().unwrap_or("none"), root)
     );
     Ok(())
 }
@@ -355,6 +400,63 @@ fn exec_current(root: &Path) -> Result<(), UpdateError> {
     }
 }
 
+fn installed_release(store: &GenerationStore) -> Option<(Version, zerodeck_updater::GenerationId)> {
+    let generation = match store.current_reference() {
+        Ok(Some(generation)) => generation,
+        Ok(None) => return None,
+        Err(_) => {
+            eprintln!(
+                "zerodeckctl: warning: the active generation reference is unreadable; treating \
+                 the installed version as unknown"
+            );
+            return None;
+        }
+    };
+    if let Ok(layout) = store.verify_generation(&generation) {
+        Some((layout.release().version().clone(), generation))
+    } else {
+        eprintln!(
+            "zerodeckctl: warning: active generation {generation} is corrupt or incomplete; \
+             treating the installed version as unknown"
+        );
+        None
+    }
+}
+
+fn status_unavailable(_error: UpdateError) -> UpdateError {
+    UpdateError::ActivationFailed("status is unavailable".to_owned())
+}
+
+fn redact_status_text(value: &str, root: &Path) -> String {
+    let root_text = root.to_string_lossy();
+    let replaced = value.replace(&*root_text, "<root>");
+    replaced
+        .split_whitespace()
+        .map(|token| {
+            if looks_like_path(token) {
+                "<path>".to_owned()
+            } else {
+                token.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn looks_like_path(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '`' | '\'' | '"' | ':' | ',' | ';' | '(' | ')' | '[' | ']'
+        )
+    });
+    token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || token.starts_with("<root>")
+}
+
 fn open_runtime(root: &Path) -> Result<(GenerationStore, StateStore, SystemdService), UpdateError> {
     let store = GenerationStore::new(root)?;
     let state = state_store(root);
@@ -428,5 +530,18 @@ fn apply_kind_name(kind: zerodeck_updater::ApplyKind) -> &'static str {
     match kind {
         zerodeck_updater::ApplyKind::Upgrade => "upgrade",
         zerodeck_updater::ApplyKind::Rollback => "rollback",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXIT_REQUIRES_START, exit_code};
+    use zerodeck_updater::UpdateError;
+
+    #[test]
+    fn requires_start_has_a_distinct_exit_code() {
+        assert_eq!(exit_code(&UpdateError::StartRequired), EXIT_REQUIRES_START);
+        assert_eq!(EXIT_REQUIRES_START, 75);
+        assert_eq!(exit_code(&UpdateError::Busy), 1);
     }
 }

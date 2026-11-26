@@ -40,6 +40,8 @@ pub enum ActivationCheckpoint {
     BeforeConfirm,
     /// After the durable `Confirmed` marker, before state confirmation.
     AfterConfirm,
+    /// After the previous reference was restored, before restarting the previous daemon.
+    BeforePreviousRestart,
 }
 
 /// Fault-injection seam for activation tests. Production callers use [`apply_pending`].
@@ -138,7 +140,9 @@ pub async fn enqueue_upgrade(
     service: &SystemdService,
     start: bool,
 ) -> Result<UpgradeOutcome, UpdateError> {
-    let _guard = acquire_maintenance_shared(store)?;
+    // Slot mutation is exclusive: two shared holders must never pass the check-then-write
+    // sequence and replace each other's request.
+    let _guard = acquire_maintenance_exclusive(store)?;
     let persisted = state.read()?;
     if persisted.pending.is_some() {
         return Err(UpdateError::DuplicateTransaction);
@@ -188,7 +192,9 @@ pub fn enqueue_rollback(
     store: &GenerationStore,
     state: &StateStore,
 ) -> Result<ApplyRequest, UpdateError> {
-    let _guard = acquire_maintenance_shared(store)?;
+    // Slot mutation is exclusive: two shared holders must never pass the check-then-write
+    // sequence and replace each other's request.
+    let _guard = acquire_maintenance_exclusive(store)?;
     let persisted = state.read()?;
     if persisted.pending.is_some() {
         return Err(UpdateError::DuplicateTransaction);
@@ -318,6 +324,7 @@ pub async fn apply_pending_with(
         candidate: request.generation.clone(),
         phase: TransactionPhase::Prepared,
         was_running,
+        start_attempted: false,
     };
     persisted.pending = Some(transaction.clone());
     persisted.last_result = None;
@@ -348,8 +355,9 @@ pub async fn apply_pending_with(
                 &requests,
                 &transaction,
                 previous.as_ref(),
-                trial_error.candidate_attempted,
+                trial_error.start_attempted,
                 trial_error.error,
+                faults,
             )
             .await
         }
@@ -372,6 +380,7 @@ fn offline_rollback(
         candidate: request.generation.clone(),
         phase: TransactionPhase::Prepared,
         was_running: false,
+        start_attempted: false,
     };
     persisted.pending = Some(transaction.clone());
     persisted.last_result = None;
@@ -389,6 +398,10 @@ fn offline_rollback(
     faults.checkpoint(ActivationCheckpoint::AfterConfirm)?;
 
     let mut confirmed = state.read()?;
+    require_pending(&confirmed, transaction.id)?;
+    // Remove only this transaction's own request while its pending marker still exists, then
+    // clear the marker; a crash in between can safely replay confirmation.
+    remove_owned_request(requests, transaction.id)?;
     confirmed.confirm();
     confirmed.last_result = Some(format!(
         "restored {}; managed service left stopped",
@@ -396,13 +409,12 @@ fn offline_rollback(
     ));
     confirmed.last_error = None;
     state.write(&confirmed)?;
-    remove_owned_request(requests, Some(transaction.id))?;
     Ok(())
 }
 
 struct TrialError {
     error: UpdateError,
-    candidate_attempted: bool,
+    start_attempted: bool,
 }
 
 async fn run_trial(
@@ -414,7 +426,7 @@ async fn run_trial(
     was_running: bool,
     faults: &dyn ActivationFault,
 ) -> Result<(), TrialError> {
-    let mut candidate_attempted = false;
+    let mut start_attempted = false;
     let outcome = async {
         if was_running {
             service.stop().await?;
@@ -427,7 +439,8 @@ async fn run_trial(
         faults.checkpoint(ActivationCheckpoint::AfterSwitch)?;
 
         service.begin_activation().await?;
-        candidate_attempted = true;
+        write_start_attempted(state, transaction.id)?;
+        start_attempted = true;
         service.start().await?;
         write_phase(state, transaction.id, TransactionPhase::Verifying)?;
         faults.checkpoint(ActivationCheckpoint::AfterStart)?;
@@ -440,7 +453,7 @@ async fn run_trial(
     .await;
     outcome.map_err(|error| TrialError {
         error,
-        candidate_attempted,
+        start_attempted,
     })
 }
 
@@ -458,11 +471,14 @@ fn finish_success(
         });
     }
     let mut confirmed = state.read()?;
+    require_pending(&confirmed, transaction.id)?;
+    // The request belongs to this transaction: remove it before clearing the pending marker so a
+    // crash cannot leave a stale request that a no-pending recovery must not delete.
+    remove_owned_request(requests, transaction.id)?;
     confirmed.confirm();
     confirmed.last_result = Some(format!("confirmed {}", transaction.candidate));
     confirmed.last_error = None;
     state.write(&confirmed)?;
-    remove_owned_request(requests, Some(transaction.id))?;
     Ok(())
 }
 
@@ -474,18 +490,21 @@ async fn reconcile_failure(
     requests: &ApplyRequestStore,
     transaction: &PendingTransaction,
     previous: Option<&GenerationLayout>,
-    candidate_attempted: bool,
+    start_attempted: bool,
     error: UpdateError,
+    faults: &dyn ActivationFault,
 ) -> Result<(), UpdateError> {
-    if let Ok(mut reverting) = state.read()
-        && let Some(pending) = reverting.pending.as_mut()
-    {
-        pending.phase = TransactionPhase::Reverting;
-        let _ = state.write(&reverting);
-    }
+    // Keep the pending transaction (including `was_running`) until recovery is durable. A process
+    // loss anywhere below must leave a state that a second recovery can finish.
+    let mut reverting = state.read()?;
+    let Some(pending) = reverting.pending.as_mut() else {
+        return Err(UpdateError::MissingApplyRequest);
+    };
+    pending.phase = TransactionPhase::Reverting;
+    state.write(&reverting)?;
 
     let active = service.is_active().await?;
-    if candidate_attempted && active {
+    if start_attempted && active {
         service.stop().await?;
     }
 
@@ -496,9 +515,27 @@ async fn reconcile_failure(
             store.switch_to(&previous_id)?;
         }
 
+        if transaction.was_running {
+            faults.checkpoint(ActivationCheckpoint::BeforePreviousRestart)?;
+            if !service.is_active().await?
+                && let Err(previous_error) = start_and_verify_previous(service, previous).await
+            {
+                abandon_without_generation(
+                    store,
+                    state,
+                    Some(service),
+                    requests,
+                    &transaction.candidate,
+                    &format!("previous generation `{previous_id}` is unhealthy: {previous_error}"),
+                    start_attempted,
+                )
+                .await?;
+                return Err(UpdateError::NoGoodGeneration);
+            }
+        }
+
         let mut recovered = state.read()?;
-        recovered.pending = None;
-        if candidate_attempted {
+        if start_attempted {
             recovered.quarantine(transaction.candidate.clone());
         }
         recovered.last_result = Some(format!(
@@ -507,31 +544,20 @@ async fn reconcile_failure(
         ));
         recovered.last_error = Some(error.to_string());
         state.write(&recovered)?;
-        remove_owned_request(requests, Some(transaction.id))?;
-
-        if transaction.was_running
-            && !service.is_active().await?
-            && let Err(previous_error) = start_and_verify_previous(service, previous).await
-        {
-            abandon_without_generation(
-                store,
-                state,
-                service,
-                &transaction.candidate,
-                &format!("previous generation `{previous_id}` is unhealthy: {previous_error}"),
-            )
-            .await?;
-            return Err(UpdateError::NoGoodGeneration);
-        }
+        remove_owned_request(requests, transaction.id)?;
+        recovered.pending = None;
+        state.write(&recovered)?;
         return Err(error);
     }
 
     abandon_without_generation(
         store,
         state,
-        service,
+        Some(service),
+        requests,
         &transaction.candidate,
         &error.to_string(),
+        start_attempted,
     )
     .await?;
     Err(UpdateError::NoGoodGeneration)
@@ -540,19 +566,31 @@ async fn reconcile_failure(
 async fn abandon_without_generation(
     store: &GenerationStore,
     state: &StateStore,
-    service: &SystemdService,
+    service: Option<&SystemdService>,
+    requests: &ApplyRequestStore,
     candidate: &GenerationId,
     reason: &str,
+    start_attempted: bool,
 ) -> Result<(), UpdateError> {
-    if service.is_active().await? {
+    if let Some(service) = service
+        && service.is_active().await?
+    {
         service.stop().await?;
     }
     store.clear_current()?;
     let mut stopped = state.read()?;
-    stopped.pending = None;
-    stopped.quarantine(candidate.clone());
+    let Some(pending) = stopped.pending.as_ref() else {
+        return Err(UpdateError::MissingApplyRequest);
+    };
+    let transaction_id = pending.id;
+    if start_attempted {
+        stopped.quarantine(candidate.clone());
+    }
     stopped.last_result = Some(format!("stopped {candidate}"));
     stopped.last_error = Some(reason.to_owned());
+    state.write(&stopped)?;
+    remove_owned_request(requests, transaction_id)?;
+    stopped.pending = None;
     state.write(&stopped)?;
     Ok(())
 }
@@ -567,12 +605,54 @@ async fn start_and_verify_previous(
 }
 
 /// Restores disk state after an interrupted activation.
+///
+/// `AfterApply` may restart a daemon that was previously running, so it can use the loopback
+/// readiness endpoint. `BeforeBootStart` and the no-pending path never construct or use a
+/// readiness client here. Neither mode opens the catalog or any external network resource.
 #[allow(clippy::too_many_lines)]
 pub async fn recover(
     store: &GenerationStore,
     state: &StateStore,
     service: &SystemdService,
     mode: RecoveryMode,
+) -> Result<(), UpdateError> {
+    recover_inner(store, state, Some(service), mode, &NoActivationFault).await
+}
+
+/// Disk-only boot recovery that never constructs or touches a readiness client.
+pub async fn recover_before_boot(
+    store: &GenerationStore,
+    state: &StateStore,
+) -> Result<(), UpdateError> {
+    recover_inner(
+        store,
+        state,
+        None,
+        RecoveryMode::BeforeBootStart,
+        &NoActivationFault,
+    )
+    .await
+}
+
+/// Fault-injectable recovery entry point used by tests.
+#[doc(hidden)]
+pub async fn recover_with(
+    store: &GenerationStore,
+    state: &StateStore,
+    service: &SystemdService,
+    mode: RecoveryMode,
+    faults: &dyn ActivationFault,
+) -> Result<(), UpdateError> {
+    recover_inner(store, state, Some(service), mode, faults).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn recover_inner(
+    store: &GenerationStore,
+    state: &StateStore,
+    service: Option<&SystemdService>,
+    mode: RecoveryMode,
+    faults: &dyn ActivationFault,
 ) -> Result<(), UpdateError> {
     let _guard = match mode {
         RecoveryMode::BeforeBootStart => acquire_maintenance_exclusive(store)?,
@@ -581,9 +661,8 @@ pub async fn recover(
     let requests = ApplyRequestStore::for_state(state);
     let mut persisted = state.read()?;
     let Some(pending) = persisted.pending.clone() else {
-        // A process may have been lost after enqueueing but before writing intent. The request is
-        // stale and must not be consumed by a later unrelated activation.
-        remove_owned_request(&requests, None)?;
+        // The slot may belong to a live or independently failed operation. Without a pending
+        // transaction this helper has no ownership proof, so it must not delete anything.
         return Ok(());
     };
 
@@ -595,11 +674,11 @@ pub async fn recover(
                 found: current,
             });
         }
+        remove_owned_request(&requests, pending.id)?;
         persisted.confirm();
         persisted.last_result = Some(format!("confirmed {}", pending.candidate));
         persisted.last_error = None;
         state.write(&persisted)?;
-        remove_owned_request(&requests, Some(pending.id))?;
         return Ok(());
     }
 
@@ -608,6 +687,12 @@ pub async fn recover(
         .clone()
         .filter(|generation| !persisted.quarantined.contains(generation))
         .and_then(|generation| store.verify_generation(&generation).ok());
+    persisted
+        .pending
+        .as_mut()
+        .expect("pending was cloned above")
+        .phase = TransactionPhase::Reverting;
+    state.write(&persisted)?;
 
     match (mode, previous) {
         (RecoveryMode::BeforeBootStart, Some(previous)) => {
@@ -615,29 +700,34 @@ pub async fn recover(
             if store.current_reference()?.as_ref() != Some(&previous_id) {
                 store.switch_to(&previous_id)?;
             }
-            persisted.pending = None;
             persisted.last_result = Some(format!(
                 "recovered {previous_id} before boot (service not started)"
             ));
-            persisted.last_error = Some("interrupted activation reverted".to_owned());
+            persisted.last_error = None;
             state.write(&persisted)?;
-            remove_owned_request(&requests, Some(pending.id))?;
+            remove_owned_request(&requests, pending.id)?;
+            persisted.pending = None;
+            state.write(&persisted)?;
             Ok(())
         }
         (RecoveryMode::BeforeBootStart, None) => {
-            store.clear_current()?;
-            persisted.pending = None;
-            persisted.quarantine(pending.candidate.clone());
-            persisted.last_result = Some(format!("stopped {} before boot", pending.candidate));
-            persisted.last_error = Some(
-                "no healthy previous generation is available; managed service left stopped"
-                    .to_owned(),
-            );
-            state.write(&persisted)?;
-            remove_owned_request(&requests, Some(pending.id))?;
+            abandon_without_generation(
+                store,
+                state,
+                None,
+                &requests,
+                &pending.candidate,
+                "no healthy previous generation is available; managed service left stopped",
+                pending.start_attempted,
+            )
+            .await?;
             Err(UpdateError::NoGoodGeneration)
         }
         (RecoveryMode::AfterApply, Some(previous)) => {
+            let service = service.ok_or_else(|| UpdateError::SystemctlUnsupported {
+                unit: DAEMON_UNIT.to_owned(),
+                operation: "recover-after-apply",
+            })?;
             let previous_id = generation_from_layout(&previous)?;
             let current = store.current_reference()?;
             if current.as_ref() != Some(&previous_id) && service.is_active().await? {
@@ -646,38 +736,51 @@ pub async fn recover(
             if store.current_reference()?.as_ref() != Some(&previous_id) {
                 store.switch_to(&previous_id)?;
             }
-            persisted.pending = None;
-            persisted.last_result = Some(format!("recovered {previous_id}"));
-            persisted.last_error = Some("interrupted activation reverted".to_owned());
-            state.write(&persisted)?;
-            remove_owned_request(&requests, Some(pending.id))?;
 
-            if pending.was_running
-                && !service.is_active().await?
-                && let Err(previous_error) = start_and_verify_previous(service, &previous).await
-            {
-                abandon_without_generation(
-                    store,
-                    state,
-                    service,
-                    &pending.candidate,
-                    &format!("previous generation `{previous_id}` is unhealthy: {previous_error}"),
-                )
-                .await?;
-                return Err(UpdateError::NoGoodGeneration);
+            if pending.was_running {
+                faults.checkpoint(ActivationCheckpoint::BeforePreviousRestart)?;
+                if !service.is_active().await?
+                    && let Err(previous_error) = start_and_verify_previous(service, &previous).await
+                {
+                    abandon_without_generation(
+                        store,
+                        state,
+                        Some(service),
+                        &requests,
+                        &pending.candidate,
+                        &format!(
+                            "previous generation `{previous_id}` is unhealthy: {previous_error}"
+                        ),
+                        pending.start_attempted,
+                    )
+                    .await?;
+                    return Err(UpdateError::NoGoodGeneration);
+                }
             }
+
+            persisted.last_result = Some(format!("recovered {previous_id}"));
+            persisted.last_error = None;
+            state.write(&persisted)?;
+            remove_owned_request(&requests, pending.id)?;
+            persisted.pending = None;
+            state.write(&persisted)?;
             Ok(())
         }
         (RecoveryMode::AfterApply, None) => {
+            let service = service.ok_or_else(|| UpdateError::SystemctlUnsupported {
+                unit: DAEMON_UNIT.to_owned(),
+                operation: "recover-after-apply",
+            })?;
             abandon_without_generation(
                 store,
                 state,
-                service,
+                Some(service),
+                &requests,
                 &pending.candidate,
                 "no healthy previous generation is available; managed service left stopped",
+                pending.start_attempted,
             )
             .await?;
-            remove_owned_request(&requests, Some(pending.id))?;
             Err(UpdateError::NoGoodGeneration)
         }
     }
@@ -695,12 +798,32 @@ fn write_phase(state: &StateStore, id: Uuid, phase: TransactionPhase) -> Result<
     state.write(&persisted)
 }
 
+fn write_start_attempted(state: &StateStore, id: Uuid) -> Result<(), UpdateError> {
+    let mut persisted = state.read()?;
+    let Some(pending) = persisted.pending.as_mut() else {
+        return Err(UpdateError::MissingApplyRequest);
+    };
+    if pending.id != id {
+        return Err(UpdateError::DuplicateTransaction);
+    }
+    pending.start_attempted = true;
+    state.write(&persisted)
+}
+
+fn require_pending(state: &UpdateState, id: Uuid) -> Result<(), UpdateError> {
+    match state.pending.as_ref() {
+        Some(pending) if pending.id == id => Ok(()),
+        Some(_) => Err(UpdateError::DuplicateTransaction),
+        None => Err(UpdateError::MissingApplyRequest),
+    }
+}
+
 fn remove_owned_request(
     requests: &ApplyRequestStore,
-    owner: Option<Uuid>,
+    transaction: Uuid,
 ) -> Result<(), UpdateError> {
     match requests.read_optional()? {
-        Some(request) if owner.is_none() || owner == Some(request.id) => requests.remove(),
+        Some(request) if request.id == transaction => requests.remove(),
         _ => Ok(()),
     }
 }

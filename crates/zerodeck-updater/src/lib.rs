@@ -21,7 +21,7 @@ use zerodeck_platform::PlatformError;
 pub use activation::{
     APPLY_UNIT, ActivationCheckpoint, ActivationFault, DAEMON_UNIT, RecoveryMode, UpgradeOutcome,
     acquire_maintenance_exclusive, acquire_maintenance_shared, apply_pending, apply_pending_with,
-    enqueue_rollback, enqueue_upgrade, recover,
+    enqueue_rollback, enqueue_upgrade, recover, recover_before_boot, recover_with,
 };
 pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
 pub use generation::{GenerationId, GenerationLayout, GenerationRelease, GenerationStore};

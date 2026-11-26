@@ -1,6 +1,6 @@
 # General hardening, performance, and cleanup pass — design
 
-**Status:** approved 2026-11-25
+**Status:** implemented 2026-11-26: PR 1 #18, PR 2 #19, PR 3 #20, PR 4 (this branch).
 
 ## Intent
 

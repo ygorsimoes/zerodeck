@@ -1,3 +1,7 @@
+//! `zerodeckd`: the `ZeroDeck` plugin loader daemon.
+
+#![forbid(unsafe_code)]
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

@@ -1,5 +1,7 @@
 //! Clean-room wire, IPC, and manifest contracts for `ZeroDeck`.
 
+#![forbid(unsafe_code)]
+
 mod error;
 mod ipc;
 mod manifest;

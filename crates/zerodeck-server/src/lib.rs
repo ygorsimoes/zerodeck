@@ -1,5 +1,7 @@
 //! Axum HTTP and WebSocket server foundation for `ZeroDeck`.
 
+#![forbid(unsafe_code)]
+
 mod auth;
 mod error;
 mod fetch;

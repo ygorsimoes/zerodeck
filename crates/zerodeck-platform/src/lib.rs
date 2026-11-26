@@ -1,5 +1,7 @@
 //! OS path, canonical path-jail, atomic persistence, and privilege abstractions for `ZeroDeck`.
 
+#![forbid(unsafe_code)]
+
 mod error;
 mod fs;
 mod ownership;

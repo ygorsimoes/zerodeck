@@ -1,5 +1,7 @@
 //! Core domain services for `ZeroDeck`: atomic settings, plugin discovery, and archive validation.
 
+#![forbid(unsafe_code)]
+
 mod archive;
 mod discovery;
 mod error;

@@ -64,7 +64,15 @@ conflict; never stop it or rewrite its files on the user's behalf. Import from a
 inactive Decky installation by copy with explicit confirmation, without promoting
 imported privileged code into a trusted root tree automatically.
 The package's build identity is the embedded build ID, not a digest of an archive containing
-that ID. Record the archive digest separately. Updater replacement is an explicit,
+that ID. Record the archive digest separately.
+
+A release target lives at `linux-x86_64/zerodeck-<version>.tar.gz` in TUF. Its signed `custom`
+metadata records `channel` (`stable` or `testing`), `version` (SemVer), `build_id`, and
+`min_updater` (SemVer). TUF hashes and length cover the whole archive; that archive digest is
+the generation identity. Inside the archive, `release.json` schema `1` records `build_id` and
+`version` so the client can verify they match the signed target without hashing the archive
+against itself. Selection reads only `stable` unless the operator opts into `testing`, rejects
+prerelease SemVer by default, and never auto-selects a version below the installed one. Updater replacement is an explicit,
 verified administrative bootstrap operation in v1: signed targets declare the minimum
 updater version, and a bootstrap replacement must be refused during a pending activation
 or if it cannot read the persisted format. Keep the existing `tar.gz` format; gate optional

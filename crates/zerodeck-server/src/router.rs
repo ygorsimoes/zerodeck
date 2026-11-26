@@ -988,7 +988,7 @@ async fn dispatch_call(state: AppState, call: WsCallPayload) -> WsServerMessage 
             id: call.id,
             result: json!("pong"),
         },
-        "utilities/filepicker" => dispatch_filepicker(&state, &call),
+        "utilities/filepicker" => dispatch_filepicker(&state, &call).await,
         "loader/get_plugins" => WsServerMessage::Reply {
             id: call.id,
             result: serialize_plugins_list(&state),
@@ -1004,7 +1004,7 @@ async fn dispatch_call(state: AppState, call: WsCallPayload) -> WsServerMessage 
         "loader/disable_plugin" => dispatch_disable_plugin(&state, &call).await,
         "loader/set_plugin_order" => dispatch_set_plugin_order(&state, &call).await,
         "loader/get_settings" => dispatch_get_settings(&state, &call),
-        "loader/set_setting" => dispatch_set_setting(&state, &call),
+        "loader/set_setting" => dispatch_set_setting(&state, &call).await,
         other => ws_error(
             call.id,
             "RouteNotFoundError",
@@ -1144,7 +1144,7 @@ async fn dispatch_reload_plugin(state: &AppState, call: &WsCallPayload) -> WsSer
     }
 }
 
-fn dispatch_filepicker(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
+async fn dispatch_filepicker(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
     let manager = match require_manager(state, call.id) {
         Ok(m) => m,
         Err(err_msg) => return err_msg,
@@ -1153,7 +1153,7 @@ fn dispatch_filepicker(state: &AppState, call: &WsCallPayload) -> WsServerMessag
         Ok(q) => q,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.list_files(query) {
+    match manager.list_files(query).await {
         Ok(listing) => match serde_json::to_value(listing) {
             Ok(result) => WsServerMessage::Reply {
                 id: call.id,
@@ -1273,7 +1273,7 @@ fn dispatch_get_settings(state: &AppState, call: &WsCallPayload) -> WsServerMess
     }
 }
 
-fn dispatch_set_setting(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
+async fn dispatch_set_setting(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
     let manager = match require_manager(state, call.id) {
         Ok(m) => m,
         Err(err_msg) => return err_msg,
@@ -1282,7 +1282,7 @@ fn dispatch_set_setting(state: &AppState, call: &WsCallPayload) -> WsServerMessa
         Ok(pair) => pair,
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
-    match manager.set_setting(&key, value) {
+    match manager.set_setting(&key, value).await {
         Ok(()) => WsServerMessage::Reply {
             id: call.id,
             result: Value::Bool(true),

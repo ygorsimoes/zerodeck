@@ -16,6 +16,7 @@ use zerodeck_protocol::PluginLoadType;
 use crate::discovery::discover_single_plugin;
 use crate::installer::run_blocking;
 use crate::preflight::{PreflightInput, preflight};
+use crate::settings::insert_dotted;
 use crate::{
     CheckedHttpClient, CoreError, DiscoveredPlugin, FilePicker, FilePickerListing, FilePickerQuery,
     InstallOutcome, InstallPluginRequest, InstallerLimits, OutboundHttpPolicy, SettingsManager,
@@ -69,6 +70,8 @@ pub struct PluginManager {
     http_client: CheckedHttpClient,
     installer_limits: InstallerLimits,
     lifecycle_lock: tokio::sync::Mutex<()>,
+    /// Serializes `loader.json` writes so they reach disk in order; never held by readers.
+    settings_writer: tokio::sync::Mutex<()>,
     loader_events_tx: broadcast::Sender<LoaderEvent>,
     daemon_is_root: bool,
     allow_unsafe_root_plugins: AtomicBool,
@@ -133,6 +136,7 @@ impl PluginManager {
             http_client,
             installer_limits,
             lifecycle_lock: tokio::sync::Mutex::new(()),
+            settings_writer: tokio::sync::Mutex::new(()),
             loader_events_tx,
             daemon_is_root: daemon_is_root(),
             allow_unsafe_root_plugins: AtomicBool::new(false),
@@ -309,7 +313,7 @@ impl PluginManager {
             )));
         }
 
-        let cleared_failure = match self.preflight_plugin(&refreshed) {
+        let cleared_failure = match self.preflight_plugin(&refreshed).await {
             Ok(cleared) => cleared,
             Err(err) => {
                 shutdown_worker_if_present(&self.supervisor, &refreshed.manifest.name, false)
@@ -438,7 +442,8 @@ impl PluginManager {
 
         self.remove_plugin_entry(&plugin.directory);
         self.clear_failure_reason(&plugin.manifest.name);
-        self.strip_plugin_from_loader_settings(&plugin.manifest.name)?;
+        self.strip_plugin_from_loader_settings(&plugin.manifest.name)
+            .await?;
         self.emit_plugins_changed();
         Ok(())
     }
@@ -454,7 +459,8 @@ impl PluginManager {
             let before = list.len();
             list.retain(|entry| entry != &plugin.manifest.name);
             list.len() != before
-        })?;
+        })
+        .await?;
 
         let needs_spawn = !plugin.passive
             && !matches!(
@@ -485,7 +491,8 @@ impl PluginManager {
                 list.push(plugin.manifest.name.clone());
                 true
             }
-        })?;
+        })
+        .await?;
 
         shutdown_worker_if_present(&self.supervisor, &plugin.manifest.name, false).await?;
         self.clear_failure_reason(&plugin.manifest.name);
@@ -496,10 +503,12 @@ impl PluginManager {
     /// Persists `pluginOrder` in `loader.json` and notifies subscribers.
     pub async fn set_plugin_order(&self, order: Vec<String>) -> Result<(), CoreError> {
         let _lifecycle = self.lifecycle_lock.lock().await;
-        {
-            let mut guard = lock_unpoisoned(&self.settings);
-            guard.set(PLUGIN_ORDER_KEY, order)?;
-        }
+        let encoded = serde_json::to_value(order)?;
+        self.persist_settings(move |map| {
+            map.insert(PLUGIN_ORDER_KEY.to_owned(), encoded);
+            Ok(true)
+        })
+        .await?;
         self.emit_plugins_changed();
         Ok(())
     }
@@ -515,7 +524,7 @@ impl PluginManager {
     }
 
     /// Atomically updates a dotted setting key in `loader.json`, rejecting lifecycle-managed keys.
-    pub fn set_setting(&self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
+    pub async fn set_setting(&self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
         let root_key = dotted_key.split('.').next().unwrap_or("");
         if matches!(
             root_key,
@@ -525,13 +534,17 @@ impl PluginManager {
                 "setting `{dotted_key}` is managed by loader lifecycle methods; use set_plugin_order / enable_plugin / disable_plugin"
             )));
         }
-        let mut guard = lock_unpoisoned(&self.settings);
-        guard.set_path(dotted_key, value)
+        self.persist_settings(|map| {
+            insert_dotted(map, dotted_key, value)?;
+            Ok(true)
+        })
+        .await
     }
 
-    /// Lists files inside the path-jailed filepicker roots.
-    pub fn list_files(&self, query: FilePickerQuery) -> Result<FilePickerListing, CoreError> {
-        FilePicker::list(&self.paths, query)
+    /// Lists files inside the path-jailed filepicker roots, on the blocking pool.
+    pub async fn list_files(&self, query: FilePickerQuery) -> Result<FilePickerListing, CoreError> {
+        let paths = self.paths.clone();
+        run_blocking(move || FilePicker::list(&paths, query)).await
     }
 
     /// Resolves a plugin-scoped static file (`dist/`, `assets/`, `data/`, or `dist/index.js`),
@@ -668,7 +681,7 @@ impl PluginManager {
 
     /// Runs the spawn preflight and, when it passes, starts the plugin's worker.
     async fn spawn_checked(&self, plugin: &DiscoveredPlugin) -> Result<(), CoreError> {
-        self.preflight_plugin(plugin)?;
+        self.preflight_plugin(plugin).await?;
         self.supervisor
             .spawn_plugin(self.spawn_spec_for(plugin))
             .await?;
@@ -677,7 +690,7 @@ impl PluginManager {
 
     /// Records a refusal as the plugin's failure reason, or clears a recorded one when the
     /// preflight passes; `Ok(true)` means a recorded reason was cleared.
-    fn preflight_plugin(&self, plugin: &DiscoveredPlugin) -> Result<bool, CoreError> {
+    async fn preflight_plugin(&self, plugin: &DiscoveredPlugin) -> Result<bool, CoreError> {
         let name = &plugin.manifest.name;
         let python_host_missing = lock_unpoisoned(&self.python_host_missing).clone();
         let input = PreflightInput {
@@ -686,12 +699,17 @@ impl PluginManager {
             allow_unsafe_root_plugins: self.allow_unsafe_root_plugins.load(Ordering::Relaxed),
             python_host_missing: python_host_missing.as_deref(),
         };
-        let plugins_dir = self.paths.plugins_dir();
-        let result = info_span!("spawn_preflight", plugin = %name).in_scope(|| {
-            preflight(&input, || {
-                check_root_plugin_tree(&plugins_dir, &plugin.directory)
-            })
-        });
+        // The tree walk is filesystem I/O over the whole plugin; run it on the blocking pool, and
+        // only when the preflight will consult it.
+        let tree_result = if input.needs_tree_check() {
+            let plugins_dir = self.paths.plugins_dir();
+            let directory = plugin.directory.clone();
+            run_blocking(move || Ok(check_root_plugin_tree(&plugins_dir, &directory))).await?
+        } else {
+            Ok(())
+        };
+        let result = info_span!("spawn_preflight", plugin = %name)
+            .in_scope(|| preflight(&input, || tree_result));
         match result {
             Ok(()) => Ok(lock_unpoisoned(&self.failure_reasons)
                 .remove(name)
@@ -800,12 +818,32 @@ impl PluginManager {
         }
     }
 
-    fn mutate_disabled_plugins<F>(&self, update: F) -> Result<(), CoreError>
+    /// Applies `mutate` to a copy of the settings, writes it on the blocking pool, then makes it
+    /// current. Writes are ordered by `settings_writer`; readers keep seeing the previous values
+    /// until the write succeeds and never wait on `fsync`.
+    async fn persist_settings<F>(&self, mutate: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
+    {
+        let _writer = self.settings_writer.lock().await;
+        let pending = lock_unpoisoned(&self.settings).prepare_update(mutate)?;
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let pending = run_blocking(move || {
+            pending.write()?;
+            Ok(pending)
+        })
+        .await?;
+        lock_unpoisoned(&self.settings).apply(pending);
+        Ok(())
+    }
+
+    async fn mutate_disabled_plugins<F>(&self, update: F) -> Result<(), CoreError>
     where
         F: FnOnce(&mut Vec<String>) -> bool,
     {
-        let mut guard = lock_unpoisoned(&self.settings);
-        guard.update_map(|map| {
+        self.persist_settings(|map| {
             let mut list = read_disabled_list(map);
             let list_changed = update(&mut list);
             let had_legacy = map.remove(LEGACY_DISABLED_PLUGINS_KEY).is_some();
@@ -816,17 +854,21 @@ impl PluginManager {
             map.insert(DISABLED_PLUGINS_KEY.to_owned(), encoded);
             Ok(true)
         })
+        .await
     }
 
-    fn strip_plugin_from_loader_settings(&self, manifest_name: &str) -> Result<(), CoreError> {
-        let mut guard = lock_unpoisoned(&self.settings);
-        guard.update_map(|map| {
+    async fn strip_plugin_from_loader_settings(
+        &self,
+        manifest_name: &str,
+    ) -> Result<(), CoreError> {
+        self.persist_settings(|map| {
             let mut changed = false;
             changed |= strip_name_from_array_key(map, PLUGIN_ORDER_KEY, manifest_name);
             changed |= strip_name_from_array_key(map, DISABLED_PLUGINS_KEY, manifest_name);
             changed |= strip_name_from_array_key(map, LEGACY_DISABLED_PLUGINS_KEY, manifest_name);
             Ok(changed)
         })
+        .await
     }
 
     fn disabled_set(&self) -> HashSet<String> {

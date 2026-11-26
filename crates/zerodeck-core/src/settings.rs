@@ -61,11 +61,10 @@ impl SettingsManager {
     /// Updates a setting key and atomically flushes the JSON file to disk.
     pub fn set<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), CoreError> {
         let encoded = serde_json::to_value(value)?;
-        let mut next = self.values.clone();
-        next.insert(key.to_owned(), encoded);
-        self.commit_map(&next)?;
-        self.values = next;
-        Ok(())
+        self.update_map(|map| {
+            map.insert(key.to_owned(), encoded);
+            Ok(true)
+        })
     }
 
     /// Reads a setting by dotted key path (e.g. `"developer.allow_unverified_installs"`).
@@ -87,44 +86,19 @@ impl SettingsManager {
     ///
     /// Rejects empty segments and non-object intermediate values without modifying on-disk state.
     pub fn set_path(&mut self, dotted_key: &str, value: Value) -> Result<(), CoreError> {
-        let segments = parse_dotted_segments(dotted_key)?;
-        let (last, parents) = segments.split_last().ok_or_else(|| {
-            CoreError::InvalidSetting("setting path must not be empty".to_owned())
-        })?;
-
-        let mut next = self.values.clone();
-        let mut current = &mut next;
-        for (idx, segment) in parents.iter().enumerate() {
-            if !current.contains_key(*segment) {
-                current.insert((*segment).to_owned(), Value::Object(Map::new()));
-            }
-            let entry = current.get_mut(*segment).ok_or_else(|| {
-                CoreError::InvalidSetting(format!("missing intermediate key `{segment}`"))
-            })?;
-            let Some(obj) = entry.as_object_mut() else {
-                let prefix = parents[..=idx].join(".");
-                return Err(CoreError::InvalidSetting(format!(
-                    "cannot traverse non-object setting `{prefix}` while setting `{dotted_key}`"
-                )));
-            };
-            current = obj;
-        }
-
-        current.insert((*last).to_owned(), value);
-        self.commit_map(&next)?;
-        self.values = next;
-        Ok(())
+        self.update_map(|map| {
+            insert_dotted(map, dotted_key, value)?;
+            Ok(true)
+        })
     }
 
     /// Removes a top-level setting key and atomically flushes changes to disk if it existed.
     pub fn remove(&mut self, key: &str) -> Result<Option<Value>, CoreError> {
-        if !self.values.contains_key(key) {
-            return Ok(None);
-        }
-        let mut next = self.values.clone();
-        let removed = next.remove(key);
-        self.commit_map(&next)?;
-        self.values = next;
+        let mut removed = None;
+        self.update_map(|map| {
+            removed = map.remove(key);
+            Ok(removed.is_some())
+        })?;
         Ok(removed)
     }
 
@@ -134,20 +108,86 @@ impl SettingsManager {
     where
         F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
     {
-        let mut next = self.values.clone();
-        if !mutate(&mut next)? {
-            return Ok(());
+        if let Some(pending) = self.prepare_update(mutate)? {
+            pending.write()?;
+            self.apply(pending);
         }
-        self.commit_map(&next)?;
-        self.values = next;
         Ok(())
     }
 
-    fn commit_map(&self, values: &Map<String, Value>) -> Result<(), CoreError> {
-        let bytes = serde_json::to_vec_pretty(&Value::Object(values.clone()))?;
-        atomic_write(&self.path, &bytes)?;
+    /// Computes the next settings map and its serialized bytes without touching disk or the
+    /// in-memory values; `None` when `mutate` reports no change.
+    ///
+    /// Callers write the result with [`PendingSettings::write`] (blocking I/O) and then commit it
+    /// with [`SettingsManager::apply`], so readers never wait on `fsync`.
+    pub fn prepare_update<F>(&self, mutate: F) -> Result<Option<PendingSettings>, CoreError>
+    where
+        F: FnOnce(&mut Map<String, Value>) -> Result<bool, CoreError>,
+    {
+        let mut next = self.values.clone();
+        if !mutate(&mut next)? {
+            return Ok(None);
+        }
+        let bytes = serde_json::to_vec_pretty(&next)?;
+        Ok(Some(PendingSettings {
+            values: next,
+            bytes,
+            path: self.path.clone(),
+        }))
+    }
+
+    /// Makes a successfully written [`PendingSettings`] the current in-memory values.
+    pub fn apply(&mut self, pending: PendingSettings) {
+        self.values = pending.values;
+    }
+}
+
+/// Settings computed by [`SettingsManager::prepare_update`], waiting to be written and applied.
+#[derive(Debug)]
+pub struct PendingSettings {
+    values: Map<String, Value>,
+    bytes: Vec<u8>,
+    path: PathBuf,
+}
+
+impl PendingSettings {
+    /// Atomically writes these settings to disk (temp file, `fsync`, rename, directory sync).
+    pub fn write(&self) -> Result<(), CoreError> {
+        atomic_write(&self.path, &self.bytes)?;
         Ok(())
     }
+}
+
+/// Sets `value` at `dotted_key` inside `map`, creating missing intermediate objects.
+pub(crate) fn insert_dotted(
+    map: &mut Map<String, Value>,
+    dotted_key: &str,
+    value: Value,
+) -> Result<(), CoreError> {
+    let segments = parse_dotted_segments(dotted_key)?;
+    let (last, parents) = segments
+        .split_last()
+        .ok_or_else(|| CoreError::InvalidSetting("setting path must not be empty".to_owned()))?;
+
+    let mut current = map;
+    for (idx, segment) in parents.iter().enumerate() {
+        if !current.contains_key(*segment) {
+            current.insert((*segment).to_owned(), Value::Object(Map::new()));
+        }
+        let entry = current.get_mut(*segment).ok_or_else(|| {
+            CoreError::InvalidSetting(format!("missing intermediate key `{segment}`"))
+        })?;
+        let Some(obj) = entry.as_object_mut() else {
+            let prefix = parents[..=idx].join(".");
+            return Err(CoreError::InvalidSetting(format!(
+                "cannot traverse non-object setting `{prefix}` while setting `{dotted_key}`"
+            )));
+        };
+        current = obj;
+    }
+
+    current.insert((*last).to_owned(), value);
+    Ok(())
 }
 
 fn parse_dotted_segments(dotted_key: &str) -> Result<Vec<&str>, CoreError> {
@@ -163,4 +203,48 @@ fn parse_dotted_segments(dotted_key: &str) -> Result<Vec<&str>, CoreError> {
         )));
     }
     Ok(segments)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
+    use super::SettingsManager;
+
+    #[test]
+    fn prepare_update_returns_none_when_unchanged_and_apply_updates_values() {
+        let dir = std::env::temp_dir().join(format!("zerodeck-settings-{}", Uuid::new_v4()));
+        let path = dir.join("loader.json");
+        let mut settings = SettingsManager::open(path.clone()).expect("open settings");
+
+        let unchanged = settings
+            .prepare_update(|_| Ok(false))
+            .expect("prepare no-op");
+        assert!(unchanged.is_none());
+        assert!(!path.exists(), "a no-op must not touch disk");
+
+        let pending = settings
+            .prepare_update(|map| {
+                map.insert("k".to_owned(), json!(7));
+                Ok(true)
+            })
+            .expect("prepare update")
+            .expect("update is pending");
+        assert_eq!(
+            settings.values().get("k"),
+            None,
+            "memory changes only on apply"
+        );
+
+        pending.write().expect("write pending settings");
+        let on_disk: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read loader.json"))
+                .expect("parse loader.json");
+        assert_eq!(on_disk, json!({"k": 7}));
+
+        settings.apply(pending);
+        assert_eq!(settings.values().get("k"), Some(&json!(7)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

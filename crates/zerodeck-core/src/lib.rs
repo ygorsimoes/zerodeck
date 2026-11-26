@@ -34,7 +34,7 @@ pub use installer::{
 pub use manager::{
     LoaderEvent, PluginFileScope, PluginManager, PluginSummary, resolve_static_file,
 };
-pub use settings::SettingsManager;
+pub use settings::{PendingSettings, SettingsManager};
 pub use watcher::{DebugWatcherHandle, start_debug_watcher};
 
 #[cfg(test)]
@@ -2327,6 +2327,7 @@ class Plugin:
         ] {
             let err = manager
                 .set_setting(protected, serde_json::json!(["x"]))
+                .await
                 .expect_err(&format!("must reject managed key `{protected}`"));
             assert!(matches!(err, CoreError::InvalidSetting(_)));
         }
@@ -2336,6 +2337,7 @@ class Plugin:
                 "developer.allow_unverified_installs",
                 serde_json::json!(true),
             )
+            .await
             .expect("persist dotted developer setting");
         assert!(manager.allow_unverified_installs());
         assert_eq!(
@@ -2856,6 +2858,7 @@ class Plugin:
 
         let fp = manager
             .list_files(crate::FilePickerQuery::default())
+            .await
             .expect("list_files");
         assert_eq!(
             fp.realpath,
@@ -3048,5 +3051,73 @@ class Plugin:
             "async runtime stalled for {gap} ms during install"
         );
         manager.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_setting_writes_leave_disk_and_memory_consistent() {
+        let dir = TestDir::new("settings-concurrent");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+
+        let mut writes = tokio::task::JoinSet::new();
+        for i in 0..32 {
+            let manager = std::sync::Arc::clone(&manager);
+            writes.spawn(async move {
+                manager
+                    .set_setting("k", serde_json::json!(i))
+                    .await
+                    .expect("set_setting");
+            });
+        }
+        while let Some(joined) = writes.join_next().await {
+            joined.expect("write task");
+        }
+
+        let on_disk: serde_json::Value = serde_json::from_slice(
+            &fs::read(paths.settings_dir().join("loader.json")).expect("read loader.json"),
+        )
+        .expect("parse loader.json");
+        assert_eq!(on_disk["k"], manager.get_setting(Some("k")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reads_are_not_blocked_by_settings_writes() {
+        use std::time::{Duration, Instant};
+
+        let dir = TestDir::new("settings-reads");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+
+        let mut writes = tokio::task::JoinSet::new();
+        for i in 0..20 {
+            let manager = std::sync::Arc::clone(&manager);
+            writes.spawn(async move {
+                manager
+                    .set_setting(&format!("key{i}"), serde_json::json!(i))
+                    .await
+                    .expect("set_setting");
+            });
+        }
+        let reader = {
+            let manager = std::sync::Arc::clone(&manager);
+            tokio::spawn(async move {
+                let started = Instant::now();
+                for _ in 0..100 {
+                    let _ = manager.list_plugins();
+                    tokio::task::yield_now().await;
+                }
+                started.elapsed()
+            })
+        };
+        let elapsed = reader.await.expect("reader task");
+        while let Some(joined) = writes.join_next().await {
+            joined.expect("write task");
+        }
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "100 reads took {elapsed:?} during writes"
+        );
     }
 }

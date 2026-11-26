@@ -1,9 +1,11 @@
 //! Streamed, verified archive staging into an immutable generation.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
@@ -304,6 +306,7 @@ struct Extractor<'a> {
     tree: &'a Path,
     limits: ExtractLimits,
     fault: &'a dyn StageFault,
+    budget_tripped: Rc<Cell<bool>>,
     seen: BTreeSet<PathBuf>,
     files: BTreeSet<PathBuf>,
     dirs: BTreeSet<PathBuf>,
@@ -318,12 +321,14 @@ impl<'a> Extractor<'a> {
         tree: &'a Path,
         limits: ExtractLimits,
         fault: &'a dyn StageFault,
+        budget_tripped: Rc<Cell<bool>>,
     ) -> Self {
         Self {
             archive_path,
             tree,
             limits,
             fault,
+            budget_tripped,
             seen: BTreeSet::new(),
             files: BTreeSet::new(),
             dirs: BTreeSet::new(),
@@ -333,7 +338,7 @@ impl<'a> Extractor<'a> {
         }
     }
 
-    fn entry<R: Read>(&mut self, entry: tar::Entry<'_, R>) -> Result<(), UpdateError> {
+    fn entry<R: Read>(&mut self, mut entry: tar::Entry<'_, R>) -> Result<(), UpdateError> {
         self.count = self.count.saturating_add(1);
         if self.count > self.limits.max_entries {
             return Err(UpdateError::TooManyArchiveEntries {
@@ -357,6 +362,18 @@ impl<'a> Extractor<'a> {
         if relative.as_os_str().is_empty() {
             return Ok(());
         }
+
+        // tar-rs consumes local pax and GNU long-name/long-link headers before it returns the
+        // entry they describe. Count those invisible metadata entries as well.
+        let metadata_entries =
+            metadata_entry_count(&mut entry).map_err(|error| self.invalid(error))?;
+        self.count = self.count.saturating_add(metadata_entries);
+        if self.count > self.limits.max_entries {
+            return Err(UpdateError::TooManyArchiveEntries {
+                limit: self.limits.max_entries,
+            });
+        }
+
         if entry_type.is_dir() {
             return self.directory(relative);
         }
@@ -425,7 +442,9 @@ impl<'a> Extractor<'a> {
             self.limits.max_entries,
         )?;
 
-        let size = entry.header().size().map_err(|error| self.invalid(error))?;
+        // `Entry::size()` applies pax size overrides; `header().size()` is only the ustar
+        // fallback and can disagree with the bytes tar-rs actually reads and skips.
+        let size = entry.size();
         self.total = self
             .total
             .checked_add(size)
@@ -447,12 +466,8 @@ impl<'a> Extractor<'a> {
                 path: path.clone(),
                 source,
             })?;
-        let copied = io::copy(&mut entry.take(size), &mut destination).map_err(|source| {
-            UpdateError::Io {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let copied = io::copy(&mut entry.take(size), &mut destination)
+            .map_err(|source| self.io_error(&path, source))?;
         if copied != size {
             return Err(self.invalid(format!("entry `{display}` is truncated")));
         }
@@ -475,10 +490,92 @@ impl<'a> Extractor<'a> {
     }
 
     fn invalid(&self, error: impl std::fmt::Display) -> UpdateError {
+        if self.budget_tripped.get() {
+            return UpdateError::ArchiveExpandedTooLarge {
+                limit: self.limits.max_total_bytes,
+            };
+        }
         UpdateError::InvalidArchive {
             path: self.archive_path.to_path_buf(),
             reason: error.to_string(),
         }
+    }
+
+    fn io_error(&self, path: &Path, source: io::Error) -> UpdateError {
+        if self.budget_tripped.get() {
+            return UpdateError::ArchiveExpandedTooLarge {
+                limit: self.limits.max_total_bytes,
+            };
+        }
+        UpdateError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
+
+/// Counts pax/GNU metadata entries that tar-rs consumes before returning the described entry.
+fn metadata_entry_count<R: Read>(entry: &mut tar::Entry<'_, R>) -> io::Result<usize> {
+    let has_pax = entry.pax_extensions()?.is_some();
+    let mut count = usize::from(has_pax);
+    let path = entry.path()?;
+    let header_path = entry.header().path()?;
+    if !has_pax && path != header_path {
+        count = count.saturating_add(1);
+    }
+    let link = entry.link_name()?;
+    let header_link = entry.header().link_name()?;
+    if !has_pax && link != header_link {
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
+struct BudgetReader<R> {
+    inner: R,
+    remaining: u64,
+    tripped: Rc<Cell<bool>>,
+}
+
+impl<R> BudgetReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            tripped: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn tripped(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.tripped)
+    }
+}
+
+impl<R: Read> Read for BudgetReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe) {
+                Ok(0) => Ok(0),
+                Ok(_) => {
+                    self.tripped.set(true);
+                    Err(io::Error::other(
+                        "decompressed archive exceeds the configured byte budget",
+                    ))
+                }
+                Err(error) => Err(error),
+            };
+        }
+        let allowed = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let read = self.inner.read(&mut buf[..allowed])?;
+        let read_u64 = u64::try_from(read).map_err(|_| io::Error::other("read length overflow"))?;
+        self.remaining = self.remaining.saturating_sub(read_u64);
+        Ok(read)
     }
 }
 
@@ -492,9 +589,10 @@ fn extract_archive(
         path: archive_path.to_path_buf(),
         source,
     })?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-    let mut extractor = Extractor::new(archive_path, tree, limits, fault);
+    let budget = BudgetReader::new(GzDecoder::new(file), limits.max_total_bytes);
+    let budget_tripped = budget.tripped();
+    let mut archive = tar::Archive::new(budget);
+    let mut extractor = Extractor::new(archive_path, tree, limits, fault, budget_tripped);
 
     let entries = match archive.entries() {
         Ok(entries) => entries,

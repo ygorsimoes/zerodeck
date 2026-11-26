@@ -80,6 +80,19 @@ fn manifest(version: &str, build_id: &str) -> Vec<u8> {
     .expect("serialize release manifest")
 }
 
+fn pax_record(key: &str, value: &str) -> Vec<u8> {
+    let body = format!("{key}={value}\n");
+    let mut length = body.len() + 2;
+    loop {
+        let actual = length.to_string().len() + 1 + body.len();
+        if actual == length {
+            break;
+        }
+        length = actual;
+    }
+    format!("{length} {body}").into_bytes()
+}
+
 enum ArchiveEntry<'a> {
     File {
         path: &'a str,
@@ -96,6 +109,18 @@ enum ArchiveEntry<'a> {
     Hardlink {
         path: &'a str,
         target: &'a str,
+    },
+    Pax {
+        data: &'a [u8],
+    },
+    GnuLongName {
+        data: &'a [u8],
+    },
+    FileWithHeaderSize {
+        path: &'a str,
+        data: &'a [u8],
+        header_size: u64,
+        mode: u32,
     },
     RawFile {
         raw_path: &'a [u8],
@@ -143,6 +168,40 @@ fn build_archive(entries: &[ArchiveEntry<'_>]) -> Vec<u8> {
                 builder
                     .append_link(&mut header, path, target)
                     .expect("append hardlink");
+            }
+            ArchiveEntry::Pax { data } => {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::XHeader);
+                header.set_size(u64::try_from(data.len()).expect("pax size"));
+                header.set_mode(0o644);
+                header.as_old_mut().name[..3].copy_from_slice(b"pax");
+                header.set_cksum();
+                builder.append(&header, *data).expect("append pax header");
+            }
+            ArchiveEntry::GnuLongName { data } => {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::GNULongName);
+                header.set_size(u64::try_from(data.len()).expect("long name size"));
+                header.set_mode(0o644);
+                header.as_old_mut().name[..8].copy_from_slice(b"longname");
+                header.set_cksum();
+                builder
+                    .append(&header, *data)
+                    .expect("append GNU long name");
+            }
+            ArchiveEntry::FileWithHeaderSize {
+                path,
+                data,
+                header_size,
+                mode,
+            } => {
+                let mut header = Header::new_gnu();
+                header.set_size(*header_size);
+                header.set_mode(*mode);
+                header.set_entry_type(EntryType::Regular);
+                builder
+                    .append_data(&mut header, path, *data)
+                    .expect("append file with explicit header size");
             }
             ArchiveEntry::RawFile { raw_path, data } => {
                 let mut header = Header::new_gnu();
@@ -610,6 +669,176 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
         "unexpected entry-limit error: {err:?}"
     );
     assert_only_active(&entry_limit_store, &entry_limit_active);
+
+    let pax_size_record = pax_record("size", "2048");
+    let pax_sized_payload = vec![b'z'; 2048];
+    let pax_size_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Pax {
+            data: &pax_size_record,
+        },
+        ArchiveEntry::FileWithHeaderSize {
+            path: "pax-sized.bin",
+            data: &pax_sized_payload,
+            header_size: 4,
+            mode: 0o644,
+        },
+    ]);
+    let (_pax_size_dir, pax_size_store, pax_size_active) = setup_store("pax-size");
+    let pax_size_server = MockServer::start(pax_size_archive.clone(), false).await;
+    let pax_size_client = client_for(&pax_size_server);
+    let pax_size = release_for(&pax_size_archive, pax_size_server.url());
+    let pax_size_digest = stage_release_with(
+        &pax_size,
+        &pax_size_store,
+        &pax_size_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect("a pax size larger than the header size must be accounted for");
+    assert_eq!(
+        pax_size_store.current().expect("read active generation"),
+        Some(pax_size_active.clone())
+    );
+    let pax_sized_file = pax_size_store
+        .generation_dir(&pax_size_digest)
+        .join("pax-sized.bin");
+    assert_eq!(
+        fs::metadata(&pax_sized_file)
+            .expect("stat pax-sized file")
+            .len(),
+        2048,
+        "the effective pax size, not the ustar header size, must bound the extracted file"
+    );
+    assert_eq!(
+        fs::read(&pax_sized_file).expect("read pax-sized file"),
+        pax_sized_payload
+    );
+
+    let large_pax = pax_record("comment", &"x".repeat(2048));
+    let large_pax_archive = build_archive(&[
+        ArchiveEntry::Pax { data: &large_pax },
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+    ]);
+    let (_large_pax_dir, large_pax_store, large_pax_active) = setup_store("large-pax");
+    let large_pax_server = MockServer::start(large_pax_archive.clone(), false).await;
+    let large_pax_client = client_for(&large_pax_server);
+    let large_pax_release = release_for(&large_pax_archive, large_pax_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024,
+            max_entries: 64,
+        },
+    };
+    let err = stage_release_with(
+        &large_pax_release,
+        &large_pax_store,
+        &large_pax_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("a large pax payload must hit the decompressed budget");
+    assert!(
+        matches!(err, UpdateError::ArchiveExpandedTooLarge { .. }),
+        "unexpected large-pax error: {err:?}"
+    );
+    assert_only_active(&large_pax_store, &large_pax_active);
+
+    let component = "a".repeat(200);
+    let mut long_path = String::new();
+    for _ in 0..9 {
+        long_path.push_str(&component);
+        long_path.push('/');
+    }
+    long_path.push_str("placeholder.txt");
+    let gnu_long_archive = build_archive(&[
+        ArchiveEntry::GnuLongName {
+            data: long_path.as_bytes(),
+        },
+        ArchiveEntry::FileWithHeaderSize {
+            path: "placeholder.txt",
+            data: b"x",
+            header_size: 1,
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+    ]);
+    let (_gnu_long_dir, gnu_long_store, gnu_long_active) = setup_store("gnu-long");
+    let gnu_long_server = MockServer::start(gnu_long_archive.clone(), false).await;
+    let gnu_long_client = client_for(&gnu_long_server);
+    let gnu_long = release_for(&gnu_long_archive, gnu_long_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024,
+            max_entries: 64,
+        },
+    };
+    let err = stage_release_with(
+        &gnu_long,
+        &gnu_long_store,
+        &gnu_long_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("a large GNU long-name payload must hit the decompressed budget");
+    assert!(
+        matches!(err, UpdateError::ArchiveExpandedTooLarge { .. }),
+        "unexpected GNU long-name error: {err:?}"
+    );
+    assert_only_active(&gnu_long_store, &gnu_long_active);
+
+    let pax_path = pax_record("path", "release.json");
+    let pax_count_archive = build_archive(&[
+        ArchiveEntry::Pax { data: &pax_path },
+        ArchiveEntry::FileWithHeaderSize {
+            path: "ignored",
+            data: &manifest_bytes,
+            header_size: u64::try_from(manifest_bytes.len()).expect("manifest size"),
+            mode: 0o644,
+        },
+    ]);
+    let (_pax_count_dir, pax_count_store, pax_count_active) = setup_store("pax-count");
+    let pax_count_server = MockServer::start(pax_count_archive.clone(), false).await;
+    let pax_count_client = client_for(&pax_count_server);
+    let pax_count = release_for(&pax_count_archive, pax_count_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024 * 1024,
+            max_entries: 1,
+        },
+    };
+    let err = stage_release_with(
+        &pax_count,
+        &pax_count_store,
+        &pax_count_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("invisible pax metadata must count against the entry limit");
+    assert!(
+        matches!(err, UpdateError::TooManyArchiveEntries { limit: 1 }),
+        "unexpected pax-count error: {err:?}"
+    );
+    assert_only_active(&pax_count_store, &pax_count_active);
 
     let (_enospc_dir, enospc_store, enospc_active) = setup_store("enospc");
     let enospc_server = MockServer::start(valid_archive.clone(), false).await;

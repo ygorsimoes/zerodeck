@@ -44,7 +44,7 @@ pub struct CheckedHttpClient {
 
 impl CheckedHttpClient {
     /// Builds a [`CheckedHttpClient`] using `policy`'s defaults (`redirect::Policy::none()`,
-    /// `.no_proxy()`, [`PolicyDnsResolver`], and any configured timeouts or user agent).
+    /// `.no_proxy()`, `PolicyDnsResolver`, and any configured timeouts or user agent).
     pub fn new(policy: OutboundHttpPolicy) -> Result<Self, CoreError> {
         Self::from_builder(policy, Client::builder())
     }
@@ -395,7 +395,7 @@ impl reqwest::dns::Resolve for PolicyDnsResolver {
 /// hops.
 ///
 /// The wrapped [`reqwest::Client`] disables automatic redirects and system proxies and uses
-/// [`PolicyDnsResolver`] so resolved IPs are validated at connect time while preserving connection
+/// `PolicyDnsResolver` so resolved IPs are validated at connect time while preserving connection
 /// pooling, configured timeouts, and user agent. Each redirect `Location` is validated before
 /// issuing the next hop, and sensitive headers (including `Host`) are stripped on cross-origin
 /// redirects.

@@ -52,7 +52,7 @@ fmt:
 # Lint everything without running tests
 [group('dev')]
 lint:
-    {{ dev }} just _fmt-check _clippy _py-lint _fe-lint
+    {{ dev }} just _fmt-check _clippy _doc _py-lint _fe-lint
 
 # Run every test suite (Rust, Python worker host, frontend)
 [group('dev')]
@@ -76,10 +76,10 @@ clean:
 
 # ─── Focused checks (one per CI job) ─────────────────────────────────────────────────────────────
 
-# Rust: rustfmt, clippy (-D warnings), tests
+# Rust: rustfmt, clippy (-D warnings), rustdoc (-D warnings), tests
 [group('checks')]
 check-rust:
-    {{ dev }} just _fmt-check _clippy _cargo-test
+    {{ dev }} just _fmt-check _clippy _doc _cargo-test
 
 # Rust test coverage report (HTML + lcov) into target/coverage
 [group('checks')]
@@ -207,7 +207,7 @@ dist tag image="zerodeck:runtime":
 # ─── Implementations (run where the public recipe decided: container or native) ─────────────────
 
 [private]
-_check: _fmt-check _clippy _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test
+_check: _fmt-check _clippy _doc _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test
 
 [private]
 _fmt: _fe-deps
@@ -221,6 +221,10 @@ _fmt-check:
 [private]
 _clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
+
+[private]
+_doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
 [private]
 _cargo-test:

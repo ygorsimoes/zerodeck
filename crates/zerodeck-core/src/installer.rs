@@ -23,6 +23,21 @@ pub const DEFAULT_MAX_ZIP_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 /// Default maximum size of a single `remote_binary` download (256 MiB).
 pub const DEFAULT_MAX_REMOTE_BINARY_BYTES: usize = 256 * 1024 * 1024;
 
+/// Runs blocking filesystem or CPU-heavy work on tokio's blocking pool so it never stalls the
+/// async runtime (WebSocket keepalives, concurrent RPCs).
+pub(crate) async fn run_blocking<T, F>(work: F) -> Result<T, CoreError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CoreError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|join_err| CoreError::Io {
+            path: PathBuf::new(),
+            source: std::io::Error::other(format!("blocking task failed: {join_err}")),
+        })?
+}
+
 /// Source of a plugin archive to stage and install.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallPluginSource {
@@ -341,32 +356,18 @@ pub async fn prepare_staged_plugin(
         fetch_and_verify_archive(paths, client, limits, &req.source, allow_unverified).await?;
 
     let plugins_dir = paths.plugins_dir();
-    ensure_dir_0755(&plugins_dir)?;
-    let canonical_plugins_dir = fs::canonicalize(&plugins_dir).map_err(|source| CoreError::Io {
-        path: plugins_dir,
-        source,
-    })?;
-
-    let staging_root = canonical_plugins_dir.join(format!(".{}.extract-staging", Uuid::new_v4()));
-    fs::create_dir(&staging_root).map_err(|source| CoreError::Io {
-        path: staging_root.clone(),
-        source,
-    })?;
-    set_dir_permissions(&staging_root)?;
-    let mut guard = StagingDirGuard::new(staging_root.clone());
-
-    let raw_dir = staging_root.join("raw");
-    extract_zip_safely_with_limits(&zip_bytes, &raw_dir, &ExtractLimits::default())?;
-
-    let plugin_stage_dir = staging_root.join("plugin");
-    let wrapper_dir = unwrap_extracted_plugin(&raw_dir, &plugin_stage_dir)?;
-    set_dir_permissions(&plugin_stage_dir)?;
-
-    let (manifest, package) = read_and_validate_manifests(
-        &plugin_stage_dir,
-        req.expected_name.as_deref(),
-        req.expected_version.as_deref(),
-    )?;
+    let expected_name = req.expected_name.clone();
+    let expected_version = req.expected_version.clone();
+    let (staging_root, plugin_stage_dir, wrapper_dir, manifest, package, mut guard) =
+        run_blocking(move || {
+            extract_into_staging(
+                &plugins_dir,
+                &zip_bytes,
+                expected_name.as_deref(),
+                expected_version.as_deref(),
+            )
+        })
+        .await?;
 
     if let Some(pkg) = package.as_ref()
         && !pkg.remote_binary.is_empty()
@@ -392,6 +393,57 @@ pub async fn prepare_staged_plugin(
         plugin_stage_dir,
         committed: false,
     })
+}
+
+/// Staging directory, unwrapped plugin directory, wrapper folder, manifests, and the guard that
+/// removes the staging directory unless disarmed.
+type ExtractedStaging = (
+    PathBuf,
+    PathBuf,
+    Option<String>,
+    PluginManifest,
+    Option<PackageManifest>,
+    StagingDirGuard,
+);
+
+/// Blocking half of [`prepare_staged_plugin`]: creates the staging directory, extracts and
+/// unwraps the archive, and validates the manifests.
+fn extract_into_staging(
+    plugins_dir: &Path,
+    zip_bytes: &[u8],
+    expected_name: Option<&str>,
+    expected_version: Option<&str>,
+) -> Result<ExtractedStaging, CoreError> {
+    ensure_dir_0755(plugins_dir)?;
+    let canonical_plugins_dir = fs::canonicalize(plugins_dir).map_err(|source| CoreError::Io {
+        path: plugins_dir.to_path_buf(),
+        source,
+    })?;
+    let staging_root = canonical_plugins_dir.join(format!(".{}.extract-staging", Uuid::new_v4()));
+    fs::create_dir(&staging_root).map_err(|source| CoreError::Io {
+        path: staging_root.clone(),
+        source,
+    })?;
+    set_dir_permissions(&staging_root)?;
+    let guard = StagingDirGuard::new(staging_root.clone());
+
+    let raw_dir = staging_root.join("raw");
+    extract_zip_safely_with_limits(zip_bytes, &raw_dir, &ExtractLimits::default())?;
+
+    let plugin_stage_dir = staging_root.join("plugin");
+    let wrapper_dir = unwrap_extracted_plugin(&raw_dir, &plugin_stage_dir)?;
+    set_dir_permissions(&plugin_stage_dir)?;
+
+    let (manifest, package) =
+        read_and_validate_manifests(&plugin_stage_dir, expected_name, expected_version)?;
+    Ok((
+        staging_root,
+        plugin_stage_dir,
+        wrapper_dir,
+        manifest,
+        package,
+        guard,
+    ))
 }
 
 /// Atomically moves a [`StagedPluginInstall`] into `target_dir`, parking and restoring any
@@ -483,8 +535,11 @@ async fn fetch_and_verify_archive(
             let policy_source = InstallSource::Remote {
                 sha256: sha256.clone(),
             };
-            let digest = verify_sha256_policy(&bytes, &policy_source, allow_unverified)?;
-            Ok((bytes, digest))
+            run_blocking(move || {
+                let digest = verify_sha256_policy(&bytes, &policy_source, allow_unverified)?;
+                Ok((bytes, digest))
+            })
+            .await
         }
         InstallPluginSource::LocalZip {
             path,
@@ -496,13 +551,17 @@ async fn fetch_and_verify_archive(
             if !has_non_empty_sha256(sha256.as_deref()) && !user_confirmed && !allow_unverified {
                 return Err(CoreError::ConfirmationRequired);
             }
-            let bytes = read_bounded_local_file(&canonical_path, limits.max_zip_download_bytes)?;
             let policy_source = InstallSource::LocalFile {
                 sha256: sha256.clone(),
                 user_confirmed: *user_confirmed,
             };
-            let digest = verify_sha256_policy(&bytes, &policy_source, allow_unverified)?;
-            Ok((bytes, digest))
+            let max_bytes = limits.max_zip_download_bytes;
+            run_blocking(move || {
+                let bytes = read_bounded_local_file(&canonical_path, max_bytes)?;
+                let digest = verify_sha256_policy(&bytes, &policy_source, allow_unverified)?;
+                Ok((bytes, digest))
+            })
+            .await
         }
     }
 }
@@ -800,23 +859,33 @@ async fn stage_remote_binaries(
         let policy_source = InstallSource::Remote {
             sha256: spec.sha256hash.clone(),
         };
-        verify_sha256_policy(&bin_bytes, &policy_source, allow_unverified)?;
-
-        let target = bin_jail.root().join(&spec.name);
-        if let Ok(meta) = fs::symlink_metadata(&target)
-            && (meta.file_type().is_symlink() || meta.is_dir())
-        {
-            return Err(CoreError::Platform(PlatformError::PathEscape {
-                candidate: PathBuf::from(&spec.name),
-                root: bin_jail.root().to_path_buf(),
-            }));
-        }
-
-        atomic_write(&target, &bin_bytes)?;
-        set_executable_permissions(&target)?;
-        let _ = bin_jail.resolve(&spec.name)?;
+        let jail = bin_jail.clone();
+        let name = spec.name.clone();
+        run_blocking(move || {
+            verify_sha256_policy(&bin_bytes, &policy_source, allow_unverified)?;
+            write_remote_binary(&jail, &name, &bin_bytes)
+        })
+        .await?;
     }
 
+    Ok(())
+}
+
+/// Writes one verified `remote_binary` into the `bin/` jail as an executable regular file.
+fn write_remote_binary(bin_jail: &SafePath, name: &str, bytes: &[u8]) -> Result<(), CoreError> {
+    let target = bin_jail.root().join(name);
+    if let Ok(meta) = fs::symlink_metadata(&target)
+        && (meta.file_type().is_symlink() || meta.is_dir())
+    {
+        return Err(CoreError::Platform(PlatformError::PathEscape {
+            candidate: PathBuf::from(name),
+            root: bin_jail.root().to_path_buf(),
+        }));
+    }
+
+    atomic_write(&target, bytes)?;
+    set_executable_permissions(&target)?;
+    let _ = bin_jail.resolve(name)?;
     Ok(())
 }
 

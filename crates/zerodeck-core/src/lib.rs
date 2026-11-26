@@ -2982,4 +2982,71 @@ class Plugin:
         watcher.stop().await;
         manager.shutdown_all().await;
     }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_does_not_starve_current_thread_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let dir = TestDir::new("install-starve");
+        let paths = manager_test_paths(&dir.0);
+        let manager = test_manager_open(&paths);
+
+        // A passive plugin (no main.py) with one large, highly compressible asset: extracting it
+        // takes long enough that doing it on the async thread would stall the ticker below.
+        let big = vec![0u8; 256 * 1024 * 1024];
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut buf);
+            let deflated =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("plugin.json", deflated)
+                .expect("start plugin.json");
+            writer
+                .write_all(br#"{"name":"BigAssets","author":"Alice","api_version":1}"#)
+                .expect("write plugin.json");
+            writer
+                .start_file("assets/big.bin", deflated)
+                .expect("start big.bin");
+            writer.write_all(&big).expect("write big.bin");
+            writer.finish().expect("finish zip");
+        }
+        drop(big);
+        let zip_bytes = buf.into_inner();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let max_gap_ms = Arc::new(AtomicU64::new(0));
+        let ticker = {
+            let running = Arc::clone(&running);
+            let max_gap_ms = Arc::clone(&max_gap_ms);
+            tokio::spawn(async move {
+                let mut last = Instant::now();
+                while running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let now = Instant::now();
+                    let gap =
+                        u64::try_from(now.duration_since(last).as_millis()).unwrap_or(u64::MAX);
+                    max_gap_ms.fetch_max(gap, Ordering::SeqCst);
+                    last = now;
+                }
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let outcome =
+            install_local_zip_with_hash(&manager, &dir.0.join("home"), "big.zip", &zip_bytes).await;
+        assert_eq!(outcome.name, "BigAssets");
+
+        running.store(false, Ordering::SeqCst);
+        ticker.await.expect("ticker task");
+        let gap = max_gap_ms.load(Ordering::SeqCst);
+        assert!(
+            gap < 250,
+            "async runtime stalled for {gap} ms during install"
+        );
+        manager.shutdown_all().await;
+    }
 }

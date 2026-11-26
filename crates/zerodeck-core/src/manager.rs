@@ -14,6 +14,7 @@ use zerodeck_plugin_host::{
 use zerodeck_protocol::PluginLoadType;
 
 use crate::discovery::discover_single_plugin;
+use crate::installer::run_blocking;
 use crate::preflight::{PreflightInput, preflight};
 use crate::{
     CheckedHttpClient, CoreError, DiscoveredPlugin, FilePicker, FilePickerListing, FilePickerQuery,
@@ -381,7 +382,10 @@ impl PluginManager {
             false
         };
 
-        let outcome = match commit_staged_plugin(staged, &target_path) {
+        let commit_target = target_path.clone();
+        let committed =
+            run_blocking(move || Ok(commit_staged_plugin(staged, &commit_target))).await?;
+        let outcome = match committed {
             Ok(outcome) => outcome,
             Err(err) => {
                 if had_running_worker
@@ -395,7 +399,10 @@ impl PluginManager {
             }
         };
 
-        let discovered = discover_single_plugin(&target_path, outcome.directory.clone())?;
+        let discover_path = target_path.clone();
+        let discover_dir = outcome.directory.clone();
+        let discovered =
+            run_blocking(move || discover_single_plugin(&discover_path, discover_dir)).await?;
         self.upsert_plugin_entry(discovered.clone());
 
         let is_disabled = self.disabled_set().contains(&discovered.manifest.name);

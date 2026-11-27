@@ -735,6 +735,8 @@ document = {
         "min_updater": "0.1.0",
         "target": target,
     },
+    # `upgrade` rechecks the selection that produced the authorization (channel, updater version).
+    "selection": {"channel": "stable", "updater_version": "0.1.0"},
 }
 temporary = path + ".tmp"
 with open(temporary, "w", encoding="utf-8") as handle:

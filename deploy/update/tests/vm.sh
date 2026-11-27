@@ -1305,13 +1305,11 @@ scenario_sigkill_apply() {
 scenario_reboot_during_recovery() {
     log "scenario: reboot during boot recovery"
     local crash="${candidate_archive}" crash_digest="${candidate_digest}"
-    # systemd applies TimeoutStartSec to ExecStartPre as well as ExecStart. The packaged recovery
-    # unit has TimeoutStartSec=60, so a 60 s pre-delay would time out and recover-boot would never
-    # run. Override the timeout to 180 s. The window must outlast the boot-to-SSH time (sshd is not
-    # ordered after recovery, and on KVM it becomes reachable about as fast as the delay ends), so
-    # use 60 s rather than a delay that SSH can arrive after.
+    # Hold boot recovery until the harness releases it, so the observation does not depend on how
+    # long the guest takes to accept SSH. systemd applies TimeoutStartSec to ExecStartPre as well,
+    # so it is raised above the packaged 60 s; the hold ends on its own after that as a safety net.
     install_dropin zerodeck-recovery.service \
-        $'[Service]\nTimeoutStartSec=180\nExecStartPre=/bin/sleep 60'
+        $'[Service]\nTimeoutStartSec=300\nExecStartPre=/bin/sh -c \'until [ -e /run/zerodeck-vm-recovery-go ]; do sleep 1; done\''
     prepare_pending_crash "${crash}" "${crash_digest}"
     hard_poweroff
     start_qemu
@@ -1343,6 +1341,8 @@ SCRIPT
     boot_after="$(guest_cmd cat /proc/sys/kernel/random/boot_id)"
     [[ -n "${boot_after}" && "${boot_after}" != "${boot_before}" ]] || \
         die "guest boot ID did not change after the reboot trigger"
+    # Boot recovery of the new boot is held by the drop-in; release it now that SSH is up.
+    guest_root_cmd touch /run/zerodeck-vm-recovery-go
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck-recovery.service
     remove_dropin zerodeck.service

@@ -549,7 +549,7 @@ fn offline_rollback(
     ));
     confirmed.last_error = None;
     state.write(&confirmed)?;
-    store.gc(&confirmed, &staged_generations(store))?;
+    gc_keeping_staged(store, &confirmed)?;
     Ok(())
 }
 
@@ -626,16 +626,25 @@ fn finish_success(
     state.write(&confirmed)?;
     // Housekeeping runs under the exclusive guard the caller already holds. `gc` itself keeps
     // `current`, the confirmed and rollback generations, and any authorized staged candidate.
-    store.gc(&confirmed, &staged_generations(store))?;
+    gc_keeping_staged(store, &confirmed)?;
     Ok(())
 }
 
-fn staged_generations(store: &GenerationStore) -> Vec<GenerationId> {
-    Catalog::open_offline(store.root())
-        .and_then(|catalog| catalog.persisted_authorization())
-        .ok()
-        .flatten()
-        .map_or_else(Vec::new, |release| vec![release.digest])
+/// Garbage-collects generations, keeping the one the persisted authorization points at.
+///
+/// Recovery must work even when the catalog state is unreadable, but then nothing can vouch for
+/// the staged candidate, so collection is skipped instead of guessing "nothing staged".
+fn gc_keeping_staged(store: &GenerationStore, state: &UpdateState) -> Result<(), UpdateError> {
+    let staged =
+        Catalog::open_offline(store.root()).and_then(|catalog| catalog.persisted_authorization());
+    match staged {
+        Ok(release) => {
+            let staged: Vec<GenerationId> =
+                release.map(|release| release.digest).into_iter().collect();
+            store.gc(state, &staged)
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -828,20 +837,18 @@ async fn recover_inner(
         return Ok(());
     };
 
-    if pending.phase == TransactionPhase::Confirmed {
-        let current = store.current_reference()?;
-        if current.as_ref() != Some(&pending.candidate) {
-            return Err(UpdateError::StaleRequest {
-                expected: Some(pending.candidate),
-                found: current,
-            });
-        }
+    // `Confirmed` only commits when the active reference still names the candidate. A mismatch
+    // means the confirmation cannot be trusted, so it reconciles like any unconfirmed trial
+    // instead of returning an error that would keep the daemon from ever starting.
+    if pending.phase == TransactionPhase::Confirmed
+        && store.current_reference()?.as_ref() == Some(&pending.candidate)
+    {
         remove_owned_request(&requests, pending.id)?;
         persisted.confirm();
         persisted.last_result = Some(format!("confirmed {}", pending.candidate));
         persisted.last_error = None;
         state.write(&persisted)?;
-        store.gc(&persisted, &staged_generations(store))?;
+        gc_keeping_staged(store, &persisted)?;
         return Ok(());
     }
 
@@ -879,7 +886,7 @@ async fn recover_inner(
             remove_owned_request(&requests, pending.id)?;
             persisted.pending = None;
             state.write(&persisted)?;
-            store.gc(&persisted, &staged_generations(store))?;
+            gc_keeping_staged(store, &persisted)?;
             Ok(())
         }
         (RecoveryMode::BeforeBootStart, None) => {
@@ -944,7 +951,7 @@ async fn recover_inner(
             remove_owned_request(&requests, pending.id)?;
             persisted.pending = None;
             state.write(&persisted)?;
-            store.gc(&persisted, &staged_generations(store))?;
+            gc_keeping_staged(store, &persisted)?;
             Ok(())
         }
         (RecoveryMode::AfterApply, None) => {

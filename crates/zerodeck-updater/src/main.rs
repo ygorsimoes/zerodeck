@@ -12,16 +12,15 @@ use clap::{Parser, Subcommand};
 use semver::Version;
 use url::Url;
 use zerodeck_updater::{
-    ACTIVATION_DEADLINE, APPLY_UNIT, ApplyRequestStore, AuthorizedRelease, BootRecoveryMarker,
-    Catalog, Channel, DAEMON_UNIT, GenerationId, GenerationStore, RecoveryMode, SelectionPolicy,
-    StateStore, SystemdService, UpdateError, UpgradeOutcome, acquire_maintenance_exclusive,
-    apply_pending, bootstrap_generation, confirm_bootstrap, enqueue_rollback, enqueue_upgrade,
+    APPLY_UNIT, ApplyRequestStore, AuthorizedRelease, BootRecoveryMarker, Catalog, Channel,
+    DAEMON_UNIT, GenerationId, GenerationStore, RecoveryMode, SelectionPolicy, StateStore,
+    SystemdService, UpdateError, UpgradeOutcome, acquire_maintenance_exclusive, apply_pending,
+    bootstrap_generation, confirm_bootstrap, enqueue_rollback, enqueue_upgrade,
     enqueue_upgrade_with_channel, prepare_bootstrap, recover, recover_before_boot, stage_release,
 };
 
 const DEFAULT_ROOT: &str = "/var/lib/zerodeck";
 const DEFAULT_READY_URL: &str = "http://127.0.0.1:1337";
-const APPLY_WAIT: Duration = Duration::from_secs(ACTIVATION_DEADLINE.as_secs() + 120);
 const APPLY_LOCK_WAIT: Duration = Duration::from_secs(30);
 const APPLY_LOCK_POLL: Duration = Duration::from_millis(200);
 /// Distinct exit status for a staged candidate that needs an explicit `--start`.
@@ -218,6 +217,7 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     if let Some((version, generation)) = installed {
         policy = policy.with_installed(version, generation);
     }
+    policy = policy.with_quarantined(state.read()?.quarantined);
 
     // `--check-only` must not supersede the authorization of the release already staged.
     let candidate = if check_only {
@@ -232,9 +232,6 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
         );
         return Ok(());
     };
-    if state.read()?.quarantined.contains(&release.digest) {
-        return Err(UpdateError::Quarantined(release.digest));
-    }
     if check_only {
         print_release("available", &release);
         return Ok(());
@@ -358,9 +355,6 @@ fn run_unquarantine(root: &Path, digest: &str) -> Result<(), UpdateError> {
     let generation = GenerationId::new(digest)?;
     let store = GenerationStore::new(root)?;
     let _guard = acquire_maintenance_exclusive(&store)?;
-    if !store.generation_dir(&generation).is_dir() {
-        return Err(UpdateError::MissingGeneration(generation));
-    }
     let state = state_store(root);
     let mut persisted = state.read()?;
     if persisted.quarantined.contains(&generation) {
@@ -368,8 +362,6 @@ fn run_unquarantine(root: &Path, digest: &str) -> Result<(), UpdateError> {
         state.write(&persisted)?;
         println!("zerodeckctl: unquarantined {generation}");
     } else {
-        // Idempotent for a known installed generation; a digest with no generation directory was
-        // rejected above as unknown.
         println!("zerodeckctl: {generation} is not quarantined");
     }
     Ok(())
@@ -443,15 +435,30 @@ fn run_status(root: &Path) -> Result<(), UpdateError> {
 }
 
 async fn run_apply(root: &Path) -> Result<(), UpdateError> {
+    apply_waiting_for_lock(root, APPLY_LOCK_WAIT).await
+}
+
+/// Runs the pending apply, retrying while another maintenance operation holds the lock.
+///
+/// When the lock stays busy past `lock_wait` the request is discarded and the failure is final: a
+/// request left in the single slot would make every later `upgrade` answer "request pending" and
+/// nothing would ever consume it.
+async fn apply_waiting_for_lock(root: &Path, lock_wait: Duration) -> Result<(), UpdateError> {
     let (store, state, service) = open_runtime(root)?;
     let catalog = Catalog::open_offline(root)?;
-    // The apply unit can race a boot-recovery pass that still holds the exclusive guard. Retry
-    // within the unit's start timeout instead of failing and leaving the request queued forever.
-    let deadline = Instant::now() + APPLY_LOCK_WAIT;
+    let deadline = Instant::now() + lock_wait;
     loop {
         match apply_pending(&store, &state, &catalog, &service).await {
             Err(UpdateError::Busy) if Instant::now() < deadline => {
                 tokio::time::sleep(APPLY_LOCK_POLL).await;
+            }
+            Err(UpdateError::Busy) => {
+                ApplyRequestStore::for_state(&state).remove()?;
+                return Err(UpdateError::ActivationFailed(format!(
+                    "another maintenance operation held the update lock for {}s; the request was \
+                     discarded, rerun `zerodeckctl upgrade`",
+                    lock_wait.as_secs()
+                )));
             }
             result => {
                 result?;
@@ -472,45 +479,41 @@ async fn start_apply_and_report(
     command
         .args(["start", "--wait", "--", APPLY_UNIT])
         .kill_on_drop(true);
-    let systemctl_reason = match tokio::time::timeout(APPLY_WAIT, command.output()).await {
-        Ok(Ok(output)) if output.status.success() => None,
-        Ok(Ok(output)) => {
+    // `--wait` returns once the unit, including its `ExecStopPost` recovery, has finished, and the
+    // unit's own `TimeoutStartSec` bounds that: no client-side timeout or polling is needed.
+    let systemctl_reason = match command.output().await {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             Some(format!(
                 "apply unit exited with {}: {stderr}",
                 output.status
             ))
         }
-        Ok(Err(error)) => Some(format!("cannot start {APPLY_UNIT}: {error}")),
-        Err(_) => Some(format!("timed out waiting for {APPLY_UNIT}")),
+        Err(error) => Some(format!("cannot start {APPLY_UNIT}: {error}")),
     };
 
-    let deadline = Instant::now() + APPLY_WAIT;
-    loop {
-        let persisted = state.read()?;
-        let request_pending = requests.read_optional()?.is_some();
-        if persisted.pending.is_none() && !request_pending {
-            if persisted.last_confirmed.as_ref() == Some(expected) {
-                println!("zerodeckctl: activated {expected}");
-                return Ok(());
-            }
-            let reason = persisted
-                .last_error
-                .or(systemctl_reason)
-                .unwrap_or_else(|| {
-                    "apply completed without confirming the requested generation".to_owned()
-                });
-            return Err(UpdateError::ActivationFailed(reason));
+    let persisted = state.read()?;
+    let request_pending = requests.read_optional()?.is_some();
+    if persisted.pending.is_none() && !request_pending {
+        if persisted.last_confirmed.as_ref() == Some(expected) {
+            println!("zerodeckctl: activated {expected}");
+            return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err(UpdateError::ActivationFailed(
-                persisted.last_error.unwrap_or_else(|| {
-                    format!("timed out waiting for {APPLY_UNIT} to reconcile {expected}")
-                }),
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let reason = persisted
+            .last_error
+            .or(systemctl_reason)
+            .unwrap_or_else(|| {
+                "apply completed without confirming the requested generation".to_owned()
+            });
+        return Err(UpdateError::ActivationFailed(reason));
     }
+    Err(UpdateError::ActivationFailed(
+        persisted
+            .last_error
+            .or(systemctl_reason)
+            .unwrap_or_else(|| format!("{APPLY_UNIT} finished without reconciling {expected}")),
+    ))
 }
 
 fn exec_current(root: &Path) -> Result<(), UpdateError> {
@@ -669,6 +672,9 @@ fn apply_kind_name(kind: zerodeck_updater::ApplyKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::apply_waiting_for_lock;
     use super::{EXIT_REQUIRES_START, exit_code};
     use zerodeck_updater::UpdateError;
 
@@ -677,5 +683,34 @@ mod tests {
         assert_eq!(exit_code(&UpdateError::StartRequired), EXIT_REQUIRES_START);
         assert_eq!(EXIT_REQUIRES_START, 75);
         assert_eq!(exit_code(&UpdateError::Busy), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_discards_its_request_when_the_lock_stays_busy() {
+        use zerodeck_updater::{
+            ApplyRequest, ApplyRequestStore, GenerationId, GenerationStore,
+            acquire_maintenance_exclusive,
+        };
+
+        let root = std::env::temp_dir().join(format!("zerodeckctl-busy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create root");
+        let store = GenerationStore::new(&root).expect("open store");
+        let target = GenerationId::new("a".repeat(64)).expect("id");
+        let requests = ApplyRequestStore::for_state(&super::state_store(&root));
+        requests
+            .enqueue(&ApplyRequest::rollback(target, None))
+            .expect("enqueue");
+        let _held = acquire_maintenance_exclusive(&store).expect("hold the lock");
+
+        let error = apply_waiting_for_lock(&root, Duration::from_millis(300))
+            .await
+            .expect_err("a busy lock must fail");
+
+        assert!(matches!(
+            error,
+            zerodeck_updater::UpdateError::ActivationFailed(_)
+        ));
+        assert!(requests.read_optional().expect("read").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

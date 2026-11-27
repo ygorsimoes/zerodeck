@@ -6,10 +6,11 @@ ConditionPathExists=/var/lib/zerodeck
 [Service]
 Type=oneshot
 User=root
-# Activation and an offline rollback each have the 60 s readiness deadline. The start timeout also
-# covers stopping, switching, staging overhead, and the post-stop recovery hook.
-TimeoutStartSec=180
-TimeoutStopSec=180
+# Worst case is a failed candidate followed by a full revert: 2 x (30 s stop + 10 s start + 60 s
+# readiness) + 30 s bookkeeping = 230 s. `zerodeck_updater::APPLY_BUDGET` owns that figure and a
+# test fails if these timeouts drop below it.
+TimeoutStartSec=240
+TimeoutStopSec=240
 ExecStart=/usr/local/lib/zerodeck/bin/zerodeckctl apply --root /var/lib/zerodeck
 # Runs after the apply process exits, whether it succeeded, failed, or was killed. The helper waits
 # for the maintenance lock instead of stealing it and only restarts a daemon that was recorded as

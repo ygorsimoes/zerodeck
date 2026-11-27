@@ -35,7 +35,7 @@ pub use generation::{GenerationId, GenerationLayout, GenerationRelease, Generati
 pub use request::{APPLY_REQUEST_SCHEMA, ApplyKind, ApplyRequest, ApplyRequestStore};
 pub use schema::{Schema, SchemaFile};
 pub use service::{
-    ACTIVATION_DEADLINE, ReleaseIdentity, Systemctl, SystemctlFuture, SystemdService,
+    ACTIVATION_DEADLINE, APPLY_BUDGET, ReleaseIdentity, Systemctl, SystemctlFuture, SystemdService,
     TokioSystemctl, verify_ready,
 };
 pub use stage::{StageFault, StageLimits, stage_release, stage_release_with};
@@ -186,6 +186,12 @@ pub enum UpdateError {
     #[error("release has no download URL")]
     MissingDownloadUrl,
 
+    /// The archive server stopped sending data for longer than the idle timeout.
+    #[error("no data from `{url}` for {idle:?}; the download stalled")]
+    DownloadIdle {
+        url: String,
+        idle: std::time::Duration,
+    },
     /// Streaming the archive failed at the HTTP transport.
     #[error("HTTP request to `{url}` failed: {source}")]
     Download {

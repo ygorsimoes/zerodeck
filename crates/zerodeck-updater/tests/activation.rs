@@ -1555,6 +1555,30 @@ async fn boot_recovery_never_changes_services_or_trusted_metadata() {
 }
 
 #[tokio::test]
+async fn boot_recovery_reverts_a_confirmed_phase_whose_current_differs() {
+    let harness = crashed_at(ActivationCheckpoint::AfterSwitch).await;
+    let mut state = harness.read_state();
+    state.pending.as_mut().expect("pending").phase = TransactionPhase::Confirmed;
+    harness.write_state(&state);
+    harness
+        .store
+        .switch_to(&generation_id('a'))
+        .expect("point current away from the candidate");
+
+    recover(
+        &harness.store,
+        &harness.state,
+        &harness.service,
+        RecoveryMode::BeforeBootStart,
+    )
+    .await
+    .expect("a mismatched Confirmed phase must reconcile, not wedge boot");
+
+    assert_eq!(harness.current(), Some(generation_id('a')));
+    assert!(harness.read_state().pending.is_none());
+}
+
+#[tokio::test]
 async fn recovery_starts_the_previous_generation_with_the_same_readiness_gate() {
     let harness = crashed_at(ActivationCheckpoint::AfterStart).await;
     let previous = generation_id('a');
@@ -2295,8 +2319,8 @@ fn unquarantine_is_exclusive_atomic_and_idempotent() {
         .output()
         .expect("run unknown unquarantine");
     assert!(
-        !output.status.success(),
-        "an unknown digest must be rejected"
+        output.status.success(),
+        "releasing a digest that is not quarantined is an idempotent no-op"
     );
 }
 
@@ -2507,6 +2531,8 @@ async fn rollback_succeeds_with_corrupt_catalog_state_and_rejects_start_requests
     )
     .expect("corrupt catalog state");
     let catalog_bytes = harness.catalog_bytes();
+    // A generation only the unreadable catalog could vouch for must survive the rollback.
+    let (maybe_staged, _) = harness.add_generation('e', "3.0.0", "build-staged");
 
     let mut invalid = ApplyRequest::rollback(target.clone(), Some(current.clone()));
     invalid.start_service = true;
@@ -2527,6 +2553,10 @@ async fn rollback_succeeds_with_corrupt_catalog_state_and_rejects_start_requests
     assert_eq!(harness.current(), Some(target));
     assert_eq!(harness.catalog_bytes(), catalog_bytes);
     assert!(harness.runtime.active.load(Ordering::SeqCst));
+    assert!(
+        harness.store.generation_dir(&maybe_staged).is_dir(),
+        "garbage collection must be skipped, not guessed, when the catalog state is unreadable"
+    );
 }
 
 #[test]
@@ -2643,4 +2673,23 @@ async fn first_install_pre_start_interruption_does_not_quarantine() {
         "a pre-start first install stays retryable after recovery"
     );
     assert!(state.last_error.is_some());
+}
+
+#[test]
+fn apply_unit_timeout_covers_the_worst_case_budget() {
+    let unit = include_str!("../../../deploy/systemd/zerodeck-apply.service");
+    let seconds = |key: &str| -> u64 {
+        unit.lines()
+            .find_map(|line| line.strip_prefix(key))
+            .unwrap_or_else(|| panic!("{key} is not set in zerodeck-apply.service"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("{key} must be plain seconds: {error}"))
+    };
+    let budget = zerodeck_updater::APPLY_BUDGET.as_secs();
+    assert!(
+        seconds("TimeoutStartSec=") >= budget,
+        "TimeoutStartSec must cover a failed candidate plus a full revert ({budget}s)"
+    );
+    assert!(seconds("TimeoutStopSec=") >= budget);
 }

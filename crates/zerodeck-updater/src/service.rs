@@ -22,6 +22,18 @@ const READINESS_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const SYSTEMCTL_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 const SYSTEMCTL_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Worst case for one apply: stop, start and wait for readiness of the candidate, then the same
+/// three steps again to revert to the previous generation, plus the 30 s the apply helper may wait for the maintenance lock.
+///
+/// `zerodeck-apply.service` must allow at least this long (a test enforces it), and the client
+/// waits on `systemctl start --wait` instead of polling with a timeout of its own.
+pub const APPLY_BUDGET: Duration = Duration::from_secs(
+    2 * (SYSTEMCTL_STOP_TIMEOUT.as_secs()
+        + SYSTEMCTL_START_TIMEOUT.as_secs()
+        + ACTIVATION_DEADLINE.as_secs())
+        + 30,
+);
 const AUTH_TOKEN_PATH: &str = "/auth/token";
 const READY_PATH: &str = "/readyz";
 const FRONTEND_ASSET_PATH: &str = "/frontend/index.js";

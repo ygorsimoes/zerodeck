@@ -1,6 +1,6 @@
 //! Pinned-root TUF catalog selection and offline authorization checks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::Path;
@@ -87,6 +87,8 @@ pub struct SelectionPolicy {
     pub installed: Option<InstalledRelease>,
     /// The running updater version used to enforce `min_updater`.
     pub updater_version: Version,
+    /// Digests rejected by a failed trial; never selected until an operator releases them.
+    pub quarantined: BTreeSet<GenerationId>,
 }
 
 impl SelectionPolicy {
@@ -98,7 +100,15 @@ impl SelectionPolicy {
             allow_prerelease: false,
             installed: None,
             updater_version,
+            quarantined: BTreeSet::new(),
         }
+    }
+
+    /// Skips these digests, so the next eligible release is selected instead.
+    #[must_use]
+    pub fn with_quarantined(mut self, digests: impl IntoIterator<Item = GenerationId>) -> Self {
+        self.quarantined = digests.into_iter().collect();
+        self
     }
 
     /// Selects only targets from `channel`.
@@ -457,6 +467,9 @@ impl Catalog {
                 continue;
             }
             if release.min_updater > policy.updater_version {
+                continue;
+            }
+            if policy.quarantined.contains(&release.digest) {
                 continue;
             }
             if let Some(installed) = &policy.installed {

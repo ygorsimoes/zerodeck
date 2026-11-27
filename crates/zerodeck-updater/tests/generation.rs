@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use zerodeck_platform::MaintenanceLock;
-use zerodeck_updater::{GenerationId, GenerationStore, UpdateError};
+use zerodeck_updater::{GenerationId, GenerationStore, UpdateError, UpdateState};
 
 const WORKER_LOCK_PATH: &str = "ZERODECK_TEST_MAINTENANCE_LOCK";
 const WORKER_READY_PATH: &str = "ZERODECK_TEST_MAINTENANCE_READY";
@@ -171,4 +171,64 @@ fn wait_for(path: &Path, what: &str) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn make_generation(store: &GenerationStore, id: &GenerationId) {
+    let dir = store.generation_dir(id);
+    fs::create_dir_all(dir.join("bin")).expect("create generation tree");
+    fs::write(dir.join("release.json"), b"{}").expect("write manifest");
+}
+
+fn entries(store: &GenerationStore) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(
+        store
+            .generation_dir(&generation_id('0'))
+            .parent()
+            .expect("parent"),
+    )
+    .expect("list generations")
+    .map(|entry| {
+        entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .into_owned()
+    })
+    .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn gc_keeps_quarantined_generations_until_they_are_released() {
+    let dir = TestDir::new("gc-quarantine");
+    let store = GenerationStore::new(&dir.0).expect("open store");
+    let quarantined = generation_id('c');
+    let unreferenced = generation_id('d');
+    make_generation(&store, &quarantined);
+    make_generation(&store, &unreferenced);
+    let mut state = UpdateState::new();
+    state.quarantine(quarantined.clone());
+
+    store.gc(&state, &[]).expect("gc");
+
+    assert_eq!(entries(&store), vec![quarantined.to_string()]);
+}
+
+#[test]
+fn gc_sweeps_leftover_trash_and_staging_directories() {
+    let dir = TestDir::new("gc-sweep");
+    let store = GenerationStore::new(&dir.0).expect("open store");
+    let generations = store
+        .generation_dir(&generation_id('0'))
+        .parent()
+        .expect("parent")
+        .to_path_buf();
+    // A crash between gc's rename and delete, and an interrupted extraction.
+    fs::create_dir_all(generations.join(format!(".trash-{}", "f".repeat(8)))).expect("trash");
+    fs::create_dir_all(generations.join(".staging-interrupted/tree")).expect("staging");
+
+    store.gc(&UpdateState::new(), &[]).expect("gc");
+
+    assert!(entries(&store).is_empty(), "{:?}", entries(&store));
 }

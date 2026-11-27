@@ -23,6 +23,9 @@ use crate::{AuthorizedRelease, GenerationId, GenerationStore, UpdateError};
 /// Default maximum compressed archive bytes accepted while staging a loader release.
 pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = DEFAULT_MAX_ARCHIVE_BYTES;
 
+/// Default longest wait for the next chunk of an archive body.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 const ARCHIVE_FILE: &str = "archive.tar.gz";
 const TREE_DIR: &str = "tree";
 
@@ -33,6 +36,9 @@ pub struct StageLimits {
     pub max_download_bytes: u64,
     /// Maximum expanded bytes and entry count accepted from the archive.
     pub extract: ExtractLimits,
+    /// Longest wait for the next chunk of the archive body. There is deliberately no total
+    /// deadline: a large archive on a slow link is fine as long as bytes keep arriving.
+    pub idle_timeout: Duration,
 }
 
 impl Default for StageLimits {
@@ -40,6 +46,7 @@ impl Default for StageLimits {
         Self {
             max_download_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
             extract: ExtractLimits::default(),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
     }
 }
@@ -87,10 +94,9 @@ pub async fn stage_release(
     store: &GenerationStore,
 ) -> Result<GenerationId, UpdateError> {
     let client = OutboundHttpPolicy::production()
-        .with_timeouts(
-            Some(Duration::from_secs(10)),
-            Some(Duration::from_secs(120)),
-        )
+        // Connect timeout only. A total response timeout would make any archive that needs
+        // longer than it to download impossible to stage; stalls are caught per chunk instead.
+        .with_timeouts(Some(Duration::from_secs(10)), None)
         .build_checked_client()?;
     stage_release_with(release, store, &client, StageLimits::default(), &NoFault).await
 }
@@ -230,9 +236,12 @@ async fn download(
 
     let mut hasher = Sha256::new();
     let mut written = 0u64;
-    while let Some(chunk) = response
-        .chunk()
+    while let Some(chunk) = tokio::time::timeout(limits.idle_timeout, response.chunk())
         .await
+        .map_err(|_| UpdateError::DownloadIdle {
+            url: url.to_string(),
+            idle: limits.idle_timeout,
+        })?
         .map_err(|source| UpdateError::Download {
             url: url.to_string(),
             source: Box::new(source),
@@ -665,24 +674,48 @@ fn ensure_parent_dirs(
     Ok(())
 }
 
+/// Reuses an already extracted generation only when its complete layout verifies.
+///
+/// A directory that is merely named like the digest is not trusted: an interrupted delete or a
+/// copy by hand can leave `release.json` without the payload. Such a tree is discarded (unless it
+/// is the active generation) and staged again.
 fn cached_generation(
     release: &AuthorizedRelease,
     store: &GenerationStore,
 ) -> Result<Option<GenerationId>, UpdateError> {
     let directory = store.generation_dir(&release.digest);
     match fs::symlink_metadata(&directory) {
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(UpdateError::CorruptGeneration(release.digest.clone()));
-            }
-            verify_manifest(&read_release_manifest(&directory)?, release)?;
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(UpdateError::Io {
+                path: directory,
+                source,
+            });
+        }
+    }
+    match store.verify_generation(&release.digest) {
+        Ok(layout) => {
+            verify_manifest(
+                &ReleaseManifest {
+                    schema: zerodeck_protocol::release::RELEASE_MANIFEST_SCHEMA,
+                    version: layout.release().version().to_string(),
+                    build_id: layout.release().build_id().to_owned(),
+                },
+                release,
+            )?;
             Ok(Some(release.digest.clone()))
         }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(UpdateError::Io {
-            path: directory,
-            source,
-        }),
+        Err(
+            error @ (UpdateError::CorruptGeneration(_) | UpdateError::InvalidReleaseManifest(_)),
+        ) => {
+            if store.current_reference()?.as_ref() == Some(&release.digest) {
+                return Err(error);
+            }
+            store.discard(&directory)?;
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 

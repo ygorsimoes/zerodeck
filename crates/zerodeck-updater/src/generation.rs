@@ -310,6 +310,57 @@ impl GenerationStore {
         })
     }
 
+    /// Removes a generation directory without ever leaving a half-deleted tree under its name.
+    ///
+    /// The directory is renamed to `.trash-<uuid>` first (atomic), so a crash during the recursive
+    /// delete leaves only trash that [`Self::sweep`] removes later.
+    pub(crate) fn discard(&self, path: &Path) -> Result<(), UpdateError> {
+        let trash = self.generations.join(format!(".trash-{}", Uuid::new_v4()));
+        fs::rename(path, &trash).map_err(|source| UpdateError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        sync_directory(&self.generations).map_err(|source| UpdateError::Io {
+            path: self.generations.clone(),
+            source,
+        })?;
+        fs::remove_dir_all(&trash).map_err(|source| UpdateError::Io {
+            path: trash,
+            source,
+        })
+    }
+
+    /// Removes leftovers of interrupted operations: `.trash-*` from a crashed garbage collection
+    /// and `.staging-*` from an interrupted extraction.
+    ///
+    /// Callers hold the exclusive maintenance lock, which every staging operation also holds.
+    pub fn sweep(&self) -> Result<(), UpdateError> {
+        let entries = fs::read_dir(&self.generations).map_err(|source| UpdateError::Io {
+            path: self.generations.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| UpdateError::Io {
+                path: self.generations.clone(),
+                source,
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !(name.starts_with(".trash-") || name.starts_with(".staging-")) {
+                continue;
+            }
+            let path = entry.path();
+            let is_dir = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+            let removed = if is_dir {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            removed.map_err(|source| UpdateError::Io { path, source })?;
+        }
+        Ok(())
+    }
+
     /// Atomically switches the active reference to `generation`.
     pub fn switch_to(&self, generation: &GenerationId) -> Result<(), UpdateError> {
         self.switch_to_with(generation, sync_directory)
@@ -384,6 +435,9 @@ impl GenerationStore {
             keep.insert(current);
         }
         keep.extend(staged.iter().cloned());
+        // A quarantined digest stays on disk until an operator releases it: `unquarantine`
+        // must never find the generation already deleted.
+        keep.extend(state.quarantined.iter().cloned());
 
         let entries = fs::read_dir(&self.generations).map_err(|source| UpdateError::Io {
             path: self.generations.clone(),
@@ -412,11 +466,9 @@ impl GenerationStore {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 continue;
             }
-            fs::remove_dir_all(&path).map_err(|source| UpdateError::Io {
-                path: path.clone(),
-                source,
-            })?;
+            self.discard(&path)?;
         }
+        self.sweep()?;
 
         sync_directory(&self.generations).map_err(|source| UpdateError::Io {
             path: self.generations.clone(),

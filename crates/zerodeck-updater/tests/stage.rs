@@ -634,6 +634,7 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
             max_total_bytes: 1024,
             max_entries: 32,
         },
+        ..StageLimits::default()
     };
     let err = stage_release_with(&limit, &limit_store, &limit_client, limits, &NoFault)
         .await
@@ -654,6 +655,7 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
             max_total_bytes: 1024 * 1024,
             max_entries: 1,
         },
+        ..StageLimits::default()
     };
     let err = stage_release_with(
         &entry_limit,
@@ -739,6 +741,7 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
             max_total_bytes: 1024,
             max_entries: 64,
         },
+        ..StageLimits::default()
     };
     let err = stage_release_with(
         &large_pax_release,
@@ -788,6 +791,7 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
             max_total_bytes: 1024,
             max_entries: 64,
         },
+        ..StageLimits::default()
     };
     let err = stage_release_with(
         &gnu_long,
@@ -824,6 +828,7 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
             max_total_bytes: 1024 * 1024,
             max_entries: 1,
         },
+        ..StageLimits::default()
     };
     let err = stage_release_with(
         &pax_count,
@@ -906,4 +911,159 @@ async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
         "unexpected corrupt-archive error: {err:?}"
     );
     assert_only_active(&corrupt_store, &corrupt_active);
+}
+
+#[tokio::test]
+async fn stage_restages_a_partial_cached_generation() {
+    let manifest_bytes = manifest("0.1.2", "build-42");
+    let archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Directory { path: "bin" },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"#!/bin/sh\nexit 0\n",
+            mode: 0o755,
+        },
+        ArchiveEntry::File {
+            path: "python/host.py",
+            data: b"import sys\n",
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "frontend/index.js",
+            data: b"console.log('zerodeck');\n",
+            mode: 0o644,
+        },
+    ]);
+    let (_dir, store, _active) = setup_store("partial-cache");
+    let server = MockServer::start(archive.clone(), false).await;
+    let client = client_for(&server);
+    let release = release_for(&archive, server.url());
+    let digest = stage_release_with(&release, &store, &client, StageLimits::default(), &NoFault)
+        .await
+        .expect("stage");
+
+    // A crash during an in-place delete used to leave `release.json` without the payload.
+    let generation = store.generation_dir(&digest);
+    fs::remove_file(generation.join("bin/zerodeckd")).expect("simulate a partial tree");
+    let hits_before = server.hits();
+
+    stage_release_with(&release, &store, &client, StageLimits::default(), &NoFault)
+        .await
+        .expect("a partial cached generation is discarded and staged again");
+
+    assert!(
+        server.hits() > hits_before,
+        "the archive must be fetched again"
+    );
+    assert!(generation.join("bin/zerodeckd").is_file());
+}
+
+/// Serves the archive in `pieces` equal chunks, pausing `pause` between them.
+async fn slow_server(
+    body: Vec<u8>,
+    pieces: usize,
+    pause: Duration,
+    stall_after: Option<usize>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let task = tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request).await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let size = body.len().div_ceil(pieces);
+        for (index, chunk) in body.chunks(size).enumerate() {
+            if stall_after == Some(index) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let _ = socket.write_all(chunk).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(pause).await;
+        }
+        let _ = socket.shutdown().await;
+    });
+    (port, task)
+}
+
+fn valid_archive_bytes() -> Vec<u8> {
+    let manifest_bytes = manifest("0.1.2", "build-42");
+    build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Directory { path: "bin" },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"#!/bin/sh\nexit 0\n",
+            mode: 0o755,
+        },
+        ArchiveEntry::File {
+            path: "python/host.py",
+            data: b"import sys\n",
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "frontend/index.js",
+            data: b"x\n",
+            mode: 0o644,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn stage_succeeds_for_a_slow_but_steady_body() {
+    let archive = valid_archive_bytes();
+    let (port, _task) = slow_server(archive.clone(), 6, Duration::from_millis(250), None).await;
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/a.tar.gz")).expect("url");
+    let release = release_for(&archive, url);
+    let (_dir, store, _active) = setup_store("slow-steady");
+    let client = OutboundHttpPolicy::for_loopback_ports_for_testing(vec![port])
+        .build_checked_client()
+        .expect("client");
+    let limits = StageLimits {
+        idle_timeout: Duration::from_millis(900),
+        ..StageLimits::default()
+    };
+
+    stage_release_with(&release, &store, &client, limits, &NoFault)
+        .await
+        .expect("steady progress must not hit any total deadline");
+}
+
+#[tokio::test]
+async fn stage_fails_on_an_idle_body_and_leaves_no_staging_after_sweep() {
+    let archive = valid_archive_bytes();
+    let (port, _task) = slow_server(archive.clone(), 4, Duration::from_millis(10), Some(2)).await;
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/a.tar.gz")).expect("url");
+    let release = release_for(&archive, url);
+    let (_dir, store, active) = setup_store("slow-idle");
+    let client = OutboundHttpPolicy::for_loopback_ports_for_testing(vec![port])
+        .build_checked_client()
+        .expect("client");
+    let limits = StageLimits {
+        idle_timeout: Duration::from_millis(300),
+        ..StageLimits::default()
+    };
+
+    let err = stage_release_with(&release, &store, &client, limits, &NoFault)
+        .await
+        .expect_err("a stalled body must fail");
+    assert!(matches!(err, UpdateError::DownloadIdle { .. }), "{err:?}");
+
+    store.sweep().expect("sweep");
+    assert_only_active(&store, &active);
 }

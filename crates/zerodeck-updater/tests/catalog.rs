@@ -766,3 +766,49 @@ async fn preview_candidate_does_not_supersede_a_staged_authorization() {
         stable_013.digest()
     );
 }
+
+#[tokio::test]
+async fn selection_skips_a_quarantined_newest_target() {
+    let fixture = Fixture::new().await;
+    let root = TestDir::new("quarantine-root");
+    let older = TargetSpec::new(
+        "linux-x86_64",
+        "0.1.2",
+        "stable",
+        "build-0.1.2",
+        "0.1.0",
+        "older",
+    );
+    let newest = TargetSpec::new(
+        "linux-x86_64",
+        "0.1.3",
+        "stable",
+        "build-0.1.3",
+        "0.1.0",
+        "newest",
+    );
+    let (older_digest, newest_digest) = (older.digest(), newest.digest());
+    fixture
+        .publish(&PublishSpec {
+            root_version: 1,
+            metadata_version: 1,
+            expires: FAR_FUTURE,
+            targets: vec![older, newest],
+        })
+        .await;
+    let catalog = load_catalog(&fixture, &root.0).await;
+    let updater = Version::parse("0.1.0").expect("updater version");
+
+    let plain = catalog
+        .candidate(&SelectionPolicy::new(updater.clone()))
+        .expect("select")
+        .expect("a release");
+    assert_eq!(plain.digest, newest_digest);
+
+    let skipping = SelectionPolicy::new(updater).with_quarantined([newest_digest]);
+    let fallback = catalog
+        .candidate(&skipping)
+        .expect("select")
+        .expect("falls back to the next eligible release");
+    assert_eq!(fallback.digest, older_digest);
+}

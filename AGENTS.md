@@ -18,6 +18,9 @@ zerodeckd
  ├── zerodeck-cef ───── zerodeck-protocol
  ├── zerodeck-core ──── zerodeck-platform, zerodeck-plugin-host, zerodeck-protocol
  └── zerodeck-plugin-host ── zerodeck-platform, zerodeck-protocol
+
+zerodeck-updater (the `zerodeckctl` binary; not linked into `zerodeckd`)
+ └── zerodeck-core, zerodeck-platform, zerodeck-protocol
 ```
 
 - `zerodeck-protocol` MUST have **zero** internal `zerodeck-*` dependencies.

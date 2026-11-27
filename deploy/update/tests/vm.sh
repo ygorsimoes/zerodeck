@@ -1274,10 +1274,9 @@ SCRIPT
 
 scenario_hard_poweroff() {
     log "scenario: hard poweroff during apply"
-    local crash="${work}/crash-hard.managed.tar.gz"
-    make_fixture_candidate "${managed}" "${crash}" "healthy"
-    local crash_digest
-    crash_digest="$(check_digest "${crash}" "" "hard-poweroff candidate")"
+    # The updater refuses a new digest under an installed version, so every crash scenario
+    # activates the genuinely newer candidate and clears its quarantine afterwards.
+    local crash="${candidate_archive}" crash_digest="${candidate_digest}"
     prepare_pending_crash "${crash}" "${crash_digest}"
     hard_poweroff
     start_qemu
@@ -1285,29 +1284,25 @@ scenario_hard_poweroff() {
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck.service
     assert_quarantined "${crash_digest}" "hard-poweroff-recovered"
+    guest_root_cmd "${ZERODECK_CTL}" unquarantine "${crash_digest}" >/dev/null
     verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "hard-poweroff-recovered" yes
 }
 
 scenario_sigkill_apply() {
     log "scenario: SIGKILL of the independent apply helper"
-    local crash="${work}/crash-kill.managed.tar.gz"
-    make_fixture_candidate "${managed}" "${crash}" "healthy"
-    local crash_digest
-    crash_digest="$(check_digest "${crash}" "" "SIGKILL candidate")"
+    local crash="${candidate_archive}" crash_digest="${candidate_digest}"
     prepare_pending_crash "${crash}" "${crash_digest}"
     kill_apply_helper
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck.service
     assert_quarantined "${crash_digest}" "sigkill-recovered"
+    guest_root_cmd "${ZERODECK_CTL}" unquarantine "${crash_digest}" >/dev/null
     verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "sigkill-recovered" yes
 }
 
 scenario_reboot_during_recovery() {
     log "scenario: reboot during boot recovery"
-    local crash="${work}/crash-reboot.managed.tar.gz"
-    make_fixture_candidate "${managed}" "${crash}" "healthy"
-    local crash_digest
-    crash_digest="$(check_digest "${crash}" "" "reboot-recovery candidate")"
+    local crash="${candidate_archive}" crash_digest="${candidate_digest}"
     # systemd applies TimeoutStartSec to ExecStartPre as well as ExecStart. The packaged recovery
     # unit has TimeoutStartSec=60, so a 60 s pre-delay would time out and recover-boot would never
     # run. Override the timeout to 180 s and keep the observable window at 20 s.
@@ -1347,6 +1342,7 @@ SCRIPT
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck-recovery.service
     remove_dropin zerodeck.service
+    guest_root_cmd "${ZERODECK_CTL}" unquarantine "${crash_digest}" >/dev/null
     verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "reboot-recovery" yes
 }
 

@@ -342,36 +342,42 @@ fn warn_about_writable_ancestors(paths: &PlatformPaths) {
     );
 }
 
-fn resolve_loader_paths(
-    managed: Option<&install::ManagedGeneration>,
-) -> (PythonHostConfig, Option<PathBuf>, String, String) {
+/// Python host, frontend bundle and identity the daemon serves with.
+struct LoaderPaths {
+    python_host: PythonHostConfig,
+    frontend_dir: Option<PathBuf>,
+    version: String,
+    build_id: String,
+}
+
+fn resolve_loader_paths(managed: Option<&install::ManagedGeneration>) -> LoaderPaths {
     if let Some(managed) = managed {
         info!(
             generation = %managed.root().display(),
             binary = %managed.binary().display(),
             release_version = %managed.release_version(),
-            embedded_build_id = %install::compile_time_build_id(),
+            embedded_build_id = %zerodeck_server::build_id(),
             "serving one immutable managed loader generation"
         );
-        (
-            PythonHostConfig {
+        LoaderPaths {
+            python_host: PythonHostConfig {
                 host_module_path: Some(managed.python_host_path().to_owned()),
                 ..PythonHostConfig::default()
             },
-            Some(managed.frontend_dir().to_path_buf()),
-            managed.release_version().to_owned(),
-            install::compile_time_build_id(),
-        )
+            frontend_dir: Some(managed.frontend_dir().to_path_buf()),
+            version: managed.release_version().to_owned(),
+            build_id: zerodeck_server::build_id().to_owned(),
+        }
     } else {
-        (
-            PythonHostConfig {
+        LoaderPaths {
+            python_host: PythonHostConfig {
                 host_module_path: resolve_python_host_path(),
                 ..PythonHostConfig::default()
             },
-            resolve_frontend_path(),
-            env!("CARGO_PKG_VERSION").to_owned(),
-            install::compile_time_build_id(),
-        )
+            frontend_dir: resolve_frontend_path(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_id: zerodeck_server::build_id().to_owned(),
+        }
     }
 }
 
@@ -387,7 +393,12 @@ async fn run_daemon(
     #[cfg(unix)]
     warn_about_writable_ancestors(&paths);
 
-    let (python_host, frontend_dir, version, build_id) = resolve_loader_paths(generation.as_ref());
+    let LoaderPaths {
+        python_host,
+        frontend_dir,
+        version,
+        build_id,
+    } = resolve_loader_paths(generation.as_ref());
     let python_host_missing = probe_python_host(&python_host).await;
     let config = ServerConfig {
         host: cli.host,
@@ -517,10 +528,13 @@ async fn main() -> Result<()> {
         let addrs = resolve(&cli.host, cli.port).await?;
         check_bind_policy(&addrs, cli.allow_non_loopback)?;
         // A managed generation is only installable if its bundled worker host imports. Check the
-        // same resolved path the daemon will hand to every plugin worker.
-        let (python_host, _frontend, _version, _build_id) = resolve_loader_paths(managed.as_ref());
-        if let Some(reason) = probe_python_host(&python_host).await {
-            bail!("configuration check failed: {reason}");
+        // same resolved path the daemon will hand to every plugin worker. Standalone installs
+        // keep checking the bind policy only.
+        if managed.is_some() {
+            let loader = resolve_loader_paths(managed.as_ref());
+            if let Some(reason) = probe_python_host(&loader.python_host).await {
+                bail!("configuration check failed: {reason}");
+            }
         }
         return Ok(());
     }

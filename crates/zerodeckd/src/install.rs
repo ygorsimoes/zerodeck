@@ -5,23 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-
-const RELEASE_MANIFEST: &str = "release.json";
-const RELEASE_MANIFEST_SCHEMA: u32 = 1;
-const MAX_RELEASE_MANIFEST_BYTES: u64 = 64 * 1024;
-const DAEMON_BINARY: &str = "bin/zerodeckd";
-const PYTHON_DIR: &str = "python";
-const FRONTEND_DIR: &str = "frontend";
-
-/// Compile-time build identity used by standalone installations.
-#[must_use]
-pub fn compile_time_build_id() -> String {
-    option_env!("ZERODECK_BUILD_ID")
-        .filter(|build_id| !build_id.is_empty())
-        .unwrap_or("dev")
-        .to_owned()
-}
+use zerodeck_platform::GenerationLayout;
 
 /// Directory overrides that could otherwise mix a managed generation with standalone assets.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,13 +69,6 @@ impl PathOverrides {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ReleaseManifest {
-    schema: u32,
-    build_id: String,
-    version: String,
-}
-
 /// One immutable generation resolved for the lifetime of the daemon process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedGeneration {
@@ -125,77 +102,47 @@ impl ManagedGeneration {
             );
         }
 
-        let binary = ensure_regular_file(&canonical_root, DAEMON_BINARY)?;
-        let python_dir = ensure_directory(&canonical_root, PYTHON_DIR)?;
-        let frontend_dir = ensure_directory(&canonical_root, FRONTEND_DIR)?;
-        let release_path = ensure_regular_file(&canonical_root, RELEASE_MANIFEST)?;
-        for path in [&binary, &release_path] {
-            ensure_within(&canonical_root, path)?;
-        }
-        ensure_binary_is_executable(&binary)?;
-
-        overrides.validate(&python_dir, &frontend_dir)?;
-
-        let python_host_path = python_dir
+        let layout = GenerationLayout::open(&canonical_root).map_err(|error| {
+            anyhow::anyhow!(
+                "managed generation `{}` is invalid: {error}",
+                canonical_root.display()
+            )
+        })?;
+        overrides.validate(layout.python_dir(), layout.frontend_dir())?;
+        let python_host_path = layout
+            .python_dir()
             .to_str()
             .with_context(|| {
                 format!(
                     "managed generation Python path `{}` is not valid UTF-8",
-                    python_dir.display()
+                    layout.python_dir().display()
                 )
             })?
             .to_owned();
-        let manifest_size = fs::metadata(&release_path)
-            .with_context(|| format!("inspect `{}`", release_path.display()))?
-            .len();
-        if manifest_size > MAX_RELEASE_MANIFEST_BYTES {
+        let release = layout.manifest();
+        if release.build_id != zerodeck_server::build_id() {
             bail!(
-                "`{}` exceeds {MAX_RELEASE_MANIFEST_BYTES} bytes",
-                release_path.display()
-            );
-        }
-        let release: ReleaseManifest = serde_json::from_slice(
-            &fs::read(&release_path)
-                .with_context(|| format!("read `{}`", release_path.display()))?,
-        )
-        .with_context(|| format!("parse `{}`", release_path.display()))?;
-        if release.schema != RELEASE_MANIFEST_SCHEMA {
-            bail!(
-                "`{}` uses unsupported schema {}",
-                release_path.display(),
-                release.schema
-            );
-        }
-        if release.build_id.trim().is_empty() {
-            bail!("`{}` has an empty build_id", release_path.display());
-        }
-        let embedded_build_id = compile_time_build_id();
-        if release.build_id != embedded_build_id {
-            bail!(
-                "`{}` build_id `{}` does not match this binary's embedded build ID `{}`; \
-                 refusing to serve a mismatched managed generation",
-                release_path.display(),
+                "`release.json` build_id `{}` does not match this binary's embedded build ID \
+                 `{}`; refusing to serve a mismatched managed generation",
                 release.build_id,
-                embedded_build_id
+                zerodeck_server::build_id()
             );
         }
         let binary_version = env!("CARGO_PKG_VERSION");
         if release.version != binary_version {
             bail!(
-                "`{}` version `{}` does not match this binary's version `{}`; refusing to serve \
-                 a mismatched managed generation",
-                release_path.display(),
-                release.version,
-                binary_version
+                "`release.json` version `{}` does not match this binary's version `{binary_version}`; \
+                 refusing to serve a mismatched managed generation",
+                release.version
             );
         }
 
         Ok(Self {
-            root: canonical_root,
-            binary,
+            root: layout.root().to_path_buf(),
+            binary: layout.daemon().to_path_buf(),
             python_host_path,
-            frontend_dir,
-            release_version: release.version,
+            frontend_dir: layout.frontend_dir().to_path_buf(),
+            release_version: layout.manifest().version.clone(),
         })
     }
 
@@ -254,68 +201,6 @@ impl ManagedGeneration {
     }
 }
 
-fn ensure_regular_file(root: &Path, relative: &str) -> Result<PathBuf> {
-    let path = root.join(relative);
-    let metadata = fs::symlink_metadata(&path)
-        .with_context(|| format!("managed generation is missing `{}`", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!(
-            "managed generation path `{}` is not a regular file",
-            path.display()
-        );
-    }
-    Ok(path)
-}
-
-fn ensure_directory(root: &Path, relative: &str) -> Result<PathBuf> {
-    let path = root.join(relative);
-    let metadata = fs::symlink_metadata(&path)
-        .with_context(|| format!("managed generation is missing `{}`", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "managed generation path `{}` is not a directory",
-            path.display()
-        );
-    }
-    let canonical =
-        fs::canonicalize(&path).with_context(|| format!("resolve `{}`", path.display()))?;
-    ensure_within(root, &canonical)?;
-    Ok(canonical)
-}
-
-fn ensure_within(root: &Path, path: &Path) -> Result<()> {
-    let canonical =
-        fs::canonicalize(path).with_context(|| format!("resolve `{}`", path.display()))?;
-    if !canonical.starts_with(root) {
-        bail!(
-            "managed generation path `{}` escapes `{}`",
-            canonical.display(),
-            root.display()
-        );
-    }
-    Ok(())
-}
-
-fn ensure_binary_is_executable(binary: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(binary)
-            .with_context(|| format!("inspect `{}`", binary.display()))?
-            .permissions()
-            .mode();
-        if mode & 0o111 == 0 {
-            bail!(
-                "managed generation binary `{}` is not executable",
-                binary.display()
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = binary;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -362,7 +247,7 @@ mod tests {
             root.join("release.json"),
             format!(
                 r#"{{"schema":1,"build_id":"{}","version":"{}"}}"#,
-                super::compile_time_build_id(),
+                zerodeck_server::build_id(),
                 env!("CARGO_PKG_VERSION")
             ),
         )
@@ -461,7 +346,7 @@ mod tests {
             root.join("release.json"),
             format!(
                 r#"{{"schema":1,"build_id":"{}","version":"999.999.999"}}"#,
-                super::compile_time_build_id()
+                zerodeck_server::build_id()
             ),
         )
         .expect("rewrite release.json");

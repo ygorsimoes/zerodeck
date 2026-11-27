@@ -34,6 +34,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 zerodeck-core.workspace = true
 zerodeck-platform.workspace = true
+zerodeck-protocol.workspace = true
 
 [dev-dependencies]
 aws-lc-rs = "1.19.0"

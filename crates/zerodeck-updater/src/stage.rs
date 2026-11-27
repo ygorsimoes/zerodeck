@@ -9,8 +9,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use flate2::read::GzDecoder;
-use semver::Version;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::EntryType;
 use uuid::Uuid;
@@ -18,6 +16,7 @@ use zerodeck_core::{
     CheckedHttpClient, DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_REDIRECTS, ExtractLimits,
     OutboundHttpPolicy, send_checked_request,
 };
+use zerodeck_protocol::release::{RELEASE_MANIFEST, ReleaseManifest};
 
 use crate::{AuthorizedRelease, GenerationId, GenerationStore, UpdateError};
 
@@ -26,9 +25,6 @@ pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = DEFAULT_MAX_ARCHIVE_BYTES;
 
 const ARCHIVE_FILE: &str = "archive.tar.gz";
 const TREE_DIR: &str = "tree";
-const RELEASE_MANIFEST: &str = "release.json";
-const RELEASE_MANIFEST_SCHEMA: u32 = 1;
-const MAX_RELEASE_MANIFEST_BYTES: u64 = 64 * 1024;
 
 /// Resource bounds enforced while downloading and extracting a release archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,37 +57,25 @@ struct NoFault;
 
 impl StageFault for NoFault {}
 
-#[derive(Debug, Deserialize)]
-struct ReleaseManifest {
-    schema: u32,
-    build_id: String,
-    version: Version,
-}
-
-impl ReleaseManifest {
-    fn verify(&self, release: &AuthorizedRelease) -> Result<(), UpdateError> {
-        if self.schema != RELEASE_MANIFEST_SCHEMA {
-            return Err(UpdateError::InvalidReleaseManifest(format!(
-                "unsupported schema {}",
-                self.schema
-            )));
-        }
-        if self.build_id != release.build_id {
-            return Err(UpdateError::ReleaseIdentityMismatch {
-                field: "build_id",
-                expected: release.build_id.clone(),
-                found: self.build_id.clone(),
-            });
-        }
-        if self.version != release.version {
-            return Err(UpdateError::ReleaseIdentityMismatch {
-                field: "version",
-                expected: release.version.to_string(),
-                found: self.version.to_string(),
-            });
-        }
-        Ok(())
+fn verify_manifest(
+    manifest: &ReleaseManifest,
+    release: &AuthorizedRelease,
+) -> Result<(), UpdateError> {
+    if manifest.build_id != release.build_id {
+        return Err(UpdateError::ReleaseIdentityMismatch {
+            field: "build_id",
+            expected: release.build_id.clone(),
+            found: manifest.build_id.clone(),
+        });
     }
+    if manifest.version != release.version.to_string() {
+        return Err(UpdateError::ReleaseIdentityMismatch {
+            field: "version",
+            expected: release.version.to_string(),
+            found: manifest.version.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Downloads, verifies, extracts, and durably promotes a release generation.
@@ -199,7 +183,7 @@ async fn stage_into(
 
     extract_archive(&archive, &tree, limits.extract, fault)?;
     let manifest = read_release_manifest(&tree)?;
-    manifest.verify(release)?;
+    verify_manifest(&manifest, release)?;
 
     fs::remove_file(&archive).map_err(|source| UpdateError::Io {
         path: archive,
@@ -691,7 +675,7 @@ fn cached_generation(
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(UpdateError::CorruptGeneration(release.digest.clone()));
             }
-            read_release_manifest(&directory)?.verify(release)?;
+            verify_manifest(&read_release_manifest(&directory)?, release)?;
             Ok(Some(release.digest.clone()))
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -714,17 +698,11 @@ fn read_release_manifest(directory: &Path) -> Result<ReleaseManifest, UpdateErro
             path.display()
         )));
     }
-    if metadata.len() > MAX_RELEASE_MANIFEST_BYTES {
-        return Err(UpdateError::InvalidReleaseManifest(format!(
-            "`{}` exceeds {MAX_RELEASE_MANIFEST_BYTES} bytes",
-            path.display()
-        )));
-    }
     let bytes = fs::read(&path).map_err(|source| UpdateError::Io {
         path: path.clone(),
         source,
     })?;
-    serde_json::from_slice(&bytes)
+    ReleaseManifest::parse(&bytes)
         .map_err(|error| UpdateError::InvalidReleaseManifest(error.to_string()))
 }
 

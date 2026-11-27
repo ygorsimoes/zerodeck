@@ -12,7 +12,7 @@ mod ws_sync;
 
 pub use error::ServerError;
 pub use routes::{build_router, serve};
-pub use state::{AppState, AppStateBuilder, ServerConfig};
+pub use state::{AppState, AppStateBuilder, ServerConfig, build_id};
 pub use ws_sync::WsSyncCache;
 
 #[cfg(test)]

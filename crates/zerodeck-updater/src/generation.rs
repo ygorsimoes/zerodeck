@@ -8,18 +8,13 @@ use std::str::FromStr;
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
+use zerodeck_platform::LayoutError;
 
 use crate::{ReleaseIdentity, UpdateError, UpdateState};
 
 const GENERATIONS_DIR: &str = "generations";
 const CURRENT_FILE: &str = "current";
 const MAINTENANCE_LOCK_FILE: &str = "maintenance.lock";
-const RELEASE_MANIFEST: &str = "release.json";
-const RELEASE_MANIFEST_SCHEMA: u32 = 1;
-const MAX_RELEASE_MANIFEST_BYTES: u64 = 64 * 1024;
-const DAEMON_BINARY: &str = "bin/zerodeckd";
-const PYTHON_DIR: &str = "python";
-const FRONTEND_DIR: &str = "frontend";
 
 /// A validated lowercase SHA-256 generation digest.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -80,9 +75,8 @@ impl<'de> Deserialize<'de> for GenerationId {
 }
 
 /// Release identity recorded in an immutable generation's `release.json`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationRelease {
-    schema: u32,
     build_id: String,
     version: Version,
 }
@@ -300,47 +294,19 @@ impl GenerationStore {
             });
         }
 
-        let binary = ensure_regular_file(&root, generation, DAEMON_BINARY)?;
-        ensure_executable(&binary, generation)?;
-        ensure_directory(&root, generation, PYTHON_DIR)?;
-        ensure_directory(&root, generation, FRONTEND_DIR)?;
-        let manifest_path = ensure_regular_file(&root, generation, RELEASE_MANIFEST)?;
-        let manifest_size = fs::metadata(&manifest_path)
-            .map_err(|source| UpdateError::Io {
-                path: manifest_path.clone(),
-                source,
-            })?
-            .len();
-        if manifest_size > MAX_RELEASE_MANIFEST_BYTES {
-            return Err(UpdateError::InvalidReleaseManifest(format!(
-                "`{}` exceeds {MAX_RELEASE_MANIFEST_BYTES} bytes",
-                manifest_path.display()
-            )));
-        }
-        let release: GenerationRelease =
-            serde_json::from_slice(&fs::read(&manifest_path).map_err(|source| {
-                UpdateError::Io {
-                    path: manifest_path.clone(),
-                    source,
-                }
-            })?)
+        let platform = zerodeck_platform::GenerationLayout::open(&root)
+            .map_err(|error| layout_error(generation, error))?;
+        let manifest = platform.manifest();
+        let version = Version::parse(&manifest.version)
             .map_err(|error| UpdateError::InvalidReleaseManifest(error.to_string()))?;
-        if release.schema != RELEASE_MANIFEST_SCHEMA {
-            return Err(UpdateError::InvalidReleaseManifest(format!(
-                "unsupported schema {}",
-                release.schema
-            )));
-        }
-        if release.build_id.trim().is_empty() {
-            return Err(UpdateError::InvalidReleaseManifest(
-                "build_id is empty".to_owned(),
-            ));
-        }
 
         Ok(GenerationLayout {
             root,
-            binary,
-            release,
+            binary: platform.daemon().to_path_buf(),
+            release: GenerationRelease {
+                build_id: manifest.build_id.clone(),
+                version,
+            },
         })
     }
 
@@ -485,92 +451,14 @@ impl GenerationStore {
     }
 }
 
-fn ensure_regular_file(
-    root: &Path,
-    generation: &GenerationId,
-    relative: &str,
-) -> Result<PathBuf, UpdateError> {
-    let path = root.join(relative);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(UpdateError::CorruptGeneration(generation.clone()));
-        }
-        Err(source) => {
-            return Err(UpdateError::Io {
-                path: path.clone(),
-                source,
-            });
-        }
-    };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(UpdateError::CorruptGeneration(generation.clone()));
-    }
-    let canonical = fs::canonicalize(&path).map_err(|source| UpdateError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    ensure_within(root, &canonical)?;
-    Ok(canonical)
-}
-
-fn ensure_directory(
-    root: &Path,
-    generation: &GenerationId,
-    relative: &str,
-) -> Result<PathBuf, UpdateError> {
-    let path = root.join(relative);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            return Err(UpdateError::CorruptGeneration(generation.clone()));
-        }
-        Err(source) => {
-            return Err(UpdateError::Io {
-                path: path.clone(),
-                source,
-            });
-        }
-    };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(UpdateError::CorruptGeneration(generation.clone()));
-    }
-    let canonical = fs::canonicalize(&path).map_err(|source| UpdateError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    ensure_within(root, &canonical)?;
-    Ok(canonical)
-}
-
-fn ensure_within(root: &Path, path: &Path) -> Result<(), UpdateError> {
-    if !path.starts_with(root) {
-        return Err(UpdateError::PathEscape {
-            path: path.to_path_buf(),
-            root: root.to_path_buf(),
-        });
-    }
-    Ok(())
-}
-
-fn ensure_executable(path: &Path, generation: &GenerationId) -> Result<(), UpdateError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(path)
-            .map_err(|source| UpdateError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .permissions()
-            .mode();
-        if mode & 0o111 == 0 {
-            return Err(UpdateError::CorruptGeneration(generation.clone()));
+fn layout_error(generation: &GenerationId, error: LayoutError) -> UpdateError {
+    match error {
+        LayoutError::Manifest(error) => UpdateError::InvalidReleaseManifest(error.to_string()),
+        LayoutError::Io { path, source } => UpdateError::Io { path, source },
+        LayoutError::Missing(_) | LayoutError::BadEntry(_) | LayoutError::BadMode(_) => {
+            UpdateError::CorruptGeneration(generation.clone())
         }
     }
-    #[cfg(not(unix))]
-    let _ = (path, generation);
-    Ok(())
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {

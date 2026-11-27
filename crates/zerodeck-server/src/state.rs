@@ -16,11 +16,13 @@ use zerodeck_plugin_host::{PluginEvent, PythonHostConfig};
 use crate::ServerError;
 use crate::ws_sync::WsSyncCache;
 
-fn default_build_id() -> String {
-    option_env!("ZERODECK_BUILD_ID")
-        .filter(|build_id| !build_id.is_empty())
-        .unwrap_or("dev")
-        .to_owned()
+/// Build identity compiled into this binary (`ZERODECK_BUILD_ID`, or `dev` for local builds).
+#[must_use]
+pub fn build_id() -> &'static str {
+    match option_env!("ZERODECK_BUILD_ID") {
+        Some(build_id) if !build_id.is_empty() => build_id,
+        _ => "dev",
+    }
 }
 
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
@@ -77,7 +79,7 @@ impl Default for ServerConfig {
             ws_max_message_bytes: 16 * 1024 * 1024,
             frontend_dir: None,
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            build_id: default_build_id(),
+            build_id: build_id().to_owned(),
             python_host_ready: false,
             invocation_id: String::new(),
             max_zip_download_bytes: DEFAULT_MAX_ZIP_DOWNLOAD_BYTES,

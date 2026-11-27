@@ -5,6 +5,7 @@
 mod error;
 mod ipc;
 mod manifest;
+pub mod release;
 mod ws;
 
 pub use error::ProtocolError;

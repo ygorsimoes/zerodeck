@@ -141,6 +141,19 @@ fn check_config_succeeds_on_empty_homebrew() {
 }
 
 #[test]
+fn check_config_standalone_does_not_require_python_host() {
+    let home = TempHome::new("check-config-no-python");
+    let empty = home.0.join("no-python-host");
+    std::fs::create_dir_all(&empty).expect("create empty python path");
+    let status = daemon_command(&home, "127.0.0.1", 1)
+        .env("PYTHONPATH", &empty)
+        .arg("--check-config")
+        .status()
+        .expect("run --check-config");
+    assert!(status.success());
+}
+
+#[test]
 fn check_config_tolerates_a_broken_plugin() {
     let home = TempHome::new("check-config-broken");
     let plugin = home.0.join("plugins").join("broken");

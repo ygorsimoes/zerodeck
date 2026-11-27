@@ -9,7 +9,9 @@ pub mod release;
 mod ws;
 
 pub use error::ProtocolError;
-pub use ipc::{PluginIpcError, PluginIpcFromWorker, PluginIpcToWorker, PluginIpcType};
+pub use ipc::{
+    PluginIpcError, PluginIpcFromWorker, PluginIpcToWorker, PluginIpcType, WorkerStartup,
+};
 pub use manifest::{PackageManifest, PluginLoadType, PluginManifest, RemoteBinarySpec};
 pub use ws::{WsCallPayload, WsClientMessage, WsErrorDetail, WsMessageType, WsServerMessage};
 

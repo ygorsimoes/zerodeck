@@ -315,3 +315,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Best effort: the daily channels run picks the release up anyway if this dispatch fails.
         run: gh workflow run channels.yml --repo "${GITHUB_REPOSITORY}" --ref main || echo "channels dispatch failed; the daily run will sign it"
+
+      - name: Qualify the exact published archive for Stable
+        if: (github.event_name == 'push' || inputs.publish) && !contains(steps.identity.outputs.version, '-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: gh workflow run qualify-stable.yml --repo "${GITHUB_REPOSITORY}" --ref main --raw-field "tag=${TAG}"

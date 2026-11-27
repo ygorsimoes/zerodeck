@@ -59,6 +59,7 @@ impl PythonHostConfig {
         cmd.arg("-m").arg("zerodeck_py_host");
         cmd.arg("--entrypoint").arg(&spec.entrypoint);
         cmd.arg("--plugin-name").arg(&spec.manifest.name);
+        cmd.arg("--generation").arg(&spec.generation);
         cmd.arg("--api-version")
             .arg(spec.manifest.api_version.to_string());
 

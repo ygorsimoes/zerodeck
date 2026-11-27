@@ -117,30 +117,26 @@ fn unreadable(path: &Path, err: &std::io::Error) -> OwnershipViolation {
 /// violation. Callers that may run unprivileged should use [`ensure_root_owned_ancestors`].
 #[cfg(unix)]
 pub fn check_secure_ancestors(path: &Path) -> Result<(), OwnershipViolation> {
-    // Reject a symlink on the requested path before canonicalization hides it. A root-owned
-    // symlink is still not part of the contract: producers must use a real directory tree.
+    use std::path::Component;
+
+    // Check the exact path from its anchor down. Once an ancestor is trusted, an unprivileged
+    // user cannot replace the next component while we inspect it. Canonicalizing first would
+    // discard components that the eventual open still has to traverse.
+    if path.components().any(|part| part == Component::ParentDir) {
+        return Err(OwnershipViolation {
+            path: path.to_path_buf(),
+            kind: ViolationKind::Unreadable("parent components are not allowed".to_owned()),
+        });
+    }
+    let absolute = std::path::absolute(path).map_err(|err| unreadable(path, &err))?;
     let mut component = PathBuf::new();
-    for part in path.components() {
+    for part in absolute.components() {
         component.push(part.as_os_str());
         let meta =
             std::fs::symlink_metadata(&component).map_err(|err| unreadable(&component, &err))?;
-        if meta.file_type().is_symlink() {
-            return Err(OwnershipViolation {
-                path: component,
-                kind: ViolationKind::Symlink,
-            });
-        }
-    }
-
-    let absolute = std::fs::canonicalize(path).map_err(|err| unreadable(path, &err))?;
-    for ancestor in absolute.ancestors() {
-        if ancestor.as_os_str().is_empty() {
-            continue;
-        }
-        let meta = std::fs::symlink_metadata(ancestor).map_err(|err| unreadable(ancestor, &err))?;
         if let Some(kind) = check_entry(entry_meta(&meta)) {
             return Err(OwnershipViolation {
-                path: ancestor.to_path_buf(),
+                path: component,
                 kind,
             });
         }
@@ -340,6 +336,12 @@ mod tests {
     }
 
     #[test]
+    fn secure_ancestors_reject_non_normalized_paths() {
+        let path = Path::new("/usr/../usr");
+        assert!(check_secure_ancestors(path).is_err());
+    }
+
+    #[test]
     fn secure_ancestors_reject_a_user_owned_root() {
         let dir = TestDir::new("secure-ancestors-owned");
         let root = fs::canonicalize(&dir.0).expect("canonical temp root");
@@ -347,19 +349,20 @@ mod tests {
         fs::create_dir_all(&leaf).expect("create leaf");
 
         let violation = check_secure_ancestors(&leaf).expect_err("user-owned root must fail");
-        assert_eq!(violation.path, leaf);
-        assert_eq!(
+        assert!(leaf.starts_with(&violation.path));
+        assert!(matches!(
             violation.kind,
-            ViolationKind::NotRootOwned {
-                uid: rustix::process::geteuid().as_raw()
-            }
-        );
+            ViolationKind::NotRootOwned { .. } | ViolationKind::WritableByOthers { .. }
+        ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn secure_ancestors_reject_a_symlinked_ancestor() {
-        let dir = TestDir::new("secure-ancestors-link");
-        let root = fs::canonicalize(&dir.0).expect("canonical temp root");
+    #[ignore = "requires root; run with just test-privileged"]
+    fn privileged_secure_ancestors_reject_a_symlinked_ancestor() {
+        assert_eq!(rustix::process::geteuid().as_raw(), 0);
+        let dir = TestDir(Path::new("/var/lib").join(format!("zerodeck-path-{}", Uuid::new_v4())));
+        let root = &dir.0;
         let real = root.join("real");
         fs::create_dir_all(real.join("nested")).expect("create real tree");
         let link = root.join("link");
@@ -373,10 +376,7 @@ mod tests {
 
     #[test]
     fn secure_ancestors_report_unreadable_paths_fail_closed() {
-        let dir = TestDir::new("secure-ancestors-missing");
-        let missing = fs::canonicalize(&dir.0)
-            .expect("canonical temp root")
-            .join("absent");
+        let missing = Path::new("/").join(format!("zerodeck-missing-{}", Uuid::new_v4()));
         let violation = check_secure_ancestors(&missing).expect_err("missing path must fail");
         assert!(matches!(violation.kind, ViolationKind::Unreadable(_)));
     }

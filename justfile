@@ -135,10 +135,33 @@ test-updater-vm image ssh_key ssh_user manual managed candidate="-":
 test-updater-vm-ci dist_dir tag candidate:
     bash deploy/update/tests/vm-ci.sh "{{ dist_dir }}" "{{ tag }}" "{{ candidate }}"
 
+# Install the Linux CI runner's QEMU tools and allow the runner to open KVM.
+[group('checks')]
+setup-vm-ci:
+    just _setup-vm-ci
+
+[private]
+_setup-vm-ci:
+    sudo apt-get update
+    sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils
+    echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+        | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --name-match=kvm
+
 # Build a managed archive of a newer version (a second image build) for the VM update scenarios
 [group('checks')]
 build-vm-candidate version out_dir:
     bash deploy/update/tests/build-candidate.sh "{{ version }}" "{{ out_dir }}"
+
+# Verify the exact published Stable candidate in a Linux VM and write its attestation predicate.
+[group('checks')]
+qualify-stable $repo $tag $out_dir:
+    just _qualify-stable "$repo" "$tag" "$out_dir"
+
+[private]
+_qualify-stable $repo $tag $out_dir:
+    bash deploy/update/tests/qualify-stable.sh "$repo" "$tag" "$out_dir"
 
 # Exercise the VM harness itself with fake qemu/ssh (no image or hardware required)
 [group('checks')]
@@ -299,6 +322,7 @@ _release-scripts:
     bash deploy/update/tests/bootstrap.sh
     bash deploy/update/tests/publish.sh
     bash deploy/update/tests/sign-channel.sh
+    bash deploy/update/tests/qualification.sh
     just _test-updater-vm-selftest
 
 [private]

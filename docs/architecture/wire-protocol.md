@@ -100,9 +100,17 @@ Each line is a UTF-8 JSON object terminated by `\n` (up to 4 MiB per frame):
 | `0` | `CALL` | Daemon -> Worker | `id` (UUID string), `method`, `args`, `legacy` (optional bool) |
 | `1` | `RESPONSE` | Worker -> Daemon | `id`, `success`, `res`, `error` (optional) |
 | `2` | `EVENT` | Worker -> Daemon | `event`, `args` |
+| `3` | `STARTUP_PROBE` | Daemon -> Worker | `generation`, `probe` (`0` at startup, `1` after observation) |
+| `3` | `STARTUP` | Worker -> Daemon | `generation`, `status` (`ready` with matching `probe`, or `startup_failed` with `error`) |
 | — | `CONTROL` | Daemon -> Worker | `uninstall: bool` |
 
 When `success` is `false`, `res` holds the error message string and the worker adds `error: { "name": string, "traceback": string | null }` (the exception class name and formatted traceback), which maps onto the WebSocket `ERROR` frame's `name`/`traceback`. Receivers must treat `error` as optional and ignore it if malformed.
+
+`STARTUP` is internal. The daemon supplies the opaque generation at launch and ignores reports for
+any other generation. The worker answers the first probe through its IPC handler after import and
+migration, subject to a 15-second startup deadline by default. Confirmation requires a two-second
+observation without a crash or early `_main` failure, followed by a second IPC response within one
+second. A later automatic retry cannot retroactively confirm a failed first attempt.
 
 The daemon spawns each active plugin over an anonymous Unix `socketpair()` FD (`--fd`, clearing `FD_CLOEXEC` in `pre_exec`) with a sanitized environment (`env_clear()`), `cwd` set to `DECKY_PLUGIN_DIR`, and `stdout`/`stderr` piped into structured `tracing` logs. The worker takes ownership of the inherited IPC socket FD and closes it on shutdown. On graceful uninstall (`Control { uninstall: true }` followed by socket write-half shutdown), the worker completes `_unload` and `_uninstall` before exiting; hung workers are terminated with `SIGKILL` after the shutdown grace timeout.
 
@@ -132,7 +140,7 @@ The daemon spawns each active plugin over an anonymous Unix `socketpair()` FD (`
 - Managed lifecycle keys (`pluginOrder`, `disabledPlugins`, `disabled_plugins`) must be mutated via `loader/set_plugin_order`, `loader/enable_plugin`, and `loader/disable_plugin` rather than `loader/set_setting`.
 
 ### Root Plugin Ownership Check
-- When the daemon runs as root, every spawn of a `"root"` plugin (startup, enable, reload, install, debug hot-reload) first checks that `plugins/` itself and every entry of the plugin's directory are owned by uid 0, are not group- or world-writable, and are not symlinks. Otherwise the plugin stays `Failed` with a `failure_reason` naming the path (`owned by uid N, not root`, `writable by group/others (mode 0oNNN)`, `symlink`, or `unreadable: ...`). Crash restarts by the worker supervisor (with backoff) re-exec the plugin without re-running the check; this is tracked with the `PRIVILEGED_PATH` open decision.
+- When the daemon runs as root, every launch of a `"root"` plugin, including automatic restarts, checks that the plugin tree and all ancestors are owned by uid 0, are not group- or world-writable, and are not symlinks. Otherwise the plugin stays `Failed` with a `failure_reason` naming the path (`owned by uid N, not root`, `writable by group/others (mode 0oNNN)`, `symlink`, or `unreadable: ...`).
 - The daemon flag `--allow-unsafe-root-plugins` (env `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`, off by default) skips the check and logs a warning on each spawn. It is a development escape hatch that grants root to code a non-root user can edit, so it is read only from the daemon's own command line or environment, which only root controls. `loader.json` cannot enable it: `settings/` belongs to the unprivileged user.
 
 ### Python Worker Modules & Environment

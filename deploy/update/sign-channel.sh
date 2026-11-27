@@ -5,8 +5,9 @@
 #     --channel stable --repository owner/repo --source-sha <40-hex> --sequence 3 \
 #     --key signing-key.pem --out channels/
 #
-# The archive digest, `release.json` identity and GitHub build provenance are checked first; only
-# then is `<out>/<channel>.json` written and signed (ed25519, detached hex in `<channel>.json.sig`).
+# The archive digest, `release.json` identity and GitHub build provenance are checked first.
+# Stable also requires a VM qualification attestation for the same archive (exit 33 if unavailable).
+# Only then is `<out>/<channel>.json` written and signed (ed25519, detached hex).
 # The private key is only ever read from `--key`; release automation supplies it from a protected
 # environment secret.
 set -euo pipefail
@@ -93,6 +94,18 @@ PY
     --signer-workflow "${signer_workflow}" \
     --source-digest "${source_sha}" \
     --deny-self-hosted-runners >/dev/null
+
+if [[ "${channel}" == stable ]]; then
+    if ! "${gh_bin}" attestation verify "${archive}" \
+        --repo "${repository}" \
+        --signer-workflow "${repository}/.github/workflows/qualify-stable.yml" \
+        --source-ref refs/heads/main \
+        --predicate-type "https://github.com/${repository}/attestations/stable-vm/v1" \
+        --deny-self-hosted-runners >/dev/null; then
+        echo "sign-channel: no verified Stable VM result for ${tag} (${sha256})" >&2
+        exit 33
+    fi
+fi
 
 mkdir -p "${out}"
 document="${out}/${channel}.json"

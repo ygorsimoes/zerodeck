@@ -32,6 +32,18 @@ pub enum HostError {
     #[error("plugin worker startup timed out")]
     StartupTimeout,
 
+    /// A worker could not complete startup or failed during its startup observation window.
+    #[error("plugin worker failed to start: {0}")]
+    StartupFailed(String),
+
+    /// The requested readiness check applies to a different plugin generation.
+    #[error("plugin worker belongs to a different generation")]
+    GenerationMismatch,
+
+    /// Privileged execution was refused because the plugin code is not root controlled.
+    #[error("{0}")]
+    UnsafeRootPlugin(zerodeck_platform::OwnershipViolation),
+
     /// Worker returned a structured exception for an RPC invocation.
     #[error("plugin call failed ({name}): {message}")]
     PluginCallFailed {

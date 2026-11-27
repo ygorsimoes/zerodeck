@@ -39,7 +39,7 @@ ZeroDeck enforces defense-in-depth across the following areas.
 - Zip-Slip (`enclosed_name()`), symlink, size, and `UMask=0077` permission (`0755`/`0644`) checks during archive extraction, with staged atomic swaps and rollback on failed installs/upgrades
 - Fail-closed SHA-256 verification for remote plugin archives and `remote_binary` downloads (unless explicitly disabled via `developer.allow_unverified_installs`)
 - Out-of-process plugin workers with explicit `uid`/`gid` privilege dropping for plugins without the `"root"` flag
-- Root plugins only start from root-only trees: before each spawn of a `"root"` plugin, a root daemon checks that `plugins/` and the whole plugin directory are owned by uid 0, not group- or world-writable, and free of symlinks, and refuses the spawn otherwise (development opt-in `--allow-unsafe-root-plugins` / `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS`, read only from the daemon's own command line or environment, which only root controls; never from `loader.json`, which the unprivileged user owns; see the known limitation below for crash restarts)
+- Root plugins only start from root-controlled trees: before every launch, including automatic restarts, a root daemon checks the plugin tree and its ancestors for uid 0 ownership, no group or world write permission, and no symlinks. The development override `--allow-unsafe-root-plugins` / `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS` comes only from the daemon's command line or environment, never from `loader.json`.
 - Private plugin IPC over inherited `socketpair()` FDs with sanitized `env_clear()` worker environments (no predictable `/tmp` socket paths)
 - Ephemeral auth token (`X-Decky-Auth` / `?auth=`) on mutating, IPC, `/ws` and `/fetch` endpoints, compared in constant time, plus strict `https://steamloopback.host` CORS and loopback `Host` DNS-rebinding protection
 - Loopback-only listener by default: `zerodeckd` refuses to bind a non-loopback address unless started with `--allow-non-loopback` / `ZERODECK_ALLOW_NON_LOOPBACK`, because the `Host` check can be spoofed by a remote client and `/auth/token` would then hand out the token (and with it plugin installs). The container image sets the opt-in because it must bind `0.0.0.0` inside the container; publish its port on `127.0.0.1` only
@@ -48,15 +48,9 @@ ZeroDeck enforces defense-in-depth across the following areas.
 - Root-only behavior (privilege drop, worker reaping on daemon death, root plugin ownership) exercised in CI by a dedicated root container with minimal capabilities
 - Supply chain: `cargo-deny` license, advisory and source policy (`deny.toml`); GitHub Actions pinned by commit SHA and audited with `zizmor`; toolchain binaries pinned by SHA-256; release images and tarballs ship with signed build-provenance attestations and an SBOM
 
-**Known limitation: ancestors of `PRIVILEGED_PATH`.** Root plugins run from
-`<PRIVILEGED_PATH>/plugins`, which defaults to `~deck/homebrew/plugins`. On stock SteamOS `~deck`
-and `~deck/homebrew` are owned by `deck`, so the unprivileged user can rename or replace the
-`plugins/` directory between the ownership check and the spawn. The daemon logs one warning at
-startup listing the non-root-writable ancestors. Moving `PRIVILEGED_PATH` to a root-owned location
-(such as `/var/lib/zerodeck`) is an open decision for the Phase 4 installer. The check runs on every
-spawn the daemon requests (startup, enable, reload, install, debug hot-reload), but crash restarts
-by the worker supervisor (with backoff) re-exec the plugin without re-checking its tree; this is
-tracked with the same `PRIVILEGED_PATH` open decision.
+The default `~deck/homebrew/plugins` remains usable for unprivileged plugins. To run privileged
+plugins, the operator must configure a root-controlled `PRIVILEGED_PATH`; the daemon does not
+automatically promote existing plugins or move user data.
 
 **Planned** (see the [roadmap](README.md#roadmap)):
 - Steam CEF debugging hardening and crash recovery ([Phase 4](README.md#roadmap))

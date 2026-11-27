@@ -2,14 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Map, Value};
 use tokio::sync::broadcast;
-use tracing::{info_span, warn};
-use zerodeck_platform::{
-    OwnershipViolation, PlatformError, PlatformPaths, SafePath, lock_unpoisoned,
-};
+use tracing::warn;
+use zerodeck_platform::{PlatformError, PlatformPaths, SafePath, lock_unpoisoned};
 use zerodeck_plugin_host::{
     HostError, PluginEvent, PluginSpawnSpec, PluginState, PluginSupervisor, SupervisorConfig,
 };
@@ -17,7 +14,6 @@ use zerodeck_protocol::PluginLoadType;
 
 use crate::blocking::run_blocking;
 use crate::discovery::discover_single_plugin;
-use crate::preflight::{PreflightInput, preflight};
 use crate::settings::insert_dotted;
 use crate::{
     CheckedHttpClient, CoreError, DiscoveredPlugin, FilePicker, FilePickerListing, FilePickerQuery,
@@ -75,8 +71,6 @@ pub struct PluginManager {
     /// Serializes `loader.json` writes so they reach disk in order; never held by readers.
     settings_writer: tokio::sync::Mutex<()>,
     loader_events_tx: broadcast::Sender<LoaderEvent>,
-    daemon_is_root: bool,
-    allow_unsafe_root_plugins: AtomicBool,
     python_host_missing: Mutex<Option<String>>,
     /// Spawn preflight refusals by `manifest.name`, cleared when a later preflight passes.
     failure_reasons: Mutex<HashMap<String, String>>,
@@ -195,8 +189,6 @@ impl PluginManager {
             lifecycle_lock: tokio::sync::Mutex::new(()),
             settings_writer: tokio::sync::Mutex::new(()),
             loader_events_tx,
-            daemon_is_root: daemon_is_root(),
-            allow_unsafe_root_plugins: AtomicBool::new(false),
             python_host_missing: Mutex::new(None),
             failure_reasons: Mutex::new(HashMap::new()),
         })
@@ -241,15 +233,7 @@ impl PluginManager {
     /// Only the daemon's own command line or environment may turn this on: anything the
     /// unprivileged user can write, such as `loader.json`, must never grant root.
     pub fn set_allow_unsafe_root_plugins(&self, allow: bool) {
-        self.allow_unsafe_root_plugins
-            .store(allow, Ordering::Relaxed);
-    }
-
-    /// Makes the spawn preflight behave as under a root daemon, so tests can exercise the tree
-    /// check without running as root.
-    #[cfg(test)]
-    pub(crate) fn assume_root_daemon_for_tests(&mut self) {
-        self.daemon_is_root = true;
+        self.supervisor.set_allow_unsafe_root_plugins(allow);
     }
 
     /// Starts workers for all enabled, non-passive plugins in configured order.
@@ -370,7 +354,7 @@ impl PluginManager {
             )));
         }
 
-        let cleared_failure = match self.preflight_plugin(&refreshed).await {
+        let cleared_failure = match self.preflight_plugin(&refreshed) {
             Ok(cleared) => cleared,
             Err(err) => {
                 shutdown_worker_if_present(&self.supervisor, &refreshed.manifest.name, false)
@@ -380,7 +364,7 @@ impl PluginManager {
             }
         };
 
-        if metadata_changed
+        let launch = if metadata_changed
             || self
                 .supervisor
                 .plugin_state(&refreshed.manifest.name)
@@ -388,11 +372,16 @@ impl PluginManager {
         {
             self.supervisor
                 .spawn_plugin(self.spawn_spec_for(&refreshed))
-                .await?;
+                .await
         } else {
             self.supervisor
                 .reload_plugin(&refreshed.manifest.name)
-                .await?;
+                .await
+        };
+        if let Err(err) = launch {
+            let err = self.launch_error(&refreshed.manifest.name, err);
+            self.emit_plugins_changed();
+            return Err(err);
         }
 
         if metadata_changed || cleared_failure {
@@ -664,13 +653,12 @@ impl PluginManager {
             .into_iter()
             .map(|plugin| {
                 let is_disabled = disabled.contains(&plugin.manifest.name);
-                let failure_reason = self.failure_reason(&plugin.manifest.name);
-                let state = if failure_reason.is_some() {
-                    PluginState::Failed
-                } else {
-                    self.supervisor
-                        .plugin_state(&plugin.manifest.name)
-                        .unwrap_or(PluginState::Stopped)
+                let (state, failure_reason) = match self.failure_reason(&plugin.manifest.name) {
+                    Some(reason) => (PluginState::Failed, Some(reason)),
+                    None => self
+                        .supervisor
+                        .plugin_status(&plugin.manifest.name)
+                        .unwrap_or((PluginState::Stopped, None)),
                 };
                 PluginSummary {
                     name: plugin.manifest.name,
@@ -738,47 +726,39 @@ impl PluginManager {
 
     /// Runs the spawn preflight and, when it passes, starts the plugin's worker.
     async fn spawn_checked(&self, plugin: &DiscoveredPlugin) -> Result<(), CoreError> {
-        self.preflight_plugin(plugin).await?;
+        self.preflight_plugin(plugin)?;
         self.supervisor
             .spawn_plugin(self.spawn_spec_for(plugin))
-            .await?;
+            .await
+            .map_err(|err| self.launch_error(&plugin.manifest.name, err))?;
         Ok(())
     }
 
-    /// Records a refusal as the plugin's failure reason, or clears a recorded one when the
-    /// preflight passes; `Ok(true)` means a recorded reason was cleared.
-    async fn preflight_plugin(&self, plugin: &DiscoveredPlugin) -> Result<bool, CoreError> {
+    /// Checks the Python host before handing off to the worker launch policy.
+    fn preflight_plugin(&self, plugin: &DiscoveredPlugin) -> Result<bool, CoreError> {
         let name = &plugin.manifest.name;
         let python_host_missing = lock_unpoisoned(&self.python_host_missing).clone();
-        let input = PreflightInput {
-            requires_root: plugin.manifest.requires_root(),
-            daemon_is_root: self.daemon_is_root,
-            allow_unsafe_root_plugins: self.allow_unsafe_root_plugins.load(Ordering::Relaxed),
-            python_host_missing: python_host_missing.as_deref(),
-        };
-        // The tree walk is filesystem I/O over the whole plugin; run it on the blocking pool, and
-        // only when the preflight will consult it.
-        let tree_result = if input.needs_tree_check() {
-            let plugins_dir = self.paths.plugins_dir();
-            let directory = plugin.directory.clone();
-            run_blocking(move || Ok(check_root_plugin_tree(&plugins_dir, &directory))).await?
-        } else {
-            Ok(())
-        };
-        let result = info_span!("spawn_preflight", plugin = %name)
-            .in_scope(|| preflight(&input, || tree_result));
-        match result {
-            Ok(()) => Ok(lock_unpoisoned(&self.failure_reasons)
+        match python_host_missing {
+            None => Ok(lock_unpoisoned(&self.failure_reasons)
                 .remove(name)
                 .is_some()),
-            Err(reason) => {
-                lock_unpoisoned(&self.failure_reasons).insert(name.clone(), reason.clone());
-                Err(CoreError::PluginBlocked {
-                    name: name.clone(),
-                    reason,
-                })
-            }
+            Some(reason) => Err(self.record_blocked_plugin(name, reason)),
         }
+    }
+
+    fn launch_error(&self, name: &str, err: HostError) -> CoreError {
+        match err {
+            HostError::UnsafeRootPlugin(violation) => {
+                self.record_blocked_plugin(name, violation.to_string())
+            }
+            other => other.into(),
+        }
+    }
+
+    fn record_blocked_plugin(&self, name: &str, reason: String) -> CoreError {
+        let name = name.to_owned();
+        lock_unpoisoned(&self.failure_reasons).insert(name.clone(), reason.clone());
+        CoreError::PluginBlocked { name, reason }
     }
 
     fn failure_reason(&self, plugin_name: &str) -> Option<String> {
@@ -793,6 +773,7 @@ impl PluginManager {
 
     fn spawn_spec_for(&self, plugin: &DiscoveredPlugin) -> PluginSpawnSpec {
         PluginSpawnSpec {
+            generation: uuid::Uuid::new_v4().to_string(),
             directory: plugin.directory.clone(),
             manifest: plugin.manifest.clone(),
             version: plugin.package.as_ref().and_then(|pkg| pkg.version.clone()),
@@ -1024,40 +1005,6 @@ fn validate_rel_path_components(root: &Path, rel_path: &str) -> Result<(), CoreE
             }));
         }
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn daemon_is_root() -> bool {
-    zerodeck_platform::current_process_identity().euid == 0
-}
-
-#[cfg(not(unix))]
-fn daemon_is_root() -> bool {
-    false
-}
-
-/// Checks `plugins_dir` itself (not its other plugins) and every entry of the plugin's
-/// `directory` below it.
-#[cfg(unix)]
-fn check_root_plugin_tree(plugins_dir: &Path, directory: &str) -> Result<(), OwnershipViolation> {
-    let violation = |kind| OwnershipViolation {
-        path: plugins_dir.to_path_buf(),
-        kind,
-    };
-    let meta = fs::symlink_metadata(plugins_dir).map_err(|err| {
-        violation(zerodeck_platform::ViolationKind::Unreadable(
-            err.to_string(),
-        ))
-    })?;
-    if let Some(kind) = zerodeck_platform::check_entry(zerodeck_platform::entry_meta(&meta)) {
-        return Err(violation(kind));
-    }
-    zerodeck_platform::check_root_only_tree(&plugins_dir.join(directory))
-}
-
-#[cfg(not(unix))]
-fn check_root_plugin_tree(_: &Path, _: &str) -> Result<(), OwnershipViolation> {
     Ok(())
 }
 

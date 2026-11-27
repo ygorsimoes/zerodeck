@@ -1,0 +1,49 @@
+name: Qualify Stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published immutable release to qualify (e.g. v0.1.0)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  qualify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    concurrency:
+      group: stable-qualification-${{ inputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: just@1.59.0
+      - name: Set up QEMU with KVM
+        run: just setup-vm-ci
+      - name: Exercise the published candidate in the VM
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: just qualify-stable "${GITHUB_REPOSITORY}" "${TAG}" "${RUNNER_TEMP}/stable-qualification"
+      - name: Attest the VM result on the candidate archive
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ runner.temp }}/stable-qualification/candidate/*.managed.tar.gz
+          predicate-type: https://github.com/${{ github.repository }}/attestations/stable-vm/v1
+          predicate-path: ${{ runner.temp }}/stable-qualification/stable-vm.json
+      - name: Ask the channels workflow to sign the qualified Stable release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run channels.yml --repo "${GITHUB_REPOSITORY}" --ref main

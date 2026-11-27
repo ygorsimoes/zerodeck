@@ -31,6 +31,8 @@ class PluginRunner:
         api_version: int,
         emit_sink: EmitCallback,
         stop_event: asyncio.Event | None = None,
+        on_main_failure: Callable[[BaseException], None] | None = None,
+        generation: str | None = None,
     ) -> None:
         self.entrypoint = entrypoint
         self.plugin_name = plugin_name
@@ -43,6 +45,8 @@ class PluginRunner:
         self._stopping = False
         self._decky_logger: Any = None
         self._stop_event: asyncio.Event | None = stop_event
+        self._on_main_failure = on_main_failure
+        self._generation = generation
 
     def load(self) -> None:
         plugin_dir = os.getenv("DECKY_PLUGIN_DIR", str(self.entrypoint.parent))
@@ -145,6 +149,9 @@ class PluginRunner:
                     "plugin _main task failed",
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+            if self._on_main_failure is not None:
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._on_main_failure, exc)
 
     def _adopt_main_awaitable(self, awaitable: Awaitable[Any]) -> None:
         if self._stopping:
@@ -162,11 +169,15 @@ class PluginRunner:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is not None and self._decky_logger is not None:
+        if exc is None:
+            return
+        if self._decky_logger is not None:
             self._decky_logger.error(
                 "plugin _main task failed",
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
+        if self._on_main_failure is not None:
+            self._on_main_failure(exc)
 
     async def stop_lifecycle(self) -> None:
         self._stopping = True
@@ -194,6 +205,24 @@ class PluginRunner:
             if not isinstance(raw_data, dict):
                 raise ValueError("IPC payload must be a JSON object")
             data = cast(dict[str, Any], raw_data)
+
+            if data.get("type") == 3:
+                probe = data.get("probe")
+                if (
+                    self._generation is not None
+                    and data.get("generation") == self._generation
+                    and type(probe) is int
+                    and probe in (0, 1)
+                ):
+                    return json.dumps(
+                        {
+                            "type": 3,
+                            "generation": self._generation,
+                            "status": "ready",
+                            "probe": probe,
+                        }
+                    )
+                return None
 
             if "uninstall" in data:
                 self.uninstalling = bool(data.get("uninstall"))
@@ -265,22 +294,54 @@ async def _run_worker(args: argparse.Namespace) -> None:
         raise ValueError("either --fd or --socket-path must be provided")
 
     stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    main_failure: asyncio.Future[BaseException] = loop.create_future()
+
+    def record_main_failure(error: BaseException) -> None:
+        if not main_failure.done():
+            main_failure.set_result(error)
+
+    async def report_startup_failure(error: BaseException) -> None:
+        if args.generation is None:
+            return
+        payload = {
+            "type": 3,
+            "generation": args.generation,
+            "status": "startup_failed",
+            "error": f"{type(error).__name__}: {error}"[:2048],
+        }
+        with suppress(OSError):
+            await transport.send_json(payload)
+
+    async def report_main_failure() -> None:
+        await report_startup_failure(await main_failure)
+
     runner = PluginRunner(
         entrypoint=Path(args.entrypoint),
         plugin_name=args.plugin_name,
         api_version=args.api_version,
         emit_sink=transport.send_json,
         stop_event=stop_event,
+        on_main_failure=record_main_failure,
+        generation=args.generation,
     )
+    report_task: asyncio.Task[None] | None = None
     try:
-        runner.load()
-        await runner.start_lifecycle()
+        try:
+            runner.load()
+            await runner.start_lifecycle()
+        except Exception as exc:
+            await report_startup_failure(exc)
+            raise
 
-        loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             with suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop_event.set)
 
+        if main_failure.done():
+            await report_startup_failure(main_failure.result())
+        else:
+            report_task = asyncio.create_task(report_main_failure())
         serve_task = asyncio.create_task(transport.serve(runner.handle_message))
         stop_task = asyncio.create_task(stop_event.wait())
         done, pending = await asyncio.wait(
@@ -299,6 +360,10 @@ async def _run_worker(args: argparse.Namespace) -> None:
 
         await runner.stop_lifecycle()
     finally:
+        if report_task is not None:
+            report_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await report_task
         await transport.close()
 
 
@@ -306,6 +371,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="ZeroDeck isolated Python plugin worker")
     parser.add_argument("--entrypoint", required=True)
     parser.add_argument("--plugin-name", required=True)
+    parser.add_argument("--generation", default=None)
     parser.add_argument("--api-version", type=int, default=0)
     parser.add_argument("--fd", type=int, default=None)
     parser.add_argument("--socket-path", default=None)

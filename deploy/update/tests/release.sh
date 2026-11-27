@@ -60,8 +60,8 @@ identity_output="$("${python}" "${tests_dir}/archive.py" identity "${archive}" "
 }
 expected_version="$(printf '%s\n' "${identity_output}" | sed -n '1p')"
 expected_build_id="$(printf '%s\n' "${identity_output}" | sed -n '2p')"
-expected_version="${ZERODECK_EXPECTED_VERSION:-${expected[0]}}"
-expected_build_id="${ZERODECK_EXPECTED_BUILD_ID:-${expected[1]}}"
+expected_version="${ZERODECK_EXPECTED_VERSION:-${expected_version}}"
+expected_build_id="${ZERODECK_EXPECTED_BUILD_ID:-${expected_build_id}}"
 export ZERODECK_EXPECTED_VERSION="${expected_version}"
 export ZERODECK_EXPECTED_BUILD_ID="${expected_build_id}"
 

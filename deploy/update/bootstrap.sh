@@ -45,7 +45,7 @@ usage() {
 usage: ${PROGRAM} --package <manual.tar.gz> --sha256 <hex>
                   --generation <managed.tar.gz> --generation-sha256 <hex>
                   --trusted-root <root.json> --trusted-root-sha256 <hex>
-                  [--metadata-url URL] [--targets-url URL]
+                  --metadata-url URL --targets-url URL
                   [--convert-existing-zerodeck] [--import-inactive-decky PATH]
                   [--start] [--dry-run]
                   [--root DIR] [--controller-root DIR] [--systemd-dir DIR]
@@ -99,6 +99,7 @@ done
 [[ -n "${package}" ]] || usage
 [[ -n "${generation}" ]] || usage
 [[ -n "${trusted_root}" ]] || usage
+[[ -n "${metadata_url}" && -n "${targets_url}" ]] || usage
 [[ "${package_sha}" =~ ^[0-9A-Fa-f]{64}$ ]] || die "--sha256 must be a 64-character SHA-256 hex digest"
 [[ "${generation_sha}" =~ ^[0-9A-Fa-f]{64}$ ]] || die "--generation-sha256 must be a SHA-256 digest"
 [[ "${trusted_root_sha}" =~ ^[0-9A-Fa-f]{64}$ ]] || die "--trusted-root-sha256 must be a SHA-256 digest"
@@ -249,15 +250,22 @@ ensure_install_path "${root}"
 ensure_install_path "${controller_root}"
 ensure_install_path "${systemd_dir}"
 ensure_install_path "${config_dir}"
-ensure_private_dir "${root}" 0755
-ensure_private_dir "${root}/generations" 0755
-ensure_private_dir "${root}/state" 0700
-ensure_private_dir "${root}/tuf" 0700
-ensure_private_dir "${root}/staging" 0700
-ensure_private_dir "${root}/backup" 0700
-ensure_owned_tree "${root}"
-
-work="${root}/.bootstrap-$$"
+for path in generations state tuf staging backup import; do
+    [[ -L "${root}/${path}" ]] && die "update root child must not be a symlink: ${root}/${path}"
+done
+if [[ "${dry_run}" -eq 0 ]]; then
+    ensure_private_dir "${root}" 0755
+    ensure_private_dir "${root}/generations" 0755
+    ensure_private_dir "${root}/state" 0700
+    ensure_private_dir "${root}/tuf" 0700
+    ensure_private_dir "${root}/staging" 0700
+    ensure_private_dir "${root}/backup" 0700
+    ensure_owned_tree "${root}"
+    work="${root}/.bootstrap-$$"
+else
+    # A dry run must not create or chmod any system path.
+    work="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-bootstrap-dry-run.XXXXXX")"
+fi
 umask 077
 mkdir -p "${work}"
 cleanup() {
@@ -413,6 +421,7 @@ manual_root="${work}/manual/${wrapper}"
 digest="$(printf '%s' "${generation_sha}" | tr '[:upper:]' '[:lower:]')"
 generation_dir="${root}/generations/${digest}"
 controller_bin="${controller_root}/bin/zerodeckctl"
+import_root="${root}/import"
 units=(zerodeck.service zerodeck-apply.service zerodeck-recovery.service zerodeck-check.service zerodeck-check.timer)
 
 decky_active() {
@@ -432,18 +441,19 @@ service_active() {
 validate_decky_import() {
     [[ -n "${import_decky}" ]] || return 0
     [[ -d "${import_decky}" ]] || die "inactive Decky path is not a directory: ${import_decky}"
-    [[ -L "${data_dir}" ]] && die "the data path must not be a symlink: ${data_dir}"
-    if [[ -e "${data_dir}" && -n "$(ls -A "${data_dir}" 2>/dev/null)" ]]; then
-        die "${data_dir} already contains data; refusing to overwrite it while importing Decky. \
-             Move the existing data aside or import manually."
+    [[ -L "${import_root}" ]] && die "the import staging path must not be a symlink: ${import_root}"
+    if [[ -e "${import_root}" && -n "$(ls -A "${import_root}" 2>/dev/null)" ]]; then
+        die "${import_root} already contains staged imports; refusing to overwrite it. \
+             Resolve or remove the staged import after review."
     fi
 }
 
-validate_decky_import
 if decky_active; then
-    die "Decky Loader is running (decky.service/plugin_loader.service is active). Stop it \
-         explicitly first; this script never stops or rewrites a running Decky installation."
+    die "Decky Loader is running (decky.service/decky-loader.service/plugin_loader.service is \
+         active). Stop it explicitly first; this script never stops or rewrites a running Decky \
+         installation."
 fi
+validate_decky_import
 
 existing=0
 for unit in "${units[@]}"; do
@@ -455,6 +465,19 @@ if [[ "${existing}" -eq 1 && "${convert}" -eq 0 ]]; then
     die "an existing ZeroDeck installation was found under ${root} or ${controller_root}; \
          pass --convert-existing-zerodeck to retain its data and previous generation"
 fi
+
+for path in \
+    "${controller_bin}" \
+    "${root}/current" \
+    "${root}/state/update.json" \
+    "${root}/state/apply.json" \
+    "${config_dir}/trusted-root.json" \
+    "${config_dir}/update.env"; do
+    [[ -L "${path}" ]] && die "refusing to replace a symlinked installation path: ${path}"
+done
+for unit in "${units[@]}"; do
+    [[ -L "${systemd_dir}/${unit}" ]] && die "refusing to replace a symlinked unit: ${systemd_dir}/${unit}"
+done
 
 was_active=0
 if service_active; then
@@ -587,11 +610,14 @@ install_config() {
 }
 
 install_units() {
-    local unit
+    local unit staged
     mkdir -p "${systemd_dir}"
     chmod 0755 "${systemd_dir}"
     for unit in "${units[@]}"; do
-        install -m 0644 "${manual_root}/systemd/${unit}" "${systemd_dir}/${unit}"
+        [[ -L "${systemd_dir}/${unit}" ]] && die "refusing to replace a symlinked unit: ${systemd_dir}/${unit}"
+        staged="${systemd_dir}/.${unit}.new.$$"
+        install -m 0644 "${manual_root}/systemd/${unit}" "${staged}"
+        mv "${staged}" "${systemd_dir}/${unit}"
         if [[ "$(id -u)" -eq 0 ]]; then
             chown root:root "${systemd_dir}/${unit}"
         fi
@@ -602,6 +628,7 @@ rollback_install() {
     local reason="$1"
     set +e
     "${systemctl}" stop zerodeck.service >/dev/null 2>&1
+    "${systemctl}" disable zerodeck.service zerodeck-recovery.service >/dev/null 2>&1 || true
     local unit
     for unit in "${units[@]}"; do
         rm -f "${systemd_dir}/${unit}"
@@ -667,20 +694,32 @@ if ! "${systemctl}" daemon-reload; then
 fi
 
 if [[ -n "${import_decky}" ]]; then
-    mkdir -p "${data_dir}"
-    cp -a "${import_decky}/." "${data_dir}/"
-    imported_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    python3 - "${root}/state/import.json" "${import_decky}" "${data_dir}" "${imported_at}" <<'PY'
+    imported_at="$(date -u +%Y%m%dT%H%M%SZ)"
+    staged_import="${import_root}/decky-${imported_at}-$$"
+    if ! mkdir -p "${import_root}" "${staged_import}" \
+        || ! chmod 0700 "${import_root}" "${staged_import}" \
+        || ! cp -a "${import_decky}/." "${staged_import}/"; then
+        rm -rf "${staged_import}"
+        rollback_install "inactive Decky import failed"
+        exit 1
+    fi
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown -R root:root "${import_root}"
+    fi
+    python3 - "${root}/state/import.json" "${import_decky}" "${staged_import}" \
+        "${data_dir}" "${imported_at}" <<'PY'
 import json, os, sys
-path, source, target, imported_at = sys.argv[1:5]
+path, source, staged, expected_data, imported_at = sys.argv[1:6]
 document = {
     "schema": 1,
     "source": os.path.abspath(source),
-    "target": os.path.abspath(target),
+    "staged_path": os.path.abspath(staged),
+    "expected_data_root": os.path.abspath(expected_data),
     "imported_at": imported_at,
     "copy_only": True,
     "root_plugins": "blocked",
-    "policy": "imported privileged code is not trusted; install root plugins explicitly with a verified package",
+    "activated": False,
+    "adoption": "review the staged copy, then install individual plugins with a verified package; imported root plugins are never activated from this staging tree",
 }
 temp = path + ".tmp"
 with open(temp, "w", encoding="utf-8") as handle:
@@ -689,7 +728,8 @@ with open(temp, "w", encoding="utf-8") as handle:
 os.replace(temp, path)
 PY
     chmod 0644 "${root}/state/import.json"
-    echo "${PROGRAM}: imported ${import_decky} into ${data_dir}; imported root plugins are blocked"
+    echo "${PROGRAM}: staged inactive Decky import at ${staged_import}; nothing was activated"
+    echo "${PROGRAM}: imported root plugins are blocked and the host data root ${data_dir} was not created"
 fi
 
 if [[ "${start}" -eq 1 ]]; then

@@ -47,6 +47,12 @@ jobs:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
           persist-credentials: false
 
+      - name: Record the released source commit
+        id: source
+        run: |
+          set -euo pipefail
+          echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
       - name: Resolve promotion inputs
         id: promotion
         env:
@@ -117,26 +123,14 @@ jobs:
             bash deploy/update/tests/release.sh --validate-only \
               "dist/zerodeck-${tag}-linux-x86_64.managed.tar.gz"
 
-      - name: Verify GitHub build provenance for the published archive
+      - name: Verify provenance and render the promotion request
+        id: request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.promotion.outputs.tag }}
-        run: |
-          set -euo pipefail
-          archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
-          gh attestation verify "${archive}" --repo "${GITHUB_REPOSITORY}" --format json \
-            >attestation-raw.json
-          digest="$(sha256sum "${archive}" | awk '{print $1}')"
-          printf '{"verified":true,"sha256":"%s","source":"%s"}\n' \
-            "${digest}" "${GITHUB_REPOSITORY}" >attestation.json
-          cat attestation.json
-
-      - name: Render and verify the promotion request
-        id: request
-        env:
-          TAG: ${{ steps.promotion.outputs.tag }}
           CHANNEL: ${{ steps.promotion.outputs.channel }}
           MIN_UPDATER: ${{ steps.promotion.outputs.min_updater }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
           archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
@@ -151,13 +145,17 @@ jobs:
             --archive "${archive}" --sha256 "${digest}" \
             --tag "${TAG}" --version "${TAG#v}" --channel "${CHANNEL}" \
             --min-updater "${MIN_UPDATER}" --build-id "${build_id}" \
-            --attestation attestation.json --verify-only | tee target-descriptor.txt
+            --repository "${GITHUB_REPOSITORY}" \
+            --source-sha "${SOURCE_SHA}" \
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-please.yml" \
+            --source-ref "refs/heads/main" | tee target-descriptor.txt
 
       - name: Write the external signing request
         env:
           TAG: ${{ steps.promotion.outputs.tag }}
           CHANNEL: ${{ steps.promotion.outputs.channel }}
           MIN_UPDATER: ${{ steps.promotion.outputs.min_updater }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
           TUF_REPOSITORY: ${{ vars.TUF_ON_CI_REPOSITORY }}
         run: |
           set -euo pipefail
@@ -172,9 +170,11 @@ jobs:
           PY
           )"
           python3 - "${TAG}" "${version}" "${build_id}" "${CHANNEL}" "${MIN_UPDATER}" \
-            "${digest}" "${size}" "${TUF_REPOSITORY}" >promotion-request.json <<'PY'
+            "${digest}" "${size}" "${TUF_REPOSITORY}" "${SOURCE_SHA}" \
+            >promotion-request.json <<'PY'
           import json, os, sys
-          tag, version, build_id, channel, min_updater, digest, size, tuf_repository = sys.argv[1:9]
+          (tag, version, build_id, channel, min_updater, digest, size, tuf_repository,
+           source_sha) = sys.argv[1:10]
           document = {
               "schema": 1,
               "tag": tag,
@@ -186,6 +186,9 @@ jobs:
               "sha256": digest,
               "length": int(size),
               "source_repository": os.environ["GITHUB_REPOSITORY"],
+              "source_sha": source_sha,
+              "source_ref": "refs/heads/main",
+              "signer_workflow": f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/release-please.yml",
               "source_release": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{tag}",
               "tuf_repository": tuf_repository,
           }
@@ -199,7 +202,6 @@ jobs:
           name: tuf-promotion-request
           path: |
             promotion-request.json
-            attestation-raw.json
             target-descriptor.txt
           if-no-files-found: error
           retention-days: 90

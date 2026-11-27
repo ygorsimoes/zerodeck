@@ -1,7 +1,8 @@
 # TUF target shape
 
-This directory contains no keys and no signed production metadata. TUF root/targets signing happens
-in the external TUF-on-CI repository, under separate authority from the GitHub release job.
+This directory contains no keys and no signed production metadata. TUF root/targets signing and
+metadata verification happen in the external TUF-on-CI repository, under separate authority from
+the GitHub release job.
 
 `loader-target.template.json` records the signed `targets.json` entry ZeroDeck clients expect:
 
@@ -12,10 +13,13 @@ in the external TUF-on-CI repository, under separate authority from the GitHub r
 - `custom.build_id`: the daemon's embedded build ID and `release.json` build ID;
 - `custom.min_updater`: the minimum `zerodeckctl` version allowed to activate the target.
 
-`deploy/update/promote.sh --verify-only ...` prints a filled descriptor for the external signer.
-The full `promote.sh` mode refuses to stage anything unless the root, targets, snapshot and
-timestamp metadata are present, unexpired, signed by roles authorized in the out-of-band trusted
-root, and the targets entry matches the already-published archive digest and length exactly.
+`deploy/update/promote.sh` verifies the already-published archive digest, `release.json`, channel
+and GitHub build provenance (exact repository, signer workflow, source commit/ref and artifact
+digest), then prints the filled descriptor for the external signer. It deliberately does **not**
+parse or count signatures; the external TUF-on-CI repository runs a real TUF client to verify the
+signed root/targets/snapshot/timestamp chain, expiry, version monotonicity and the exact target
+entry before serving it.
 
-Do not commit private keys, unsigned `targets.json`, or locally rebuilt archives here. The release
-workflow only dispatches a promotion request; it never signs metadata or rewrites published bytes.
+Do not commit private keys, unsigned `targets.json`, locally fabricated signature records, or
+locally rebuilt archives here. The release workflow only dispatches a promotion request with the
+published digest and provenance identity; it never signs metadata or rewrites published bytes.

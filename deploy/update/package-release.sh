@@ -135,8 +135,14 @@ fi
 
 write_manifest() {
     local destination="$1"
-    printf '{"schema":1,"build_id":"%s","version":"%s"}\n' "${build_id}" "${version}" \
-        >"${destination}/release.json"
+    python3 - "${destination}/release.json" "${build_id}" "${version}" <<'PY'
+import json, os, sys
+path, build_id, version = sys.argv[1:4]
+with open(path + ".tmp", "w", encoding="utf-8") as handle:
+    json.dump({"schema": 1, "build_id": build_id, "version": version}, handle, sort_keys=True)
+    handle.write("\n")
+os.replace(path + ".tmp", path)
+PY
     chmod 0644 "${destination}/release.json"
 }
 
@@ -205,6 +211,11 @@ if [[ -n "${stage_managed}" ]]; then
     rm -f "${managed_archive}"
     make_archive "${stage_managed}" "" "${managed_archive}"
     produced+=("$(basename "${managed_archive}")")
+fi
+
+if [[ "${#produced[@]}" -eq 0 ]]; then
+    echo "error: no release asset was produced" >&2
+    exit 1
 fi
 
 "${PYTHON:-python3}" - "${outdir}" "${produced[@]}" <<'PY'

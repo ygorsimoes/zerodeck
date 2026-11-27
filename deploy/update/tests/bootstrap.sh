@@ -99,7 +99,8 @@ FAKE_DECKY_ACTIVE=1
 export FAKE_DECKY_ACTIVE
 expect_failure decky-active run_bootstrap \
     "$(base_for "${root}")" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
-    "${trusted_root}" "${root_sha}"
+    "${trusted_root}" "${root_sha}" \
+    --data-dir "${decky_home}" --import-inactive-decky "${decky_home}"
 [[ "$(fixture_sha256 "${decky_home}/plugins/example/main.py")" == "${decky_before}" ]] || {
     echo "running Decky files changed" >&2; exit 1;
 }
@@ -210,6 +211,14 @@ if grep -qE '(^| )(start|enable)( |$)' "${FAKE_SYSTEMCTL_LOG}"; then
     exit 1
 fi
 
+# ── Dry run validates without creating any installation path ──────────────────────────────────
+read -r root controller units config < <(new_install dry-run)
+run_bootstrap "$(base_for "${root}")" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" --dry-run >"${tmp}/dry-run.log"
+[[ ! -e "${root}" && ! -e "${controller}" && ! -e "${units}" && ! -e "${config}" ]] || {
+    echo "dry run created installation paths" >&2; exit 1;
+}
+
 # ── Import copies an inactive Decky tree and records blocked root plugins ────────────────────
 read -r root controller units config < <(new_install import)
 import_source="${tmp}/inactive-decky"
@@ -217,17 +226,27 @@ mkdir -p "${import_source}/plugins/example"
 printf 'decky plugin\n' >"${import_source}/plugins/example/main.py"
 run_bootstrap "$(base_for "${root}")" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
     "${trusted_root}" "${root_sha}" --import-inactive-decky "${import_source}" >"${tmp}/import.log"
-data_dir="$(base_for "${root}")/home/deck/homebrew"
-cmp "${import_source}/plugins/example/main.py" "${data_dir}/plugins/example/main.py" >/dev/null || {
-    echo "Decky import did not copy the plugin tree" >&2; exit 1;
+root_real="$(cd "${root}" && pwd)"
+data_dir="$(cd "$(base_for "${root}")" && pwd)/home/deck/homebrew"
+[[ ! -e "${data_dir}" ]] || { echo "Decky import created the host data root" >&2; exit 1; }
+staged="$(python3 - "${root_real}/state/import.json" <<'PY2'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["staged_path"])
+PY2
+)"
+[[ "${staged}" == "${root_real}/import/"* ]] || { echo "Decky import was not staged under the root" >&2; exit 1; }
+cmp "${import_source}/plugins/example/main.py" "${staged}/plugins/example/main.py" >/dev/null || {
+    echo "Decky import did not copy the plugin tree into staging" >&2; exit 1;
 }
-python3 - "${root}/state/import.json" <<'PY'
+python3 - "${root_real}/state/import.json" "${data_dir}" <<'PY2'
 import json, sys
 document = json.load(open(sys.argv[1], encoding="utf-8"))
 assert document["schema"] == 1
 assert document["copy_only"] is True
 assert document["root_plugins"] == "blocked"
-PY
+assert document["activated"] is False
+assert document["expected_data_root"] == sys.argv[2]
+PY2
 
 # ── A running ZeroDeck service is not silently converted without --start ─────────────────────
 read -r root controller units config < <(new_install running-no-start)

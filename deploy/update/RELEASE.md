@@ -31,22 +31,26 @@ same test release automation runs before upload.
 
 1. **Release Please creates a draft.** `release-please-config.json` sets `"draft": true`. It still
    owns versions, the tag, and the changelog.
-2. **Build from the exact commit.** The release workflow checks out the tag and verifies
-   `git rev-parse refs/tags/<tag>` equals the checked-out `HEAD`, then sets
-   `ZERODECK_BUILD_ID=<tag>-<sha>`. The Dockerfile receives
+2. **Build from the exact commit.** Draft releases have no git tag. The release workflow builds from
+   Release Please's `sha` output (or `GITHUB_SHA` on a push), checks out that commit, and verifies
+   `HEAD` matches it. It sets `ZERODECK_BUILD_ID=<tag>-<sha>`; the Dockerfile receives
    `ZERODECK_REQUIRE_BUILD_ID=1`, so a release build without an explicit identity fails.
 3. **Push the image, package by digest.** The runtime image is pushed once and every later step
    uses `ghcr.io/<repo>@sha256:<digest>`, never a mutable tag. `just dist` extracts both assets from
    that image and writes `SHA256SUMS.txt`.
 4. **Validate before upload.** Both archives pass `just test-release-package`; both archives are
    attested with GitHub build provenance.
-5. **Upload and download-verify the draft.** `deploy/update/publish-release.sh` refuses a published
-   release, compares any existing draft asset by downloading it, uploads a missing/mismatched draft
-   asset, downloads every asset again, checks `SHA256SUMS.txt`, and rejects unexpected assets.
-6. **Publish the immutable release.** Only after step 5 does the workflow run
-   `publish-release.sh --publish` (`gh release edit --draft=false`). If the upload fails, the draft
-   remains unpublished and can be retried against the same tag. A failed retry never changes a
-   published digest; once published, the script only verifies and refuses mismatches.
+5. **Upload and download-verify the draft by release ID.** `deploy/update/publish-release.sh` takes
+   the numeric release ID (from Release Please's `upload_url` or the releases list), refuses a
+   published release, re-checks draft status before every asset mutation, uploads without a
+   clobber, downloads every asset again, checks `SHA256SUMS.txt`, and rejects unexpected assets.
+   Never use `releases/tags/<tag>` for a draft.
+6. **Publish the immutable release.** Only after step 5 and an explicit `gh attestation verify` for
+   both archives does the workflow publish that release ID. If the upload fails, the draft remains
+   unpublished and can be retried by the same release ID. A failed retry never changes a published
+   digest; once published, the script only verifies and refuses mismatches. Workflow concurrency
+   plus GitHub immutable releases are required; a human publishing at the same instant is an
+   unavoidable external race.
 7. **Promote the already-published bytes, separately.** `.github/workflows/promote-tuf.yml` starts
    on `release: published`, downloads the exact release assets, verifies `sha256sum -c`, validates
    both archives, verifies GitHub build provenance for the managed archive, and writes a promotion
@@ -59,25 +63,37 @@ Re-run the release workflow for the same draft tag:
 
 ```bash
 gh workflow run release-please.yml -f tag=v0.1.0 \
-  -f sha=<the exact 40-character release commit> -f publish=true
+  -f sha=<the exact 40-character release commit> \
+  -f release_id=<the numeric draft release ID> -f publish=true
 ```
 
-Release Please drafts do not create a git tag until publication, so a manual retry must name the
-exact commit if the draft API does not expose a 40-character `target_commitish`. The workflow
-refuses if the release is already published. To verify a draft without publishing, pass
-`-f publish=false`. Retrying rebuilds the assets, but `publish-release.sh` only replaces assets while
-the release is still a draft; a published release is never rewritten.
+Release Please drafts do not create a git tag until publication. A manual retry should provide the
+numeric draft release ID; if it is omitted, the workflow finds the draft by `tag_name` in the
+releases list (never `releases/tags`). It must name the exact commit if the draft does not expose a
+40-character `target_commitish`. The workflow refuses if the release is already published. To verify
+a draft without publishing, pass `-f publish=false`. Retrying rebuilds the assets, but
+`publish-release.sh` only replaces assets while the release is still a draft; a published release
+is never rewritten.
 
 ### Manual verification of a draft
 
+Find the draft's numeric ID from the releases list, then download by ID; drafts have no tag:
+
 ```bash
-gh release view v0.1.0 --json isDraft,tagName,assets
-gh release download v0.1.0 --pattern 'zerodeck-v0.1.0-linux-x86_64*' --dir verify
-gh release download v0.1.0 --pattern SHA256SUMS.txt --dir verify
-(cd verify && sha256sum -c SHA256SUMS.txt)
-just test-release-package verify/zerodeck-v0.1.0-linux-x86_64.tar.gz
-just test-release-package verify/zerodeck-v0.1.0-linux-x86_64.managed.tar.gz
-gh attestation verify verify/zerodeck-v0.1.0-linux-x86_64.managed.tar.gz --repo OWNER/zerodeck
+release_id="$(gh api 'repos/OWNER/zerodeck/releases?per_page=100' \
+  --jq '.[] | select(.tag_name == "v0.1.0" and .draft) | .id')"
+gh api "repos/OWNER/zerodeck/releases/${release_id}" --jq '{id,tag_name,draft,assets}'
+gh api "repos/OWNER/zerodeck/releases/${release_id}" \
+  --jq '.assets[] | "\(.id)\t\(.name)"' |
+while IFS=$'\t' read -r asset_id asset_name; do
+  gh api "repos/OWNER/zerodeck/releases/assets/${asset_id}" \
+    -H 'Accept: application/octet-stream' >"verify/${asset_name}"
+done
+just test-release-package verify/<downloaded-archive>
+gh attestation verify verify/zerodeck-v0.1.0-linux-x86_64.managed.tar.gz \
+  --repo OWNER/zerodeck \
+  --signer-workflow OWNER/zerodeck/.github/workflows/release-please.yml \
+  --source-digest <release-commit-sha> --source-ref refs/heads/main
 ```
 
 Do not publish until every command above succeeds and the source commit is the intended one.
@@ -86,7 +102,9 @@ Do not publish until every command above succeeds and the source commit is the i
 
 The TUF root and all signatures live in the external TUF-on-CI repository, never in this
 repository. This repository contains only the target template (`deploy/update/tuf/`), the
-validation/promotion script (`deploy/update/promote.sh`), and the request workflow.
+published-bytes/provenance verifier (`deploy/update/promote.sh`), and the request workflow. Signed
+metadata verification is performed by the external TUF-on-CI client, not by local signature
+counting or free-form "verified" records.
 
 | Role | Authority | Typical owner | Threshold | Recovery |
 |---|---|---|---|---|
@@ -107,11 +125,16 @@ The request workflow needs these repository settings:
 - variable `TUF_MIN_UPDATER` (optional, default `0.1.0`);
 - secret `TUF_PROMOTION_TOKEN` with permission to dispatch workflows/events in that repository.
 
-If either the repository or token is absent, the workflow fails instead of claiming success. The
-external TUF repository downloads the immutable release assets, runs
-`deploy/update/promote.sh` from the released tag, and signs the resulting target metadata.
+If either the repository or token is absent, the workflow fails instead of claiming success. There
+is deliberately **no local metadata acceptance** in this repository: `promote.sh` verifies the exact
+published archive and GitHub build provenance, then emits a target descriptor. The external
+TUF-on-CI repository is the trust boundary that loads its out-of-band root, verifies the signed
+root/targets/snapshot/timestamp metadata with a real TUF client (`tough` or equivalent), checks
+expiry, version monotonicity and the snapshot↔targets/timestamp↔snapshot hash chains, and only then
+serves the already-published bytes. Do not hand-roll signature parsing or fake "verified" records.
 
-Full promotion requires all of the following; any missing item is a hard failure:
+The request workflow runs this check; any missing digest, identity, provenance or channel assertion
+is a hard failure:
 
 ```bash
 bash deploy/update/promote.sh \
@@ -119,23 +142,16 @@ bash deploy/update/promote.sh \
   --sha256 <published-managed-sha256> \
   --tag v0.1.0 --version 0.1.0 --build-id v0.1.0-<commit-sha> \
   --channel stable --min-updater 0.1.0 \
-  --trusted-root root.json --trusted-root-sha256 <out-of-band-root-sha256> \
-  --attestation attestation.json \
-  --metadata-dir signed-metadata/ --output staged-tuf/
+  --repository OWNER/zerodeck --source-sha <release-commit-sha> \
+  --signer-workflow OWNER/zerodeck/.github/workflows/release-please.yml \
+  --source-ref refs/heads/main
 ```
 
-`signed-metadata/` must contain `root.json`, `targets.json`, `snapshot.json` and
-`timestamp.json`. `promote.sh` checks that they are present, unexpired, signed by key IDs with the
-required threshold in the trusted root, and that the targets entry names the exact target path with
-the published SHA-256, length, channel, version, build ID and minimum updater version. It copies
-the already-published archive into `staged-tuf/targets/linux-x86_64/zerodeck-<version>.tar.gz` and
-the signed metadata into `staged-tuf/metadata/`, and refuses to overwrite a different staged digest.
-It never creates a signature.
-
-`--verify-only` prints the target descriptor without requiring signed metadata; it is how the
-request workflow renders the external signer's input. Stable clients continue to resolve the
-previous target until the new `targets.json`, `snapshot.json`, and `timestamp.json` are signed and
-served together with the exact staged bytes.
+`promote.sh` runs `gh attestation verify` with that exact repository, signer workflow, source
+commit, source ref and artifact digest, and rejects prerelease versions on Stable. The external
+signer repeats or independently verifies provenance and then validates the signed metadata. Stable
+clients continue to resolve the previous target until the new `targets.json`, `snapshot.json`, and
+`timestamp.json` are signed and served together with the exact published bytes.
 
 Publish metadata in this order: root update (only during rotation), targets, snapshot, timestamp.
 A failure before timestamp leaves clients on the previous, still-valid authorization. An expired
@@ -200,11 +216,14 @@ A pending activation blocks controller replacement: the helper uses the new cont
 sudo ./bootstrap.sh ... --import-inactive-decky /path/to/inactive/homebrew --start
 ```
 
-The source must not have an active Decky service, and the target data directory must be empty; the
-helper copies with `cp -a` without changing ownership and never writes into an existing plugin
-tree. It records `state/import.json` with `root_plugins: "blocked"`. Imported code is not promoted
-into a root-controlled tree, is not chowned to root, and any root plugin must be installed
-explicitly with a verified package before it can be trusted. There is no implicit trust-on-import.
+The source must not have an active Decky service, and the helper never writes into
+`/home/deck/homebrew`. It copies the tree with `cp -a` into a root-only staging directory
+(`/var/lib/zerodeck/import/decky-<timestamp>-<pid>/`, mode `0700`) and records `state/import.json`
+with the staged path, `root_plugins: "blocked"`, `activated: false`, and the expected host data
+root. Imported code is not on any plugin search path and cannot be activated implicitly; review the
+staged copy and install individual plugins with a verified package before adopting them. The host
+data root is left untouched, so the unprivileged plugin process never receives a root-owned
+`0700` home. There is no implicit trust-on-import.
 
 ### Recovery of a failed conversion
 
@@ -239,15 +258,19 @@ Run the following in a fork or staging repository; never use production signing 
 - **Staging release:** create a draft, build from an exact commit, package by image digest, run the
   package test, upload/verify twice, publish once. Record the asset digests and attestation output.
 - **Retry:** inject an upload failure (the local `deploy/update/tests/publish.sh` does this), confirm
-  the draft remains unpublished, retry the same tag, and confirm the published digest never changes.
-- **Expiry:** use short-lived staging metadata; confirm `zerodeckctl update` fails closed after
-  expiry while `rollback` still works offline from a retained generation.
-- **Rotation:** add a new root key and re-sign root/targets/snapshot/timestamp in staging; confirm an
-  installed client accepts the root chain update, keeps its metadata history, and rejects an old or
-  unknown root. Record the out-of-band root fingerprint transition.
-- **Promotion failure:** leave the signed targets entry absent or mismatched; confirm
-  `promote.sh` refuses and Stable still resolves to the previous target digest.
+  the draft remains unpublished, retry the same release ID, and confirm the published digest never
+  changes.
+- **Expiry:** use short-lived staging metadata; confirm the external TUF client and
+  `zerodeckctl update` fail closed after expiry while `rollback` still works offline from a retained
+  generation.
+- **Rotation:** add a new root key and re-sign root/targets/snapshot/timestamp in the external TUF
+  repository; confirm an installed client accepts the root chain update, keeps its metadata history,
+  and rejects an old or unknown root. Record the out-of-band root fingerprint transition.
+- **Promotion failure:** leave the signed targets entry absent or mismatched; confirm the external
+  TUF client refuses to serve it and Stable still resolves to the previous target digest. Do not
+  accept locally fabricated signature records in this repository.
 
-The local shell tests exercise the refusal/retry/expiry/rotation boundary logic without keys:
-`deploy/update/tests/{bootstrap,publish,promotion}.sh`. Hardware evidence is recorded in
+The local shell tests exercise bootstrap refusal/conversion/import, release-ID upload retry and
+provenance/descriptor refusal without keys: `deploy/update/tests/{bootstrap,publish,promotion}.sh`.
+Rust catalog tests cover TUF expiry/rotation/selection. Hardware evidence is recorded in
 `deploy/update/COMPATIBILITY.md`.

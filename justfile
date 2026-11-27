@@ -242,6 +242,7 @@ _test-privileged:
 
 [private]
 _release-scripts:
+    bash deploy/update/tests/release-fixture.sh
     bash deploy/update/tests/bootstrap.sh
     bash deploy/update/tests/publish.sh
     bash deploy/update/tests/promotion.sh

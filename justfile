@@ -227,7 +227,11 @@ verify-managed-image image archive:
     generation="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-managed.XXXXXX")"
     trap 'rm -rf "${generation}"' EXIT
     tar -xzf "{{ archive }}" -C "${generation}"
-    docker run --rm --platform linux/amd64 -v "${generation}:/generation:ro" \
+    # The runtime image runs as an unprivileged user; mktemp creates 0700 and the
+    # container must be able to traverse the bind mount to execute the packaged daemon.
+    chmod -R a+rX "${generation}"
+    image_arch="$(docker image inspect '{{ image }}' | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["Architecture"])')"
+    docker run --rm --platform "linux/${image_arch}" -v "${generation}:/generation:ro" \
         -e UNPRIVILEGED_PATH=/homebrew -e PRIVILEGED_PATH=/homebrew -e PYTHONPATH= \
         --entrypoint /generation/bin/zerodeckd "{{ image }}" \
         --managed-generation /generation --check-config
@@ -290,7 +294,7 @@ _release-scripts:
 _test-updater-vm-ci image ssh_key ssh_user manual managed:
     #!/usr/bin/env bash
     set +e
-    just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}"
+    just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}" "-"
     status=$?
     set -e
     if [[ "${status}" -eq 0 ]]; then

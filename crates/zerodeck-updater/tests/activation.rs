@@ -555,7 +555,7 @@ impl Harness {
 
     async fn apply(&self) -> Result<(), UpdateError> {
         let catalog = self.catalog();
-        apply_pending(&self.store, &self.state, &catalog, &self.service).await
+        retry_busy(|| apply_pending(&self.store, &self.state, &catalog, &self.service)).await
     }
 
     async fn apply_enqueue_start(
@@ -563,7 +563,7 @@ impl Harness {
         release: &AuthorizedRelease,
         expected: Option<GenerationId>,
     ) -> Result<UpgradeOutcome, UpdateError> {
-        enqueue_upgrade(&self.store, &self.state, &self.service, true)
+        retry_busy(|| enqueue_upgrade(&self.store, &self.state, &self.service, true))
             .await
             .inspect(|outcome| {
                 if let UpgradeOutcome::Requested { request } = outcome {
@@ -571,6 +571,28 @@ impl Harness {
                     assert_eq!(request.generation, release.digest);
                 }
             })
+    }
+}
+
+/// Retries an operation that reports `Busy` for a moment.
+///
+/// Other tests in this binary spawn `zerodeckctl`; between `fork` and `exec` the child briefly holds
+/// a copy of every open descriptor, including another test's maintenance lock, so a lock that was
+/// already released can still look held. Real callers wait on the lock (`apply_waiting_for_lock`).
+async fn retry_busy<T, F, Fut>(mut operation: F) -> Result<T, UpdateError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, UpdateError>>,
+{
+    let mut attempts = 0;
+    loop {
+        match operation().await {
+            Err(UpdateError::Busy) if attempts < 100 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => return other,
+        }
     }
 }
 

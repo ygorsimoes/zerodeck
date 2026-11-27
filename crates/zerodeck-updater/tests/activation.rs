@@ -2559,6 +2559,30 @@ async fn rollback_succeeds_with_corrupt_catalog_state_and_rejects_start_requests
     );
 }
 
+#[tokio::test]
+async fn rollback_ignores_the_clock_floor_and_expired_authorization() {
+    let harness = Harness::new("rollback-clock-floor").await;
+    let (target, _) = harness.add_generation('a', "1.0.0", "build-old");
+    let (current, release) = harness.add_generation('b', "2.0.0", "build-new");
+    harness.store.switch_to(&current).expect("activate current");
+    harness.write_state(&UpdateState {
+        last_confirmed: Some(current.clone()),
+        rollback_target: Some(target.clone()),
+        ..UpdateState::new()
+    });
+    harness.set_running(true);
+    // The verification floor is in the far future and the authorization is long expired: the
+    // operator's clock is wrong, which is exactly when an offline rollback has to keep working.
+    harness.set_catalog(release, u64::MAX / 2, u64::MAX / 2 + 1);
+
+    enqueue_rollback(&harness.store, &harness.state).expect("enqueue offline rollback");
+    harness
+        .apply()
+        .await
+        .expect("rollback must not depend on the clock or the catalog");
+    assert_eq!(harness.current(), Some(target));
+}
+
 #[test]
 fn systemd_units_do_not_pull_boot_recovery_from_the_daemon() {
     let units = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/systemd");

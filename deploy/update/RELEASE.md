@@ -304,9 +304,11 @@ sudo zerodeckctl unquarantine <generation-digest>  # only after review
 
 A terminal pre-intent apply failure (stale request, quarantined candidate, missing generation,
 authorization expired/superseded, stopped service without `--start`, or a malformed request)
-removes its own request so later upgrades are not wedged. Transient failures such as a held
-maintenance lock are retried by the apply unit with bounded backoff. If a request remains after an
-interrupted helper, run `sudo systemctl start zerodeck-apply.service` to retry it, or
+removes its own request so later upgrades are not wedged. That includes a maintenance lock that
+stays held for the whole wait: the request is discarded (the reason is in
+`journalctl -u zerodeck-apply.service`) and `sudo zerodeckctl upgrade` must be run again. If a
+request remains after an interrupted helper, run `sudo systemctl start zerodeck-apply.service` to
+retry it, or
 `sudo zerodeckctl recover --discard-request` after confirming no apply is running. The updater
 rechecks the persisted selection channel, the signed release channel, the installed version and
 `min_updater` under the exclusive lock; Stable refuses a Testing selection, a downgrade, a reused

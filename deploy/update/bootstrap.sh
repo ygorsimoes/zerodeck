@@ -811,12 +811,15 @@ install_keep_list() {
             echo "/etc/systemd/system/${unit}"
         done
         echo "/etc/systemd/system/*.wants/zerodeck*"
+        echo "/etc/systemd/system/zerodeck*.service.d/*"
+        echo "/etc/zerodeck/trusted-root.json"
+        echo "/etc/zerodeck/update.env"
         echo "/etc/atomic-update.conf.d/zerodeck.conf"
-    } >"${staged}"
-    chmod 0644 "${staged}"
-    mv "${staged}" "${keep_list_dir}/zerodeck.conf"
+    } >"${staged}" || return 1
+    chmod 0644 "${staged}" || return 1
+    mv "${staged}" "${keep_list_dir}/zerodeck.conf" || return 1
     if [[ "$(id -u)" -eq 0 ]]; then
-        chown root:root "${keep_list_dir}/zerodeck.conf"
+        chown root:root "${keep_list_dir}/zerodeck.conf" || return 1
     fi
 }
 

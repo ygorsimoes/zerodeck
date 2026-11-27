@@ -2693,3 +2693,30 @@ fn apply_unit_timeout_covers_the_worst_case_budget() {
     );
     assert!(seconds("TimeoutStopSec=") >= budget);
 }
+
+#[test]
+fn update_sweeps_staging_left_by_a_killed_run() {
+    use std::process::Command;
+
+    let dir = TestDir::new("sweep-on-update");
+    let root = &dir.0;
+    let store = GenerationStore::new(root).expect("open store");
+    let leftover = store
+        .generation_dir(&generation_id('a'))
+        .with_file_name(".staging-killed");
+    fs::create_dir_all(leftover.join("tree")).expect("plant interrupted staging");
+
+    // No update settings exist, so the run fails after taking the lock; it must still sweep.
+    let output = Command::new(env!("CARGO_BIN_EXE_zerodeckctl"))
+        .args(["--root"])
+        .arg(root)
+        .arg("update")
+        .env_remove("ZERODECK_UPDATE_METADATA_URL")
+        .output()
+        .expect("run update");
+    assert!(!output.status.success());
+    assert!(
+        !leftover.exists(),
+        "a killed update's staging must be swept by the next run"
+    );
+}

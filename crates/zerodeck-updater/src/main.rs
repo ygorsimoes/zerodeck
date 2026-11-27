@@ -202,6 +202,9 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     // `Catalog::load` updates the persisted verification floor even for `--check-only`; take the
     // exclusive guard so two updates cannot interleave their catalog-state writes.
     let _guard = acquire_maintenance_exclusive(&store)?;
+    // A previous run killed mid-download (SIGINT, OOM, power loss) leaves its staging tree behind;
+    // every update holds this lock, so nothing else can be staging right now.
+    store.sweep()?;
 
     let installed = installed_release(&store);
     let metadata_url = environment_url("ZERODECK_UPDATE_METADATA_URL")?;

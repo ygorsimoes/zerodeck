@@ -449,6 +449,9 @@ for entry in \
     /etc/systemd/system/zerodeck-check.service \
     /etc/systemd/system/zerodeck-check.timer \
     '/etc/systemd/system/*.wants/zerodeck*' \
+    '/etc/systemd/system/zerodeck*.service.d/*' \
+    /etc/zerodeck/trusted-root.json \
+    /etc/zerodeck/update.env \
     /etc/atomic-update.conf.d/zerodeck.conf; do
     grep -qxF "${entry}" "${keep_file}" || {
         echo "keep-list is missing ${entry}" >&2; cat "${keep_file}" >&2; exit 1;

@@ -144,7 +144,27 @@ fn inspect(path: &Path) -> Result<Option<fs::Metadata>, LayoutError> {
     }
 }
 
+/// Every component below `root` must be a real directory, so an entry such as `bin/zerodeckd`
+/// cannot be redirected outside the generation through a symlinked parent.
+fn ensure_real_parents(root: &Path, relative: &'static str) -> Result<(), LayoutError> {
+    let mut current = root.to_path_buf();
+    let mut parts = relative.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        current.push(part);
+        match inspect(&current)? {
+            Some(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            None => return Ok(()),
+            Some(_) => return Err(LayoutError::BadEntry(relative)),
+        }
+    }
+    Ok(())
+}
+
 fn regular_file(root: &Path, relative: &'static str) -> Result<Option<PathBuf>, LayoutError> {
+    ensure_real_parents(root, relative)?;
     let path = root.join(relative);
     match inspect(&path)? {
         None => Ok(None),
@@ -246,6 +266,23 @@ mod tests {
             GenerationLayout::open(tree.path()),
             Err(LayoutError::BadEntry("python"))
         ));
+    }
+
+    #[test]
+    fn open_rejects_symlinked_bin_dir() {
+        let tree = Tree::new();
+        let outside = std::env::temp_dir().join(format!("zerodeck-outside-{}", Uuid::new_v4()));
+        fs::create_dir_all(&outside).expect("outside");
+        fs::rename(tree.path().join("bin/zerodeckd"), outside.join("zerodeckd")).expect("move");
+        fs::remove_dir(tree.path().join("bin")).expect("remove bin");
+        symlink(&outside, tree.path().join("bin")).expect("link bin outside");
+
+        let result = GenerationLayout::open(tree.path());
+        let _ = fs::remove_dir_all(&outside);
+        assert!(
+            matches!(result, Err(LayoutError::BadEntry(_))),
+            "{result:?}"
+        );
     }
 
     #[test]

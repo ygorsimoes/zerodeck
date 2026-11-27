@@ -168,6 +168,17 @@ impl Systemctl for TokioSystemctl {
 
     fn start<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
         Box::pin(async move {
+            // A candidate that crashes on start is restarted by systemd until its start limit
+            // trips; the unit then refuses every later start, including the revert to the
+            // previous generation. Clear that state before starting; failure here is harmless
+            // because a unit with no recorded failure has nothing to reset.
+            let _ = run_systemctl(
+                unit,
+                "reset-failed",
+                &["reset-failed"],
+                SYSTEMCTL_STOP_TIMEOUT,
+            )
+            .await;
             // Readiness is owned by `verify_ready`; do not let systemd's default start timeout
             // outlive the activation deadline.
             let output = run_systemctl(

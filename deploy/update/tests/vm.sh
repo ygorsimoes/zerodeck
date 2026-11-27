@@ -455,6 +455,12 @@ stop_qemu() {
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
+    if [[ "${status}" != "0" ]] && qemu_alive; then
+        # Leave the guest's view of the failure in the log; best effort, bounded.
+        printf '[vm] guest journal after the failure:\n' >&2
+        guest_root_cmd journalctl --no-pager -n 60 -u zerodeck.service -u zerodeck-apply.service \
+            -u zerodeck-recovery.service >&2 2>&1 || true
+    fi
     if qemu_alive; then
         kill -TERM "${qemu_pid}" 2>/dev/null || true
         local deadline=$((SECONDS + 10))

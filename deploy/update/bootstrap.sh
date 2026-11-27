@@ -114,7 +114,11 @@ done
 [[ -f "${package}" ]] || die "package not found: ${package}"
 [[ -f "${generation}" ]] || die "managed generation not found: ${generation}"
 [[ -f "${trusted_root}" ]] || die "trusted root not found: ${trusted_root}"
-[[ -x "${systemctl}" ]] || die "systemctl not executable: ${systemctl}"
+if [[ "${systemctl}" == */* ]]; then
+    [[ -x "${systemctl}" ]] || die "systemctl not executable: ${systemctl}"
+else
+    command -v "${systemctl}" >/dev/null 2>&1 || die "systemctl not executable: ${systemctl}"
+fi
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 if [[ -n "${metadata_url}" && ! "${metadata_url}" =~ ^https?:// ]]; then
     die "--metadata-url must be an http(s) URL"

@@ -1,0 +1,18 @@
+[Unit]
+Description=ZeroDeck managed loader activation
+After=local-fs.target
+ConditionPathExists=/home/.zerodeck
+
+[Service]
+Type=oneshot
+User=root
+# Worst case is a failed candidate followed by a full revert: 2 x (30 s stop + 10 s start + 60 s
+# readiness) + 30 s bookkeeping = 230 s. `zerodeck_updater::APPLY_BUDGET` owns that figure and a
+# test fails if these timeouts drop below it.
+TimeoutStartSec=240
+TimeoutStopSec=240
+ExecStart=/home/.zerodeck/bin/zerodeckctl apply --root /home/.zerodeck
+# Runs after the apply process exits, whether it succeeded, failed, or was killed. The helper waits
+# for the maintenance lock instead of stealing it and only restarts a daemon that was recorded as
+# running before the failed apply.
+ExecStopPost=/home/.zerodeck/bin/zerodeckctl recover-after-apply --root /home/.zerodeck

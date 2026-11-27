@@ -1,0 +1,1069 @@
+//! Archive staging, extraction, limits, and cache-reuse fault tests.
+
+#![cfg(unix)]
+
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use semver::Version;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tar::{Builder, EntryType, Header};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use url::Url;
+use zerodeck_core::{CheckedHttpClient, ExtractLimits, OutboundHttpPolicy};
+use zerodeck_updater::{
+    AuthorizedRelease, Channel, GenerationId, GenerationStore, StageFault, StageLimits,
+    UpdateError, stage_release_with,
+};
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "zerodeck-stage-{label}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("create temp test dir");
+        Self(path)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn generation_id(fill: char) -> GenerationId {
+    GenerationId::new(fill.to_string().repeat(64)).expect("valid generation id")
+}
+
+fn generation_entries(generations: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(generations)
+        .expect("read generations")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn setup_store(label: &str) -> (TestDir, GenerationStore, GenerationId) {
+    let dir = TestDir::new(label);
+    let store = GenerationStore::new(&dir.0).expect("open generation store");
+    let active = generation_id('a');
+    fs::create_dir(store.generation_dir(&active)).expect("create active generation");
+    store.switch_to(&active).expect("activate generation");
+    (dir, store, active)
+}
+
+fn manifest(version: &str, build_id: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema": 1,
+        "build_id": build_id,
+        "version": version,
+    }))
+    .expect("serialize release manifest")
+}
+
+fn pax_record(key: &str, value: &str) -> Vec<u8> {
+    let body = format!("{key}={value}\n");
+    let mut length = body.len() + 2;
+    loop {
+        let actual = length.to_string().len() + 1 + body.len();
+        if actual == length {
+            break;
+        }
+        length = actual;
+    }
+    format!("{length} {body}").into_bytes()
+}
+
+enum ArchiveEntry<'a> {
+    File {
+        path: &'a str,
+        data: &'a [u8],
+        mode: u32,
+    },
+    Directory {
+        path: &'a str,
+    },
+    Symlink {
+        path: &'a str,
+        target: &'a str,
+    },
+    Hardlink {
+        path: &'a str,
+        target: &'a str,
+    },
+    Pax {
+        data: &'a [u8],
+    },
+    GnuLongName {
+        data: &'a [u8],
+    },
+    FileWithHeaderSize {
+        path: &'a str,
+        data: &'a [u8],
+        header_size: u64,
+        mode: u32,
+    },
+    RawFile {
+        raw_path: &'a [u8],
+        data: &'a [u8],
+    },
+}
+
+fn build_archive(entries: &[ArchiveEntry<'_>]) -> Vec<u8> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    for entry in entries {
+        match entry {
+            ArchiveEntry::File { path, data, mode } => {
+                let mut header = Header::new_gnu();
+                header.set_size(u64::try_from(data.len()).expect("file size"));
+                header.set_mode(*mode);
+                header.set_entry_type(EntryType::Regular);
+                builder
+                    .append_data(&mut header, path, *data)
+                    .expect("append file");
+            }
+            ArchiveEntry::Directory { path } => {
+                let mut header = Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_entry_type(EntryType::Directory);
+                builder
+                    .append_data(&mut header, path, io::empty())
+                    .expect("append directory");
+            }
+            ArchiveEntry::Symlink { path, target } => {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                builder
+                    .append_link(&mut header, path, target)
+                    .expect("append symlink");
+            }
+            ArchiveEntry::Hardlink { path, target } => {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::Link);
+                header.set_size(0);
+                header.set_mode(0o644);
+                builder
+                    .append_link(&mut header, path, target)
+                    .expect("append hardlink");
+            }
+            ArchiveEntry::Pax { data } => {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::XHeader);
+                header.set_size(u64::try_from(data.len()).expect("pax size"));
+                header.set_mode(0o644);
+                header.as_old_mut().name[..3].copy_from_slice(b"pax");
+                header.set_cksum();
+                builder.append(&header, *data).expect("append pax header");
+            }
+            ArchiveEntry::GnuLongName { data } => {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::GNULongName);
+                header.set_size(u64::try_from(data.len()).expect("long name size"));
+                header.set_mode(0o644);
+                header.as_old_mut().name[..8].copy_from_slice(b"longname");
+                header.set_cksum();
+                builder
+                    .append(&header, *data)
+                    .expect("append GNU long name");
+            }
+            ArchiveEntry::FileWithHeaderSize {
+                path,
+                data,
+                header_size,
+                mode,
+            } => {
+                let mut header = Header::new_gnu();
+                header.set_size(*header_size);
+                header.set_mode(*mode);
+                header.set_entry_type(EntryType::Regular);
+                builder
+                    .append_data(&mut header, path, *data)
+                    .expect("append file with explicit header size");
+            }
+            ArchiveEntry::RawFile { raw_path, data } => {
+                let mut header = Header::new_gnu();
+                header.set_size(u64::try_from(data.len()).expect("file size"));
+                header.set_mode(0o644);
+                header.set_entry_type(EntryType::Regular);
+                header.as_old_mut().name[..raw_path.len()].copy_from_slice(raw_path);
+                header.set_cksum();
+                builder.append(&header, *data).expect("append raw file");
+            }
+        }
+    }
+    builder.finish().expect("finish archive");
+    builder
+        .into_inner()
+        .expect("finish gzip stream")
+        .finish()
+        .expect("finish gzip encoder")
+}
+
+fn release_for(bytes: &[u8], url: Url) -> AuthorizedRelease {
+    AuthorizedRelease {
+        channel: Channel::Stable,
+        version: Version::parse("0.1.2").expect("parse release version"),
+        digest: GenerationId::new(hex::encode(Sha256::digest(bytes))).expect("archive digest"),
+        size: u64::try_from(bytes.len()).expect("archive size"),
+        build_id: "build-42".to_owned(),
+        min_updater: Version::parse("0.1.0").expect("parse minimum updater"),
+        target: "linux-x86_64/zerodeck-0.1.2.tar.gz".to_owned(),
+        url: Some(url),
+    }
+}
+
+struct MockServer {
+    port: u16,
+    hits: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl MockServer {
+    async fn start(body: Vec<u8>, truncate: bool) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind archive server");
+        let port = listener.local_addr().expect("server address").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 2048];
+                let _ = socket.read(&mut request).await;
+                let shared = if truncate {
+                    &body[..body.len() / 2]
+                } else {
+                    &body[..]
+                };
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(shared);
+                let _ = socket.write_all(&response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        Self { port, hits, task }
+    }
+
+    fn url(&self) -> Url {
+        Url::parse(&format!(
+            "http://127.0.0.1:{}/linux-x86_64/zerodeck-0.1.2.tar.gz",
+            self.port
+        ))
+        .expect("archive url")
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn client_for(server: &MockServer) -> CheckedHttpClient {
+    OutboundHttpPolicy::for_loopback_ports_for_testing(vec![server.port])
+        .with_timeouts(Some(Duration::from_secs(5)), Some(Duration::from_secs(30)))
+        .build_checked_client()
+        .expect("build checked HTTP client")
+}
+
+struct NoFault;
+
+impl StageFault for NoFault {}
+
+struct EnospcFault;
+
+impl StageFault for EnospcFault {
+    fn before_write(&self, _path: &Path, _bytes: usize) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(28))
+    }
+}
+
+fn assert_only_active(store: &GenerationStore, active: &GenerationId) {
+    let generations = store
+        .generation_dir(active)
+        .parent()
+        .expect("generations directory")
+        .to_path_buf();
+    assert_eq!(
+        generation_entries(&generations),
+        vec![active.to_string()],
+        "failed staging must not create or promote a generation"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn stage_keeps_current_on_truncation_limit_or_bad_digest() {
+    let manifest_bytes = manifest("0.1.2", "build-42");
+    let valid_entries = [
+        ArchiveEntry::Directory { path: "bin" },
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"#!/bin/sh\nexit 0\n",
+            mode: 0o755,
+        },
+        ArchiveEntry::File {
+            path: "python/host.py",
+            data: b"import sys\n",
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "frontend/index.js",
+            data: b"console.log('zerodeck');\n",
+            mode: 0o644,
+        },
+    ];
+    let valid_archive = build_archive(&valid_entries);
+
+    let (valid_dir, valid_store, active) = setup_store("valid");
+    let valid_server = MockServer::start(valid_archive.clone(), false).await;
+    let valid_client = client_for(&valid_server);
+    let release = release_for(&valid_archive, valid_server.url());
+    let digest = stage_release_with(
+        &release,
+        &valid_store,
+        &valid_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect("stage a valid release");
+    assert_eq!(digest, release.digest);
+    assert_eq!(
+        valid_store.current().expect("read active generation"),
+        Some(active.clone()),
+        "staging must not change the active reference"
+    );
+    let generation = valid_store.generation_dir(&digest);
+    assert!(generation.join("release.json").is_file());
+    assert!(generation.join("bin/zerodeckd").is_file());
+    assert!(generation.join("python/host.py").is_file());
+    assert!(generation.join("frontend/index.js").is_file());
+    assert_eq!(
+        fs::metadata(generation.join("bin/zerodeckd"))
+            .expect("stat executable")
+            .mode()
+            & 0o777,
+        0o755
+    );
+
+    let marker = generation.join("cache-hit-marker");
+    fs::write(&marker, b"keep").expect("write cache marker");
+    let metadata = fs::metadata(&generation).expect("generation metadata");
+    let hits_before = valid_server.hits();
+    let reused = stage_release_with(
+        &release,
+        &valid_store,
+        &valid_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect("reuse a complete cached generation");
+    assert_eq!(reused, digest);
+    assert_eq!(
+        valid_server.hits(),
+        hits_before,
+        "a complete cache hit must not download again"
+    );
+    let after = fs::metadata(&generation).expect("generation metadata after cache hit");
+    assert_eq!(
+        after.ino(),
+        metadata.ino(),
+        "cache hit must not rewrite the generation"
+    );
+    assert_eq!(
+        fs::read(&marker).expect("read cache marker"),
+        b"keep",
+        "cache hit must not replace generation contents"
+    );
+    assert!(
+        !valid_dir.0.join("release.json").exists(),
+        "staging must never write outside the generation root"
+    );
+
+    let (bad_digest_dir, bad_digest_store, bad_digest_active) = setup_store("bad-digest");
+    let bad_digest_server = MockServer::start(valid_archive.clone(), false).await;
+    let bad_digest_client = client_for(&bad_digest_server);
+    let mut bad_digest = release_for(&valid_archive, bad_digest_server.url());
+    bad_digest.digest = generation_id('0');
+    let err = stage_release_with(
+        &bad_digest,
+        &bad_digest_store,
+        &bad_digest_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a bad archive digest must fail before extraction");
+    assert!(
+        matches!(err, UpdateError::DigestMismatch { .. }),
+        "unexpected bad-digest error: {err:?}"
+    );
+    assert_eq!(
+        bad_digest_store.current().expect("read active generation"),
+        Some(bad_digest_active.clone())
+    );
+    assert_only_active(&bad_digest_store, &bad_digest_active);
+    assert!(!bad_digest_dir.0.join("tree").exists());
+
+    let (truncated_dir, truncated_store, truncated_active) = setup_store("truncated");
+    let truncated_server = MockServer::start(valid_archive.clone(), true).await;
+    let truncated_client = client_for(&truncated_server);
+    let truncated = release_for(&valid_archive, truncated_server.url());
+    let err = stage_release_with(
+        &truncated,
+        &truncated_store,
+        &truncated_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a truncated download must fail");
+    assert!(
+        matches!(
+            err,
+            UpdateError::Download { .. } | UpdateError::SizeMismatch { .. }
+        ),
+        "unexpected truncation error: {err:?}"
+    );
+    assert_eq!(
+        truncated_store.current().expect("read active generation"),
+        Some(truncated_active.clone())
+    );
+    assert_only_active(&truncated_store, &truncated_active);
+    assert!(!truncated_dir.0.join("tree").exists());
+
+    let escape_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::RawFile {
+            raw_path: b"../zerodeck-escape.txt",
+            data: b"escape",
+        },
+    ]);
+    let (escape_dir, escape_store, escape_active) = setup_store("escape");
+    let escape_server = MockServer::start(escape_archive.clone(), false).await;
+    let escape_client = client_for(&escape_server);
+    let escape = release_for(&escape_archive, escape_server.url());
+    let err = stage_release_with(
+        &escape,
+        &escape_store,
+        &escape_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a parent-traversal archive entry must be rejected");
+    assert!(
+        matches!(err, UpdateError::UnsafeArchiveEntry { .. }),
+        "unexpected path error: {err:?}"
+    );
+    assert_eq!(
+        escape_store.current().expect("read active generation"),
+        Some(escape_active.clone())
+    );
+    assert_only_active(&escape_store, &escape_active);
+    assert!(!escape_dir.0.join("zerodeck-escape.txt").exists());
+    assert!(
+        !escape_dir
+            .0
+            .join("generations/zerodeck-escape.txt")
+            .exists()
+    );
+
+    let link_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Symlink {
+            path: "passwd",
+            target: "/etc/passwd",
+        },
+    ]);
+    let (_link_dir, link_store, link_active) = setup_store("link");
+    let link_server = MockServer::start(link_archive.clone(), false).await;
+    let link_client = client_for(&link_server);
+    let link = release_for(&link_archive, link_server.url());
+    let err = stage_release_with(
+        &link,
+        &link_store,
+        &link_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a symlink entry must be rejected");
+    assert!(
+        matches!(err, UpdateError::UnsafeArchiveEntry { .. }),
+        "unexpected link error: {err:?}"
+    );
+    assert_only_active(&link_store, &link_active);
+
+    let hardlink_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Hardlink {
+            path: "hardlink",
+            target: "release.json",
+        },
+    ]);
+    let (_hardlink_dir, hardlink_store, hardlink_active) = setup_store("hardlink");
+    let hardlink_server = MockServer::start(hardlink_archive.clone(), false).await;
+    let hardlink_client = client_for(&hardlink_server);
+    let hardlink = release_for(&hardlink_archive, hardlink_server.url());
+    let err = stage_release_with(
+        &hardlink,
+        &hardlink_store,
+        &hardlink_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a hardlink entry must be rejected");
+    assert!(
+        matches!(err, UpdateError::UnsafeArchiveEntry { .. }),
+        "unexpected hardlink error: {err:?}"
+    );
+    assert_only_active(&hardlink_store, &hardlink_active);
+
+    let duplicate_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"first",
+            mode: 0o755,
+        },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"second",
+            mode: 0o755,
+        },
+    ]);
+    let (_duplicate_dir, duplicate_store, duplicate_active) = setup_store("duplicate");
+    let duplicate_server = MockServer::start(duplicate_archive.clone(), false).await;
+    let duplicate_client = client_for(&duplicate_server);
+    let duplicate = release_for(&duplicate_archive, duplicate_server.url());
+    let err = stage_release_with(
+        &duplicate,
+        &duplicate_store,
+        &duplicate_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a duplicate archive entry must be rejected");
+    assert!(
+        matches!(err, UpdateError::DuplicateArchiveEntry { .. }),
+        "unexpected duplicate error: {err:?}"
+    );
+    assert_only_active(&duplicate_store, &duplicate_active);
+
+    let large_data = vec![b'x'; 4096];
+    let limit_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "large.bin",
+            data: &large_data,
+            mode: 0o644,
+        },
+    ]);
+    let (_limit_dir, limit_store, limit_active) = setup_store("limit");
+    let limit_server = MockServer::start(limit_archive.clone(), false).await;
+    let limit_client = client_for(&limit_server);
+    let limit = release_for(&limit_archive, limit_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024,
+            max_entries: 32,
+        },
+        ..StageLimits::default()
+    };
+    let err = stage_release_with(&limit, &limit_store, &limit_client, limits, &NoFault)
+        .await
+        .expect_err("an over-limit archive must be rejected");
+    assert!(
+        matches!(err, UpdateError::ArchiveExpandedTooLarge { .. }),
+        "unexpected limit error: {err:?}"
+    );
+    assert_only_active(&limit_store, &limit_active);
+
+    let (_entry_limit_dir, entry_limit_store, entry_limit_active) = setup_store("entry-limit");
+    let entry_limit_server = MockServer::start(valid_archive.clone(), false).await;
+    let entry_limit_client = client_for(&entry_limit_server);
+    let entry_limit = release_for(&valid_archive, entry_limit_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024 * 1024,
+            max_entries: 1,
+        },
+        ..StageLimits::default()
+    };
+    let err = stage_release_with(
+        &entry_limit,
+        &entry_limit_store,
+        &entry_limit_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("an entry-count limit must be enforced");
+    assert!(
+        matches!(err, UpdateError::TooManyArchiveEntries { limit: 1 }),
+        "unexpected entry-limit error: {err:?}"
+    );
+    assert_only_active(&entry_limit_store, &entry_limit_active);
+
+    let pax_size_record = pax_record("size", "2048");
+    let pax_sized_payload = vec![b'z'; 2048];
+    let pax_size_archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Pax {
+            data: &pax_size_record,
+        },
+        ArchiveEntry::FileWithHeaderSize {
+            path: "pax-sized.bin",
+            data: &pax_sized_payload,
+            header_size: 4,
+            mode: 0o644,
+        },
+    ]);
+    let (_pax_size_dir, pax_size_store, pax_size_active) = setup_store("pax-size");
+    let pax_size_server = MockServer::start(pax_size_archive.clone(), false).await;
+    let pax_size_client = client_for(&pax_size_server);
+    let pax_size = release_for(&pax_size_archive, pax_size_server.url());
+    let pax_size_digest = stage_release_with(
+        &pax_size,
+        &pax_size_store,
+        &pax_size_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect("a pax size larger than the header size must be accounted for");
+    assert_eq!(
+        pax_size_store.current().expect("read active generation"),
+        Some(pax_size_active.clone())
+    );
+    let pax_sized_file = pax_size_store
+        .generation_dir(&pax_size_digest)
+        .join("pax-sized.bin");
+    assert_eq!(
+        fs::metadata(&pax_sized_file)
+            .expect("stat pax-sized file")
+            .len(),
+        2048,
+        "the effective pax size, not the ustar header size, must bound the extracted file"
+    );
+    assert_eq!(
+        fs::read(&pax_sized_file).expect("read pax-sized file"),
+        pax_sized_payload
+    );
+
+    let large_pax = pax_record("comment", &"x".repeat(2048));
+    let large_pax_archive = build_archive(&[
+        ArchiveEntry::Pax { data: &large_pax },
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+    ]);
+    let (_large_pax_dir, large_pax_store, large_pax_active) = setup_store("large-pax");
+    let large_pax_server = MockServer::start(large_pax_archive.clone(), false).await;
+    let large_pax_client = client_for(&large_pax_server);
+    let large_pax_release = release_for(&large_pax_archive, large_pax_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024,
+            max_entries: 64,
+        },
+        ..StageLimits::default()
+    };
+    let err = stage_release_with(
+        &large_pax_release,
+        &large_pax_store,
+        &large_pax_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("a large pax payload must hit the decompressed budget");
+    assert!(
+        matches!(err, UpdateError::ArchiveExpandedTooLarge { .. }),
+        "unexpected large-pax error: {err:?}"
+    );
+    assert_only_active(&large_pax_store, &large_pax_active);
+
+    let component = "a".repeat(200);
+    let mut long_path = String::new();
+    for _ in 0..9 {
+        long_path.push_str(&component);
+        long_path.push('/');
+    }
+    long_path.push_str("placeholder.txt");
+    let gnu_long_archive = build_archive(&[
+        ArchiveEntry::GnuLongName {
+            data: long_path.as_bytes(),
+        },
+        ArchiveEntry::FileWithHeaderSize {
+            path: "placeholder.txt",
+            data: b"x",
+            header_size: 1,
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+    ]);
+    let (_gnu_long_dir, gnu_long_store, gnu_long_active) = setup_store("gnu-long");
+    let gnu_long_server = MockServer::start(gnu_long_archive.clone(), false).await;
+    let gnu_long_client = client_for(&gnu_long_server);
+    let gnu_long = release_for(&gnu_long_archive, gnu_long_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024,
+            max_entries: 64,
+        },
+        ..StageLimits::default()
+    };
+    let err = stage_release_with(
+        &gnu_long,
+        &gnu_long_store,
+        &gnu_long_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("a large GNU long-name payload must hit the decompressed budget");
+    assert!(
+        matches!(err, UpdateError::ArchiveExpandedTooLarge { .. }),
+        "unexpected GNU long-name error: {err:?}"
+    );
+    assert_only_active(&gnu_long_store, &gnu_long_active);
+
+    let pax_path = pax_record("path", "release.json");
+    let pax_count_archive = build_archive(&[
+        ArchiveEntry::Pax { data: &pax_path },
+        ArchiveEntry::FileWithHeaderSize {
+            path: "ignored",
+            data: &manifest_bytes,
+            header_size: u64::try_from(manifest_bytes.len()).expect("manifest size"),
+            mode: 0o644,
+        },
+    ]);
+    let (_pax_count_dir, pax_count_store, pax_count_active) = setup_store("pax-count");
+    let pax_count_server = MockServer::start(pax_count_archive.clone(), false).await;
+    let pax_count_client = client_for(&pax_count_server);
+    let pax_count = release_for(&pax_count_archive, pax_count_server.url());
+    let limits = StageLimits {
+        max_download_bytes: 1024 * 1024,
+        extract: ExtractLimits {
+            max_total_bytes: 1024 * 1024,
+            max_entries: 1,
+        },
+        ..StageLimits::default()
+    };
+    let err = stage_release_with(
+        &pax_count,
+        &pax_count_store,
+        &pax_count_client,
+        limits,
+        &NoFault,
+    )
+    .await
+    .expect_err("invisible pax metadata must count against the entry limit");
+    assert!(
+        matches!(err, UpdateError::TooManyArchiveEntries { limit: 1 }),
+        "unexpected pax-count error: {err:?}"
+    );
+    assert_only_active(&pax_count_store, &pax_count_active);
+
+    let (_enospc_dir, enospc_store, enospc_active) = setup_store("enospc");
+    let enospc_server = MockServer::start(valid_archive.clone(), false).await;
+    let enospc_client = client_for(&enospc_server);
+    let enospc = release_for(&valid_archive, enospc_server.url());
+    let err = stage_release_with(
+        &enospc,
+        &enospc_store,
+        &enospc_client,
+        StageLimits::default(),
+        &EnospcFault,
+    )
+    .await
+    .expect_err("a write failure must abort staging");
+    assert!(
+        matches!(&err, UpdateError::Io { source, .. } if source.raw_os_error() == Some(28)),
+        "unexpected ENOSPC error: {err:?}"
+    );
+    assert_eq!(
+        enospc_store.current().expect("read active generation"),
+        Some(enospc_active.clone())
+    );
+    assert_only_active(&enospc_store, &enospc_active);
+
+    let wrong_manifest_archive = build_archive(&[ArchiveEntry::File {
+        path: "release.json",
+        data: &manifest("0.1.2", "different-build"),
+        mode: 0o644,
+    }]);
+    let (_manifest_dir, manifest_store, manifest_active) = setup_store("manifest");
+    let manifest_server = MockServer::start(wrong_manifest_archive.clone(), false).await;
+    let manifest_client = client_for(&manifest_server);
+    let wrong_manifest = release_for(&wrong_manifest_archive, manifest_server.url());
+    let err = stage_release_with(
+        &wrong_manifest,
+        &manifest_store,
+        &manifest_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a mismatched release manifest must be rejected");
+    assert!(
+        matches!(err, UpdateError::ReleaseIdentityMismatch { .. }),
+        "unexpected manifest error: {err:?}"
+    );
+    assert_only_active(&manifest_store, &manifest_active);
+
+    let corrupt_archive = b"this is not a tar.gz archive".to_vec();
+    let (_corrupt_dir, corrupt_store, corrupt_active) = setup_store("corrupt");
+    let corrupt_server = MockServer::start(corrupt_archive.clone(), false).await;
+    let corrupt_client = client_for(&corrupt_server);
+    let corrupt = release_for(&corrupt_archive, corrupt_server.url());
+    let err = stage_release_with(
+        &corrupt,
+        &corrupt_store,
+        &corrupt_client,
+        StageLimits::default(),
+        &NoFault,
+    )
+    .await
+    .expect_err("a corrupt archive must fail after integrity verification");
+    assert!(
+        matches!(err, UpdateError::InvalidArchive { .. }),
+        "unexpected corrupt-archive error: {err:?}"
+    );
+    assert_only_active(&corrupt_store, &corrupt_active);
+}
+
+#[tokio::test]
+async fn stage_restages_a_partial_cached_generation() {
+    let manifest_bytes = manifest("0.1.2", "build-42");
+    let archive = build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Directory { path: "bin" },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"#!/bin/sh\nexit 0\n",
+            mode: 0o755,
+        },
+        ArchiveEntry::File {
+            path: "python/host.py",
+            data: b"import sys\n",
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "frontend/index.js",
+            data: b"console.log('zerodeck');\n",
+            mode: 0o644,
+        },
+    ]);
+    let (_dir, store, _active) = setup_store("partial-cache");
+    let server = MockServer::start(archive.clone(), false).await;
+    let client = client_for(&server);
+    let release = release_for(&archive, server.url());
+    let digest = stage_release_with(&release, &store, &client, StageLimits::default(), &NoFault)
+        .await
+        .expect("stage");
+
+    // A crash during an in-place delete used to leave `release.json` without the payload.
+    let generation = store.generation_dir(&digest);
+    fs::remove_file(generation.join("bin/zerodeckd")).expect("simulate a partial tree");
+    let hits_before = server.hits();
+
+    stage_release_with(&release, &store, &client, StageLimits::default(), &NoFault)
+        .await
+        .expect("a partial cached generation is discarded and staged again");
+
+    assert!(
+        server.hits() > hits_before,
+        "the archive must be fetched again"
+    );
+    assert!(generation.join("bin/zerodeckd").is_file());
+}
+
+/// Serves the archive in `pieces` equal chunks, pausing `pause` between them.
+async fn slow_server(
+    body: Vec<u8>,
+    pieces: usize,
+    pause: Duration,
+    stall_after: Option<usize>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let task = tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request).await;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let size = body.len().div_ceil(pieces);
+        for (index, chunk) in body.chunks(size).enumerate() {
+            if stall_after == Some(index) {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            let _ = socket.write_all(chunk).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(pause).await;
+        }
+        let _ = socket.shutdown().await;
+    });
+    (port, task)
+}
+
+fn valid_archive_bytes() -> Vec<u8> {
+    let manifest_bytes = manifest("0.1.2", "build-42");
+    build_archive(&[
+        ArchiveEntry::File {
+            path: "release.json",
+            data: &manifest_bytes,
+            mode: 0o644,
+        },
+        ArchiveEntry::Directory { path: "bin" },
+        ArchiveEntry::File {
+            path: "bin/zerodeckd",
+            data: b"#!/bin/sh\nexit 0\n",
+            mode: 0o755,
+        },
+        ArchiveEntry::File {
+            path: "python/host.py",
+            data: b"import sys\n",
+            mode: 0o644,
+        },
+        ArchiveEntry::File {
+            path: "frontend/index.js",
+            data: b"x\n",
+            mode: 0o644,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn stage_succeeds_for_a_slow_but_steady_body() {
+    let archive = valid_archive_bytes();
+    let (port, _task) = slow_server(archive.clone(), 6, Duration::from_millis(250), None).await;
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/a.tar.gz")).expect("url");
+    let release = release_for(&archive, url);
+    let (_dir, store, _active) = setup_store("slow-steady");
+    let client = OutboundHttpPolicy::for_loopback_ports_for_testing(vec![port])
+        .build_checked_client()
+        .expect("client");
+    let limits = StageLimits {
+        idle_timeout: Duration::from_millis(900),
+        ..StageLimits::default()
+    };
+
+    stage_release_with(&release, &store, &client, limits, &NoFault)
+        .await
+        .expect("steady progress must not hit any total deadline");
+}
+
+#[tokio::test]
+async fn stage_fails_on_an_idle_body_and_leaves_no_staging_after_sweep() {
+    let archive = valid_archive_bytes();
+    let (port, _task) = slow_server(archive.clone(), 4, Duration::from_millis(10), Some(2)).await;
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/a.tar.gz")).expect("url");
+    let release = release_for(&archive, url);
+    let (_dir, store, active) = setup_store("slow-idle");
+    let client = OutboundHttpPolicy::for_loopback_ports_for_testing(vec![port])
+        .build_checked_client()
+        .expect("client");
+    let limits = StageLimits {
+        idle_timeout: Duration::from_millis(300),
+        ..StageLimits::default()
+    };
+
+    let err = stage_release_with(&release, &store, &client, limits, &NoFault)
+        .await
+        .expect_err("a stalled body must fail");
+    assert!(matches!(err, UpdateError::DownloadIdle { .. }), "{err:?}");
+
+    store.sweep().expect("sweep");
+    assert_only_active(&store, &active);
+}

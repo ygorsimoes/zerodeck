@@ -3,7 +3,7 @@
 #![cfg(unix)]
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -51,7 +51,11 @@ fn free_port(host: &str) -> u16 {
 }
 
 fn daemon_command(home: &TempHome, host: &str, port: u16) -> Command {
-    let mut cmd = Command::new(BIN);
+    daemon_command_at(Path::new(BIN), home, host, port)
+}
+
+fn daemon_command_at(binary: &Path, home: &TempHome, host: &str, port: u16) -> Command {
+    let mut cmd = Command::new(binary);
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", &home.0)
@@ -130,6 +134,19 @@ fn serve_then_shutdown(host: &str) {
 fn check_config_succeeds_on_empty_homebrew() {
     let home = TempHome::new("check-config");
     let status = daemon_command(&home, "127.0.0.1", 1)
+        .arg("--check-config")
+        .status()
+        .expect("run --check-config");
+    assert!(status.success());
+}
+
+#[test]
+fn check_config_standalone_does_not_require_python_host() {
+    let home = TempHome::new("check-config-no-python");
+    let empty = home.0.join("no-python-host");
+    std::fs::create_dir_all(&empty).expect("create empty python path");
+    let status = daemon_command(&home, "127.0.0.1", 1)
+        .env("PYTHONPATH", &empty)
         .arg("--check-config")
         .status()
         .expect("run --check-config");
@@ -838,7 +855,6 @@ fn copy_python_host(home: &TempHome) -> PathBuf {
 }
 
 /// Reads the `loader/get_plugins` entry for `name` over a fresh WebSocket session.
-#[cfg(target_os = "linux")]
 async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
     let token = fetch_auth_token(&reqwest::Client::new(), port).await;
     let (mut ws, _) =
@@ -946,6 +962,395 @@ async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+}
+
+fn copy_tree(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("create copied directory");
+    for entry in std::fs::read_dir(src).expect("read directory to copy") {
+        let entry = entry.expect("directory entry");
+        let target = dst.join(entry.file_name());
+        let file_type = entry.file_type().expect("entry file type");
+        if file_type.is_dir() {
+            if entry.file_name() == "__pycache__" {
+                continue;
+            }
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy file");
+        }
+    }
+}
+
+fn write_python_host(destination: &Path) {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../hosts/python/zerodeck_py_host")
+        .canonicalize()
+        .expect("resolve hosts/python/zerodeck_py_host");
+    copy_tree(&source, &destination.join("zerodeck_py_host"));
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("mark file executable");
+}
+
+fn embedded_build_id() -> &'static str {
+    option_env!("ZERODECK_BUILD_ID")
+        .filter(|build_id| !build_id.is_empty())
+        .unwrap_or("dev")
+}
+
+fn install_generation_binary(generation: &Path) {
+    let binary = generation.join("bin/zerodeckd");
+    std::fs::copy(BIN, &binary).expect("copy the real daemon binary into the generation");
+    make_executable(&binary);
+}
+
+fn write_managed_generation(
+    root: &Path,
+    build_id: &str,
+    release_version: &str,
+    script: &str,
+    css: &str,
+) {
+    std::fs::create_dir_all(root.join("bin")).expect("create generation bin");
+    std::fs::create_dir_all(root.join("frontend/static")).expect("create generation frontend");
+    std::fs::create_dir_all(root.join("python")).expect("create generation python");
+
+    let binary = root.join("bin/zerodeckd");
+    std::fs::write(&binary, b"generation daemon placeholder").expect("write generation binary");
+    make_executable(&binary);
+    write_python_host(&root.join("python"));
+    std::fs::write(root.join("frontend/index.js"), script).expect("write generation frontend");
+    std::fs::write(root.join("frontend/static/app.css"), css).expect("write generation static");
+    std::fs::write(
+        root.join("release.json"),
+        format!(r#"{{"schema":1,"build_id":"{build_id}","version":"{release_version}"}}"#),
+    )
+    .expect("write release.json");
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn managed_daemon_uses_one_generation() {
+    let home = TempHome::new("managed-generation");
+
+    // A failed, unrelated plugin must not gate loader readiness.
+    let failed_plugin = home.0.join("plugins/broken_plugin");
+    std::fs::create_dir_all(&failed_plugin).expect("create failed plugin directory");
+    std::fs::write(
+        failed_plugin.join("plugin.json"),
+        r#"{"name":"BrokenPlugin","author":"Tester","api_version":1}"#,
+    )
+    .expect("write failed plugin manifest");
+    std::fs::write(
+        failed_plugin.join("main.py"),
+        "raise RuntimeError('broken unrelated plugin')\n",
+    )
+    .expect("write failed plugin entrypoint");
+    // A file where the supervisor needs its per-plugin settings directory makes every worker
+    // spawn fail immediately, so the crash-loop breaker trips instead of waiting on Python.
+    std::fs::create_dir_all(home.0.join("settings")).expect("create settings directory");
+    std::fs::write(home.0.join("settings/broken_plugin"), b"not a directory")
+        .expect("block the broken plugin settings directory");
+
+    // Stale legacy assets remain available, but the managed process must not serve them.
+    let legacy = home.0.join("legacy");
+    std::fs::create_dir_all(legacy.join("frontend")).expect("create legacy frontend");
+    std::fs::create_dir_all(legacy.join("python")).expect("create legacy python");
+    let stale_python = legacy.join("python/zerodeck_py_host");
+    std::fs::create_dir_all(&stale_python).expect("create stale legacy python module");
+    std::fs::write(
+        stale_python.join("__init__.py"),
+        "raise ImportError('stale legacy python host')\n",
+    )
+    .expect("write stale legacy python module");
+    std::fs::write(
+        legacy.join("frontend/index.js"),
+        "console.log('stale legacy frontend');\n",
+    )
+    .expect("write legacy frontend");
+    std::fs::create_dir_all(legacy.join("frontend/static")).expect("create legacy static dir");
+    std::fs::write(
+        legacy.join("frontend/static/app.css"),
+        ".stale-legacy-static{}",
+    )
+    .expect("write stale legacy static asset");
+
+    let update_root = home.0.join("update");
+    let generation_one = update_root.join("generations").join("a".repeat(64));
+    let generation_two = update_root.join("generations").join("b".repeat(64));
+    write_managed_generation(
+        &generation_one,
+        embedded_build_id(),
+        env!("CARGO_PKG_VERSION"),
+        "console.log('generation one frontend');\n",
+        ".generation-one{}",
+    );
+    write_managed_generation(
+        &generation_two,
+        embedded_build_id(),
+        env!("CARGO_PKG_VERSION"),
+        "console.log('generation two frontend');\n",
+        ".generation-two{}",
+    );
+    install_generation_binary(&generation_one);
+    std::fs::write(update_root.join("current"), format!("{}\n", "a".repeat(64)))
+        .expect("write active generation reference");
+
+    let port = free_port("127.0.0.1");
+    let generation_binary = generation_one.join("bin/zerodeckd");
+    let mut daemon = Daemon(
+        daemon_command_at(&generation_binary, &home, "127.0.0.1", port)
+            .arg("--managed-generation")
+            .arg(&generation_one)
+            .spawn()
+            .expect("spawn the generation's zerodeckd"),
+    );
+    wait_until_healthy(&home, "127.0.0.1", port);
+
+    let plugin_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let entry = get_plugin_entry(port, "BrokenPlugin").await;
+        let state = entry["state"].as_str().unwrap_or_default();
+        // The supervisor reports BackingOff while it retries the failing worker and Failed when
+        // its crash-loop breaker trips; both are the plugin's own failure state, not Running.
+        if matches!(state, "BackingOff" | "Failed") {
+            break;
+        }
+        assert!(
+            Instant::now() < plugin_deadline,
+            "broken plugin never entered its own failure state: {entry}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let client = reqwest::Client::new();
+    let ready_url = format!("http://127.0.0.1:{port}/readyz");
+    assert_eq!(
+        client
+            .get(&ready_url)
+            .send()
+            .await
+            .expect("GET unauthenticated /readyz")
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    let token = fetch_auth_token(&client, port).await;
+    let assert_generation_one = |body: String, script: &str, css: &str| {
+        let ready: serde_json::Value = serde_json::from_str(&body).expect("parse /readyz");
+        assert_eq!(
+            ready,
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "build_id": embedded_build_id(),
+                "python_host_ready": true,
+                "invocation_id": "",
+            })
+        );
+        assert!(!body.contains("generations"), "{body}");
+        assert!(!body.contains("frontend"), "{body}");
+        assert_eq!(
+            script,
+            std::fs::read_to_string(generation_one.join("frontend/index.js"))
+                .expect("read generation frontend")
+        );
+        assert_eq!(
+            css,
+            std::fs::read_to_string(generation_one.join("frontend/static/app.css"))
+                .expect("read generation static")
+        );
+    };
+
+    let ready = client
+        .get(&ready_url)
+        .header("X-Decky-Auth", &token)
+        .send()
+        .await
+        .expect("GET authenticated /readyz")
+        .error_for_status()
+        .expect("authenticated /readyz succeeds")
+        .text()
+        .await
+        .expect("readyz body");
+    let script = client
+        .get(format!("http://127.0.0.1:{port}/frontend/index.js"))
+        .send()
+        .await
+        .expect("GET generation frontend")
+        .text()
+        .await
+        .expect("frontend body");
+    let css = client
+        .get(format!("http://127.0.0.1:{port}/static/app.css"))
+        .send()
+        .await
+        .expect("GET generation static asset")
+        .text()
+        .await
+        .expect("static body");
+    assert_generation_one(ready, &script, &css);
+
+    // The active reference moving to another generation must not affect the running process.
+    std::fs::write(update_root.join("current"), format!("{}\n", "b".repeat(64)))
+        .expect("switch active generation reference");
+
+    let ready = client
+        .get(&ready_url)
+        .header("X-Decky-Auth", &token)
+        .send()
+        .await
+        .expect("GET /readyz after current changed")
+        .error_for_status()
+        .expect("/readyz still succeeds")
+        .text()
+        .await
+        .expect("readyz body");
+    let script = client
+        .get(format!("http://127.0.0.1:{port}/frontend/index.js"))
+        .send()
+        .await
+        .expect("GET frontend after current changed")
+        .text()
+        .await
+        .expect("frontend body");
+    let css = client
+        .get(format!("http://127.0.0.1:{port}/static/app.css"))
+        .send()
+        .await
+        .expect("GET static after current changed")
+        .text()
+        .await
+        .expect("static body");
+    assert_generation_one(ready, &script, &css);
+
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+}
+
+#[test]
+fn managed_daemon_rejects_conflicting_overrides() {
+    let home = TempHome::new("managed-override");
+    let generation = home.0.join("update/generations").join("c".repeat(64));
+    write_managed_generation(
+        &generation,
+        embedded_build_id(),
+        env!("CARGO_PKG_VERSION"),
+        "console.log('managed');\n",
+        "body{}",
+    );
+    let legacy_frontend = home.0.join("legacy/frontend");
+    let legacy_python = home.0.join("legacy/python");
+    std::fs::create_dir_all(&legacy_frontend).expect("create legacy frontend");
+    std::fs::create_dir_all(&legacy_python).expect("create legacy python");
+
+    for (variable, value) in [
+        ("ZERODECK_FRONTEND_DIR", legacy_frontend.as_path()),
+        ("PYTHONPATH", legacy_python.as_path()),
+    ] {
+        let output = daemon_command(&home, "127.0.0.1", 1)
+            .arg("--managed-generation")
+            .arg(&generation)
+            .arg("--check-config")
+            .env(variable, value)
+            .stderr(Stdio::piped())
+            .output()
+            .expect("run --check-config");
+        assert!(
+            !output.status.success(),
+            "{variable} selecting a different generation must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(variable), "stderr: {stderr}");
+        assert!(stderr.contains("--managed-generation"), "stderr: {stderr}");
+    }
+}
+
+#[test]
+fn managed_daemon_rejects_a_stale_running_binary() {
+    let home = TempHome::new("managed-stale-binary");
+    let generation = home.0.join("update/generations").join("d".repeat(64));
+    write_managed_generation(
+        &generation,
+        embedded_build_id(),
+        env!("CARGO_PKG_VERSION"),
+        "console.log('managed');\n",
+        "body{}",
+    );
+    let output = daemon_command(&home, "127.0.0.1", 1)
+        .arg("--managed-generation")
+        .arg(&generation)
+        .arg("--check-config")
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run a stale daemon against the managed generation");
+    assert!(
+        !output.status.success(),
+        "a daemon that is not the generation binary must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("running daemon"), "stderr: {stderr}");
+    assert!(stderr.contains("managed generation"), "stderr: {stderr}");
+}
+
+#[test]
+fn managed_daemon_rejects_a_release_version_that_differs_from_the_binary() {
+    let home = TempHome::new("managed-stale-version");
+    let generation = home.0.join("update/generations").join("e".repeat(64));
+    write_managed_generation(
+        &generation,
+        embedded_build_id(),
+        "999.999.999",
+        "console.log('managed');\n",
+        "body{}",
+    );
+    let output = daemon_command(&home, "127.0.0.1", 1)
+        .arg("--managed-generation")
+        .arg(&generation)
+        .arg("--check-config")
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run a mismatched managed version");
+    assert!(
+        !output.status.success(),
+        "a release version that differs from the binary must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("version"), "stderr: {stderr}");
+    assert!(stderr.contains("does not match"), "stderr: {stderr}");
+}
+
+#[test]
+fn daemon_notifies_systemd_ready_after_listening() {
+    use std::os::unix::net::UnixDatagram;
+
+    let home = TempHome::new("notify");
+    let socket_path = home.0.join("notify.sock");
+    let socket = UnixDatagram::bind(&socket_path).expect("bind NOTIFY_SOCKET");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("set notification read timeout");
+
+    let port = free_port("127.0.0.1");
+    let mut daemon = Daemon(
+        daemon_command(&home, "127.0.0.1", port)
+            .env("NOTIFY_SOCKET", &socket_path)
+            .spawn()
+            .expect("spawn zerodeckd"),
+    );
+
+    let mut buffer = [0u8; 64];
+    let length = socket
+        .recv(&mut buffer)
+        .expect("receive READY notification");
+    assert_eq!(&buffer[..length], b"READY=1\n");
+
+    wait_until_healthy(&home, "127.0.0.1", port);
     sigterm(&daemon);
     assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
 }

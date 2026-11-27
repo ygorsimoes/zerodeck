@@ -3,15 +3,31 @@ name: Release Please
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft tag to retry (e.g. v0.1.0)
+        required: false
+        type: string
+      release_id:
+        description: Optional numeric draft release ID for a retry
+        required: false
+        type: string
+      publish:
+        description: Publish the release after every asset and attestation is verified
+        required: false
+        default: true
+        type: boolean
 
 permissions: {}
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
 
 jobs:
   release-please:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -21,6 +37,8 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
       - name: Run Release Please
         id: release
@@ -31,22 +49,138 @@ jobs:
           manifest-file: .release-please-manifest.json
 
   publish:
-    name: Publish Container & Release Tarball
+    name: Build, verify and publish the immutable release
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    if: >-
+      always() && (
+        (github.event_name == 'push' &&
+         needs.release-please.outputs.release_created == 'true') ||
+        (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+      )
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    concurrency:
+      group: release-publish-${{ inputs.tag || needs.release-please.outputs.tag_name }}
+      cancel-in-progress: false
     permissions:
       contents: write
       packages: write
       id-token: write
       attestations: write
+      actions: write
     steps:
-      - name: Checkout released tag
+      - name: Resolve the unpublished draft ID and exact commit
+        id: identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE_ID: ${{ inputs.release_id }}
+          OUTPUT_TAG: ${{ needs.release-please.outputs.tag_name }}
+          OUTPUT_VERSION: ${{ needs.release-please.outputs.version }}
+          OUTPUT_SHA: ${{ needs.release-please.outputs.sha }}
+          OUTPUT_UPLOAD_URL: ${{ needs.release-please.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-${OUTPUT_TAG}}"
+          [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || {
+            echo "release tag is not a v-prefixed SemVer: ${tag}" >&2
+            exit 1
+          }
+          version="${tag#v}"
+          if [[ -n "${OUTPUT_VERSION}" && "${OUTPUT_VERSION}" != "${version}" ]]; then
+            echo "Release Please version ${OUTPUT_VERSION} disagrees with tag ${tag}" >&2
+            exit 1
+          fi
+
+          # Draft releases have no git tag, so never use `/releases/tags/<tag>`. Prefer the release
+          # ID embedded in Release Please's upload_url; otherwise find the draft in the releases list.
+          release_id="${INPUT_RELEASE_ID:-}"
+          if [[ -z "${release_id}" && "${OUTPUT_UPLOAD_URL}" =~ releases/([0-9]+)/assets ]]; then
+            release_id="${BASH_REMATCH[1]}"
+          fi
+          if [[ -z "${release_id}" ]]; then
+            releases_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+            release_id="$(python3 -c 'import json,sys; tag=sys.argv[1]; print(next((release["id"] for release in json.load(sys.stdin) if release.get("tag_name") == tag and release.get("draft")), ""))' "${tag}" <<<"${releases_json}")"
+            [[ -n "${release_id}" ]] || {
+              echo "no unpublished draft with tag ${tag} was found" >&2
+              exit 1
+            }
+          fi
+          [[ "${release_id}" =~ ^[0-9]+$ ]] || {
+            echo "invalid release id: ${release_id}" >&2
+            exit 1
+          }
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")" || {
+            echo "release id ${release_id} is not accessible" >&2
+            exit 1
+          }
+          state="$(python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("draft") else "0")' <<<"${release_json}")"
+          [[ "${state}" == "1" ]] || {
+            echo "release id ${release_id} is published; a published release is immutable" >&2
+            exit 1
+          }
+          remote_tag="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name", ""))' <<<"${release_json}")"
+          [[ "${remote_tag}" == "${tag}" ]] || {
+            echo "release id ${release_id} has tag ${remote_tag}, expected ${tag}" >&2
+            exit 1
+          }
+
+          target_commitish="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("target_commitish", ""))' <<<"${release_json}")"
+          # Build exactly the commit that triggered this workflow run. Its provenance source is
+          # github.sha/github.ref, so a retry cannot rebuild an arbitrary input commit.
+          sha="${GITHUB_SHA}"
+          [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "release ${tag} has no exact workflow source commit" >&2
+            exit 1
+          }
+          if [[ "${OUTPUT_SHA}" =~ ^[0-9a-f]{40}$ && "${OUTPUT_SHA}" != "${sha}" ]]; then
+            echo "Release Please commit ${OUTPUT_SHA} differs from the workflow source ${sha}" >&2
+            echo "dispatch the retry from the exact release commit" >&2
+            exit 1
+          fi
+          if [[ "${target_commitish}" =~ ^[0-9a-f]{40}$ && "${target_commitish}" != "${sha}" ]]; then
+            echo "release target ${target_commitish} differs from the workflow source ${sha}" >&2
+            echo "dispatch the retry from the exact release commit" >&2
+            exit 1
+          fi
+          build_id="${tag}-${sha}"
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "sha=${sha}"
+            echo "release_id=${release_id}"
+            echo "build_id=${build_id}"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Checkout the exact released commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ steps.identity.outputs.sha }}
           persist-credentials: false
+
+      - name: Verify the checked-out commit
+        env:
+          EXPECTED_SHA: ${{ steps.identity.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${actual}" != "${EXPECTED_SHA}" ]]; then
+            echo "checked out ${actual}, expected the release commit ${EXPECTED_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Require an unpublished draft before rebuilding
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '.draft' 2>/dev/null || true)"
+          if [[ "${state}" != "true" ]]; then
+            echo "release id ${RELEASE_ID} is not an unpublished draft (draft=${state:-missing})" >&2
+            echo "a published release is immutable; promote its existing bytes instead of rebuilding" >&2
+            exit 1
+          fi
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
@@ -64,9 +198,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.tag_name }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.tag_name }}
-            type=raw,value=latest,enable=${{ !contains(needs.release-please.outputs.version, '-') }}
+            type=semver,pattern={{version}},value=${{ steps.identity.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.identity.outputs.tag }}
+            type=raw,value=latest,enable=${{ !contains(steps.identity.outputs.version, '-') }}
 
       - name: Build and push runtime container image
         id: build
@@ -78,7 +212,9 @@ jobs:
           provenance: mode=max
           sbom: true
           build-args: |
-            VERSION=${{ needs.release-please.outputs.version }}
+            VERSION=${{ steps.identity.outputs.version }}
+            ZERODECK_BUILD_ID=${{ steps.identity.outputs.build_id }}
+            ZERODECK_REQUIRE_BUILD_ID=1
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -91,35 +227,91 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+      - name: Record the immutable image reference
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          repository="$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_REF=ghcr.io/${repository}@${DIGEST}" >>"${GITHUB_ENV}"
+
       - name: Install just
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
         with:
           tool: just@1.59.0
 
-      - name: Package Linux release tarball and checksums
+      - name: Package and validate both release assets by OCI digest
         env:
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          REPO: ${{ github.repository }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          ZERODECK_BUILD_ID: ${{ steps.identity.outputs.build_id }}
+          ZERODECK_EXPECTED_VERSION: ${{ steps.identity.outputs.version }}
+          ZERODECK_EXPECTED_BUILD_ID: ${{ steps.identity.outputs.build_id }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/$(echo "${REPO}" | tr '[:upper:]' '[:lower:]'):${VERSION}"
-          docker pull "${IMAGE}"
-          # Same recipe as local `just dist`: copies zerodeckd, the Python host and the frontend
-          # bundle out of the published image, plus the systemd unit and LICENSE.
-          just dist "${TAG}" "${IMAGE}"
+          docker pull "${IMAGE_REF}"
+          just dist "${TAG}" "${IMAGE_REF}"
+          just test-release-package "dist/zerodeck-${TAG}-linux-x86_64.tar.gz"
+          just test-release-package "dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
 
-      - name: Attest release tarball provenance
+      - name: Verify the packaged daemon embedded identity
+        env:
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          just verify-managed-image "${IMAGE_REF}" "dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
+
+      - name: Attest both release archives
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: dist/zerodeck-${{ needs.release-please.outputs.tag_name }}-linux-x86_64.tar.gz
+          subject-path: |
+            dist/zerodeck-${{ steps.identity.outputs.tag }}-linux-x86_64.tar.gz
+            dist/zerodeck-${{ steps.identity.outputs.tag }}-linux-x86_64.managed.tar.gz
 
-      - name: Upload release assets
+      - name: Upload, download and verify assets on the same draft
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          bash deploy/update/publish-release.sh \
+            --repo "${GITHUB_REPOSITORY}" --release-id "${RELEASE_ID}" \
+            --tag "${TAG}" --dist dist
+
+      - name: Verify build provenance before publication
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          for archive in \
+            "dist/zerodeck-${TAG}-linux-x86_64.tar.gz" \
+            "dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"; do
+            gh attestation verify "${archive}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-please.yml" \
+              --source-digest "${SOURCE_SHA}" \
+              --source-ref "${SOURCE_REF}" \
+              --deny-self-hosted-runners
+          done
+
+      - name: Publish the immutable release only after verification
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          bash deploy/update/publish-release.sh \
+            --repo "${GITHUB_REPOSITORY}" --release-id "${RELEASE_ID}" \
+            --tag "${TAG}" --dist dist --publish
+
+      - name: Ask the channels workflow to sign the new release
+        if: github.event_name == 'push' || inputs.publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
-        run: |
-          gh release upload "${TAG}" \
-            "dist/zerodeck-${TAG}-linux-x86_64.tar.gz" \
-            "dist/SHA256SUMS.txt" \
-            --clobber
+        # Best effort: the daily channels run picks the release up anyway if this dispatch fails.
+        run: gh workflow run channels.yml --repo "${GITHUB_REPOSITORY}" --ref main || echo "channels dispatch failed; the daily run will sign it"

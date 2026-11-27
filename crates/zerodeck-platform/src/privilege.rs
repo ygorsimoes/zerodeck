@@ -239,6 +239,18 @@ fn parse_supplemental_groups(contents: &str, username: &str, primary_gid: u32) -
     gids
 }
 
+/// Converts permission bits to rustix's platform-specific raw mode type.
+#[cfg(all(unix, target_os = "linux"))]
+fn raw_mode(perms: u32) -> u32 {
+    perms
+}
+
+/// Converts permission bits to rustix's platform-specific raw mode type.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn raw_mode(perms: u32) -> u16 {
+    u16::try_from(perms).expect("POSIX permission bits fit in u16")
+}
+
 /// Ensures `path` exists with optional POSIX permissions and ownership (applied only when `euid == 0`),
 /// refusing to follow symlinks at the target or newly created components.
 #[cfg(unix)]
@@ -297,7 +309,8 @@ pub fn ensure_owned_dir(
     .map_err(|err| errno_err(path, err))?;
 
     if let Some(perms) = mode {
-        fchmod(&leaf_fd, Mode::from_raw_mode(perms as _)).map_err(|err| errno_err(path, err))?;
+        fchmod(&leaf_fd, Mode::from_raw_mode(raw_mode(perms)))
+            .map_err(|err| errno_err(path, err))?;
     }
 
     if is_root && let Some((uid, gid)) = owner {

@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod install;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -63,6 +65,10 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     allow_unsafe_root_plugins: bool,
+
+    /// Internal: serve one immutable managed generation selected by systemd.
+    #[arg(long, value_name = "PATH", hide = true)]
+    managed_generation: Option<PathBuf>,
 }
 
 fn init_tracing() {
@@ -336,28 +342,76 @@ fn warn_about_writable_ancestors(paths: &PlatformPaths) {
     );
 }
 
+/// Python host, frontend bundle and identity the daemon serves with.
+struct LoaderPaths {
+    python_host: PythonHostConfig,
+    frontend_dir: Option<PathBuf>,
+    version: String,
+    build_id: String,
+}
+
+fn resolve_loader_paths(managed: Option<&install::ManagedGeneration>) -> LoaderPaths {
+    if let Some(managed) = managed {
+        info!(
+            generation = %managed.root().display(),
+            binary = %managed.binary().display(),
+            release_version = %managed.release_version(),
+            embedded_build_id = %zerodeck_server::build_id(),
+            "serving one immutable managed loader generation"
+        );
+        LoaderPaths {
+            python_host: PythonHostConfig {
+                host_module_path: Some(managed.python_host_path().to_owned()),
+                ..PythonHostConfig::default()
+            },
+            frontend_dir: Some(managed.frontend_dir().to_path_buf()),
+            version: managed.release_version().to_owned(),
+            build_id: zerodeck_server::build_id().to_owned(),
+        }
+    } else {
+        LoaderPaths {
+            python_host: PythonHostConfig {
+                host_module_path: resolve_python_host_path(),
+                ..PythonHostConfig::default()
+            },
+            frontend_dir: resolve_frontend_path(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_id: zerodeck_server::build_id().to_owned(),
+        }
+    }
+}
+
 async fn run_daemon(
     cli: Cli,
     paths: PlatformPaths,
     settings: SettingsManager,
     plugins: Vec<zerodeck_core::DiscoveredPlugin>,
+    generation: Option<install::ManagedGeneration>,
 ) -> Result<()> {
     let addrs = resolve(&cli.host, cli.port).await?;
     check_bind_policy(&addrs, cli.allow_non_loopback)?;
     #[cfg(unix)]
     warn_about_writable_ancestors(&paths);
 
-    let python_host = PythonHostConfig {
-        host_module_path: resolve_python_host_path(),
-        ..PythonHostConfig::default()
-    };
+    let LoaderPaths {
+        python_host,
+        frontend_dir,
+        version,
+        build_id,
+    } = resolve_loader_paths(generation.as_ref());
     let python_host_missing = probe_python_host(&python_host).await;
     let config = ServerConfig {
         host: cli.host,
         port: cli.port,
         cef: CefConfig::default(),
         python_host: python_host.clone(),
-        frontend_dir: resolve_frontend_path(),
+        frontend_dir,
+        version,
+        build_id,
+        python_host_ready: python_host_missing.is_none(),
+        // systemd sets this for every service process and the updater compares it with the unit's
+        // current `InvocationID` before accepting `/readyz` as the freshly started daemon.
+        invocation_id: std::env::var("INVOCATION_ID").unwrap_or_default(),
         ..ServerConfig::default()
     };
     let http_client = OutboundHttpPolicy::production()
@@ -424,6 +478,9 @@ async fn run_daemon(
         .context("initialize server state")?;
 
     info!(listen = %addr, frontend_dir = ?frontend_dir, "ZeroDeck daemon listening");
+    if let Err(error) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        warn!(error = %error, "failed to notify systemd that the daemon is ready");
+    }
     let serve_result = serve(listener, state, shutdown_signal())
         .await
         .context("serve HTTP/WS");
@@ -444,6 +501,15 @@ async fn main() -> Result<()> {
         return run_healthcheck(&cli.host, cli.port).await;
     }
 
+    let managed = match cli.managed_generation.as_deref() {
+        Some(root) => {
+            let managed = install::ManagedGeneration::resolve_from_env(root)?;
+            managed.verify_running_binary()?;
+            Some(managed)
+        }
+        None => None,
+    };
+
     let paths = PlatformPaths::from_env();
     let settings = SettingsManager::open(paths.settings_dir().join("loader.json"))
         .context("load loader settings")?;
@@ -461,10 +527,19 @@ async fn main() -> Result<()> {
     if cli.check_config {
         let addrs = resolve(&cli.host, cli.port).await?;
         check_bind_policy(&addrs, cli.allow_non_loopback)?;
+        // A managed generation is only installable if its bundled worker host imports. Check the
+        // same resolved path the daemon will hand to every plugin worker. Standalone installs
+        // keep checking the bind policy only.
+        if managed.is_some() {
+            let loader = resolve_loader_paths(managed.as_ref());
+            if let Some(reason) = probe_python_host(&loader.python_host).await {
+                bail!("configuration check failed: {reason}");
+            }
+        }
         return Ok(());
     }
 
-    run_daemon(cli, paths, settings, plugins).await
+    run_daemon(cli, paths, settings, plugins, managed).await
 }
 
 #[cfg(test)]

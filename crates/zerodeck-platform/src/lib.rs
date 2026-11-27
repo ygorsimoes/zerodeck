@@ -4,6 +4,10 @@
 
 mod error;
 mod fs;
+#[cfg(unix)]
+mod generation;
+#[cfg(unix)]
+mod maintenance;
 mod ownership;
 mod paths;
 mod privilege;
@@ -12,9 +16,18 @@ mod sync;
 
 pub use error::PlatformError;
 pub use fs::atomic_write;
+#[cfg(unix)]
+pub use fs::atomic_write_mode;
+#[cfg(unix)]
+pub use generation::{GenerationLayout, LayoutError};
+#[cfg(unix)]
+pub use maintenance::MaintenanceLock;
 pub use ownership::{EntryMeta, OwnershipViolation, ViolationKind, check_entry};
 #[cfg(unix)]
-pub use ownership::{check_root_only_tree, entry_meta, non_root_writable_ancestors};
+pub use ownership::{
+    check_root_only_tree, check_secure_ancestors, ensure_root_owned_ancestors, entry_meta,
+    non_root_writable_ancestors,
+};
 pub use paths::PlatformPaths;
 pub use privilege::PrivilegeTarget;
 #[cfg(unix)]

@@ -1,13 +1,21 @@
 [Unit]
 Description=ZeroDeck Plugin Loader Daemon
-After=network.target
+After=network.target zerodeck-recovery.service
+# Do not add a weak dependency on the recovery unit: recovery is enabled at boot on its own, and
+# a daemon start from the apply unit must not pull recovery in while apply holds the exclusive lock.
+# The launcher resolves the active immutable generation from this root-owned reference. Without
+# it the daemon must not start; recovery clears it when no good generation remains. `exec-current`
+# also refuses to start unless boot recovery recorded a marker for the current kernel boot, so a
+# failed or skipped recovery cannot leave the daemon running with unreconciled disk state.
+ConditionPathExists=/home/.zerodeck/current
 
 # Paths default to the stock Steam Deck layout (`/home/deck/homebrew`). systemd does not expand
 # shell-style variables in WorkingDirectory=, so to use another location create a drop-in with
 # `systemctl edit zerodeck.service` and override WorkingDirectory= and both Environment= paths.
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 User=root
 Restart=always
 RestartSec=2
@@ -15,7 +23,8 @@ RestartSec=2
 # TimeoutStopSec, and a daemon that dies anyway takes its workers down via their parent-death signal.
 KillMode=process
 TimeoutStopSec=15
-ExecStart=/usr/local/bin/zerodeckd
+TimeoutStartSec=90
+ExecStart=/home/.zerodeck/bin/zerodeckctl exec-current --root /home/.zerodeck
 # The leading `-` keeps the unit starting if the directory does not exist yet.
 WorkingDirectory=-/home/deck/homebrew/services
 Environment=UNPRIVILEGED_PATH=/home/deck/homebrew

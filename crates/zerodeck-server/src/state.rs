@@ -16,6 +16,15 @@ use zerodeck_plugin_host::{PluginEvent, PythonHostConfig};
 use crate::ServerError;
 use crate::ws_sync::WsSyncCache;
 
+/// Build identity compiled into this binary (`ZERODECK_BUILD_ID`, or `dev` for local builds).
+#[must_use]
+pub fn build_id() -> &'static str {
+    match option_env!("ZERODECK_BUILD_ID") {
+        Some(build_id) if !build_id.is_empty() => build_id,
+        _ => "dev",
+    }
+}
+
 /// Runtime configuration for the `ZeroDeck` HTTP/WebSocket server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -29,6 +38,17 @@ pub struct ServerConfig {
     pub ws_max_message_bytes: usize,
     /// Optional path to the packaged `@zerodeck/frontend` dist directory.
     pub frontend_dir: Option<PathBuf>,
+    /// Loader version reported by `/readyz`.
+    pub version: String,
+    /// Embedded loader build identity reported by `/readyz`.
+    pub build_id: String,
+    /// Whether the Python worker host was importable during startup.
+    pub python_host_ready: bool,
+    /// systemd invocation identity of this daemon process, reported by `/readyz`.
+    ///
+    /// The updater compares it with `systemctl show -p InvocationID` so an old process or an
+    /// unrelated endpoint cannot satisfy activation readiness.
+    pub invocation_id: String,
     /// Maximum compressed plugin ZIP archive size accepted by the installer.
     pub max_zip_download_bytes: usize,
     /// Maximum size of a single `remote_binary` download.
@@ -58,6 +78,10 @@ impl Default for ServerConfig {
             ws_ping_interval: Duration::from_secs(30),
             ws_max_message_bytes: 16 * 1024 * 1024,
             frontend_dir: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            build_id: build_id().to_owned(),
+            python_host_ready: false,
+            invocation_id: String::new(),
             max_zip_download_bytes: DEFAULT_MAX_ZIP_DOWNLOAD_BYTES,
             max_remote_binary_bytes: DEFAULT_MAX_REMOTE_BINARY_BYTES,
             fetch_connect_timeout: Duration::from_secs(10),

@@ -1,0 +1,40 @@
+[package]
+name = "zerodeck-updater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zerodeckctl"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ed25519-dalek.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+zerodeck-core.workspace = true
+zerodeck-platform.workspace = true
+zerodeck-protocol.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

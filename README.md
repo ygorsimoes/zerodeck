@@ -151,14 +151,23 @@ curl -s -X POST -H "X-Decky-Auth: $TOKEN" http://127.0.0.1:1337/methods/get_plug
 ### From a release
 
 Starting with the first release, every
-[GitHub release](https://github.com/ygorsimoes/zerodeck/releases) ships a `linux-x86_64` tarball
-(binary, Python worker, frontend bundle and systemd unit) with `SHA256SUMS.txt`, plus a container
-image at `ghcr.io/ygorsimoes/zerodeck`. Both carry signed build-provenance attestations, and the
-image also ships an SBOM. Verify them with the GitHub CLI:
+[GitHub release](https://github.com/ygorsimoes/zerodeck/releases) ships a manual `linux-x86_64`
+tarball (daemon and controller binaries, Python worker, frontend bundle, systemd units and
+documentation) and a root-level `.managed.tar.gz` generation archive for signed-channel updates,
+both with `SHA256SUMS.txt`, plus a container image at `ghcr.io/ygorsimoes/zerodeck`. Both archives
+carry signed build-provenance attestations, and the image also ships an SBOM. Verify them with the
+GitHub CLI:
 
 ```bash
 gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
+gh attestation verify zerodeck-v*-linux-x86_64.managed.tar.gz --repo ygorsimoes/zerodeck
 ```
+
+A managed first install or conversion is deliberately explicit: `bootstrap.sh` requires the archive
+SHA-256 digests from the release, refuses a running Decky or an unreviewed existing ZeroDeck install,
+and starts nothing without `--start`. After that, updates follow the signed `stable` channel on
+their own. See [`deploy/update/RELEASE.md`](deploy/update/RELEASE.md) for the exact commands,
+conflict behavior, conversion backup and recovery, and how channels are signed.
 
 <details>
 <summary><strong>Configuration</strong></summary>
@@ -199,13 +208,19 @@ must not be able to grant themselves root.
 ## On Steam Deck
 
 > [!NOTE]
-> 🚧 **Coming in [Phase 4](#roadmap).** This is how it will work. None of it is available yet.
+> 🚧 **Implemented; real Steam Deck qualification is still being recorded.** The managed installer
+> and updater are covered by unit, fault-injection, packaging and VM tests (a KVM VM runs in CI),
+> but SteamOS-specific behavior is only confirmed on hardware, tracked in
+> [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md).
 
-- **Install:** one command in Desktop Mode downloads a SHA-256-verified release and installs
-  `zerodeckd` as a systemd service that uses your existing `~/homebrew/plugins`.
-- **Update:** the same command fetches and verifies the latest release, then restarts the service.
-- **Uninstall:** one command removes the service and binary and leaves your plugins and settings
-  untouched.
+- **Install:** a verified `bootstrap.sh` installs `zerodeckd` as a managed systemd service that uses
+  your existing `~/homebrew/plugins`.
+- **Update:** merging the Release Please PR publishes an immutable release and CI signs the channel
+  automatically. On the Deck, `zerodeckctl update` verifies the signed channel and stages the
+  release; `zerodeckctl upgrade` activates it explicitly, with offline rollback to the retained
+  generation. Nothing is signed or promoted by hand.
+- **Recovery:** an interrupted activation restores the previous generation or leaves a recoverable
+  stopped state; `zerodeckctl recover` reconciles a request left by an interrupted helper.
 
 Want it sooner? [Help build it](#contributing).
 

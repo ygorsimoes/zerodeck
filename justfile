@@ -116,6 +116,35 @@ py-test-on version:
 py-matrix:
     for v in {{ python_versions }}; do just py-test-on "$v"; done
 
+# Release tooling tests: publish and channel-signing scripts, bootstrap and the VM harness
+[group('checks')]
+check-release:
+    {{ dev }} just _release-scripts
+
+# Boot a disposable Linux/systemd VM and run the updater crash/rollback gate:
+#   just test-updater-vm <image> <ssh-key> <ssh-user> <manual> <managed> [<candidate>]
+# Runs on this host (it needs qemu-system-x86_64, qemu-img and the caller's image); exits 77 with
+# `skipped: no qemu/image` when they are absent. Pass `-` as candidate to test the installed
+# generation's apply/rollback path.
+[group('checks')]
+test-updater-vm image ssh_key ssh_user manual managed candidate="-":
+    just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}" "{{ candidate }}"
+
+# Run the updater VM gate against the pinned Arch cloud image (needs KVM, qemu, cloud-image-utils)
+[group('checks')]
+test-updater-vm-ci dist_dir tag candidate:
+    bash deploy/update/tests/vm-ci.sh "{{ dist_dir }}" "{{ tag }}" "{{ candidate }}"
+
+# Build a managed archive of a newer version (a second image build) for the VM update scenarios
+[group('checks')]
+build-vm-candidate version out_dir:
+    bash deploy/update/tests/build-candidate.sh "{{ version }}" "{{ out_dir }}"
+
+# Exercise the VM harness itself with fake qemu/ssh (no image or hardware required)
+[group('checks')]
+test-updater-vm-selftest:
+    {{ dev }} just _test-updater-vm-selftest
+
 # Lint the infrastructure: version pins in sync, compose, workflows (actionlint, zizmor), Dockerfile (hadolint)
 [group('checks')]
 lint-infra: _toolchain-sync
@@ -180,35 +209,58 @@ smoke *flags="--build":
     echo
     echo "smoke: zerodeckd is healthy"
 
-# Package a release tarball + SHA256SUMS from a runtime image into dist/
+# Package the manual/diagnostic tarball, the managed generation archive and SHA256SUMS from one
+# runtime image into dist/. Set ZERODECK_BUILD_ID for a real release.
 [group('runtime')]
 dist tag image="zerodeck:runtime":
+    just _dist all "{{ tag }}" "{{ image }}"
+
+# Package only the managed generation archive (archive root: release.json, bin, python, frontend)
+[group('runtime')]
+dist-managed tag image="zerodeck:runtime":
+    just _dist managed "{{ tag }}" "{{ image }}"
+
+# Validate the exact bytes of a release archive, its checksums and the failure/retry boundaries
+[group('runtime')]
+test-release-package archive:
+    just _test-release-package "{{ archive }}"
+
+# Re-sign the stable/testing channel documents when a release changed or one is close to expiry
+# (runs in the `channels` workflow; needs gh, openssl and python3 on the host)
+[group('runtime')]
+update-channels repository channels_dir key:
+    bash deploy/update/update-channels.sh "{{ repository }}" "{{ channels_dir }}" "{{ key }}"
+
+# Unpack a managed archive and require the packaged daemon to accept its embedded identity and
+# importable Python worker host
+[group('runtime')]
+verify-managed-image image archive:
     #!/usr/bin/env bash
     set -euo pipefail
-    case "$(docker image inspect --format '{{{{.Architecture}}' '{{ image }}')" in
-        amd64) arch=x86_64 ;;
-        arm64) arch=aarch64 ;;
-        *) echo "unsupported image architecture" >&2; exit 1 ;;
-    esac
-    name="zerodeck-{{ tag }}-linux-${arch}"
-    stage="dist/${name}"
-    rm -rf "${stage}" "dist/${name}.tar.gz"
-    mkdir -p "${stage}/bin" "${stage}/python" "${stage}/frontend" "${stage}/systemd"
-    cid="$(docker create '{{ image }}')"
-    trap 'docker rm -f "${cid}" >/dev/null 2>&1 || true' EXIT
-    docker cp "${cid}:/usr/local/bin/zerodeckd" "${stage}/bin/zerodeckd"
-    docker cp "${cid}:/opt/zerodeck/python/." "${stage}/python/"
-    docker cp "${cid}:/opt/zerodeck/frontend/." "${stage}/frontend/"
-    cp deploy/systemd/zerodeck.service "${stage}/systemd/zerodeck.service"
-    cp LICENSE "${stage}/LICENSE"
-    tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-    (cd dist && sha256sum "${name}.tar.gz" > SHA256SUMS.txt)
-    echo "dist/${name}.tar.gz"
+    generation="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-managed.XXXXXX")"
+    trap 'rm -rf "${generation}"' EXIT
+    tar -xzf "{{ archive }}" -C "${generation}"
+    # The runtime image runs as an unprivileged user; mktemp creates 0700 and the
+    # container must be able to traverse the bind mount to execute the packaged daemon.
+    chmod -R a+rX "${generation}"
+    image_arch="$(docker image inspect --format '{{{{.Architecture}}' '{{ image }}')"
+    docker run --rm --platform "linux/${image_arch}" -v "${generation}:/generation:ro" \
+        -e UNPRIVILEGED_PATH=/homebrew -e PRIVILEGED_PATH=/homebrew -e PYTHONPATH= \
+        --entrypoint /generation/bin/zerodeckd "{{ image }}" \
+        --managed-generation /generation --check-config
+
+[private]
+_dist mode tag image:
+    bash deploy/update/package-release.sh "{{ mode }}" "{{ tag }}" "{{ image }}" dist
+
+[private]
+_test-release-package archive:
+    bash deploy/update/tests/release.sh "{{ archive }}"
 
 # ─── Implementations (run where the public recipe decided: container or native) ─────────────────
 
 [private]
-_check: _fmt-check _clippy _doc _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test
+_check: _fmt-check _clippy _doc _cargo-test _py-lint _py-test _deny _fe-lint _fe-build _fe-test _release-scripts
 
 [private]
 _fmt: _fe-deps
@@ -240,6 +292,34 @@ _test-privileged:
         exit 1
     fi
     cargo test --workspace --locked -- --ignored privileged_
+
+[private]
+_release-scripts:
+    bash deploy/update/tests/release-fixture.sh
+    bash deploy/update/tests/bootstrap.sh
+    bash deploy/update/tests/publish.sh
+    bash deploy/update/tests/sign-channel.sh
+    just _test-updater-vm-selftest
+
+[private]
+_test-updater-vm image ssh_key ssh_user manual managed candidate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(
+        --image "{{ image }}"
+        --ssh-key "{{ ssh_key }}"
+        --ssh-user "{{ ssh_user }}"
+        --manual "{{ manual }}"
+        --managed "{{ managed }}"
+    )
+    if [[ "{{ candidate }}" != "-" ]]; then
+        args+=(--candidate "{{ candidate }}")
+    fi
+    exec bash deploy/update/tests/vm.sh "${args[@]}"
+
+[private]
+_test-updater-vm-selftest:
+    bash deploy/update/tests/vm.sh --self-test
 
 [private]
 _coverage:
@@ -307,6 +387,13 @@ _toolchain-sync:
         "$(sed -n 's/^ARG PNPM_VERSION=//p' Dockerfile)"
     expect "just in workflows vs Dockerfile JUST_VERSION" "$(sed -n 's/^ARG JUST_VERSION=//p' Dockerfile)" \
         $(grep -rhoE 'just@[0-9][0-9.]*' .github | cut -d@ -f2)
+    # Every external base image is pinned by digest; stage-to-stage references have no `:` or `/`.
+    while read -r image; do
+        if [[ "${image}" == *[:/]* && "${image}" != *@sha256:* ]]; then
+            echo "error: Dockerfile base image is not pinned by digest: ${image}" >&2
+            fail=1
+        fi
+    done < <(sed -nE 's/^FROM[[:space:]]+([^[:space:]]+).*/\1/p' Dockerfile)
     [[ "${fail}" -eq 0 ]] && echo "toolchain pins in sync (rust ${rust}, pnpm ${pnpm})"
     exit "${fail}"
 

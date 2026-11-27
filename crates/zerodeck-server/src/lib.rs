@@ -12,7 +12,7 @@ mod ws_sync;
 
 pub use error::ServerError;
 pub use routes::{build_router, serve};
-pub use state::{AppState, AppStateBuilder, ServerConfig};
+pub use state::{AppState, AppStateBuilder, ServerConfig, build_id};
 pub use ws_sync::WsSyncCache;
 
 #[cfg(test)]
@@ -24,6 +24,81 @@ mod tests {
     use zerodeck_protocol::{ProtocolError, WsClientMessage};
 
     use crate::{AppState, ServerConfig, build_router};
+
+    #[tokio::test]
+    async fn readyz_is_authenticated_and_reports_no_internal_paths() {
+        use serde_json::{Value, json};
+
+        let secret_frontend = std::env::temp_dir().join("zerodeck-readiness-secret-frontend");
+        let state = AppState::builder(ServerConfig {
+            version: "1.2.3".to_owned(),
+            build_id: "build-abc".to_owned(),
+            python_host_ready: true,
+            invocation_id: "invocation-test".to_owned(),
+            frontend_dir: Some(secret_frontend.clone()),
+            ..ServerConfig::default()
+        })
+        .build()
+        .expect("build app state");
+        let token = state.csrf_token().to_owned();
+        let app = build_router(state);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("build unauthenticated /readyz req"),
+            )
+            .await
+            .expect("call unauthenticated /readyz");
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+
+        let authenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .header("X-Decky-Auth", &token)
+                    .body(Body::empty())
+                    .expect("build authenticated /readyz req"),
+            )
+            .await
+            .expect("call authenticated /readyz");
+        assert_eq!(authenticated.status(), StatusCode::OK);
+        let body = to_bytes(authenticated.into_body(), 1024)
+            .await
+            .expect("read /readyz body");
+        let text = std::str::from_utf8(&body).expect("readyz is utf-8");
+        let ready: Value = serde_json::from_str(text).expect("readyz is json");
+        assert_eq!(
+            ready,
+            json!({
+                "version": "1.2.3",
+                "build_id": "build-abc",
+                "python_host_ready": true,
+                "invocation_id": "invocation-test",
+            })
+        );
+        assert!(!text.contains("frontend"), "{text}");
+        assert!(!text.contains("zerodeck-readiness-secret"), "{text}");
+        assert!(
+            !text.contains(&secret_frontend.display().to_string()),
+            "{text}"
+        );
+
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("build /healthz req"),
+            )
+            .await
+            .expect("call /healthz");
+        assert_eq!(health.status(), StatusCode::OK);
+    }
 
     #[tokio::test]
     async fn server_auth_health_and_csrf_middleware_behave_as_specced() {

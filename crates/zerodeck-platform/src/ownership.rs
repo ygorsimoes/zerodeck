@@ -108,6 +108,58 @@ fn unreadable(path: &Path, err: &std::io::Error) -> OwnershipViolation {
     }
 }
 
+/// Verifies that `path` and every ancestor up to `/` is root-owned, not group/world writable, and
+/// not reached through a symlink.
+///
+/// A root daemon that reads release files from a path below a non-root-writable directory trusts
+/// that directory's owner not to replace them. This check is the fail-closed version of
+/// [`non_root_writable_ancestors`]: unlike that diagnostic helper, an unreadable entry is a
+/// violation. Callers that may run unprivileged should use [`ensure_root_owned_ancestors`].
+#[cfg(unix)]
+pub fn check_secure_ancestors(path: &Path) -> Result<(), OwnershipViolation> {
+    // Reject a symlink on the requested path before canonicalization hides it. A root-owned
+    // symlink is still not part of the contract: producers must use a real directory tree.
+    let mut component = PathBuf::new();
+    for part in path.components() {
+        component.push(part.as_os_str());
+        let meta =
+            std::fs::symlink_metadata(&component).map_err(|err| unreadable(&component, &err))?;
+        if meta.file_type().is_symlink() {
+            return Err(OwnershipViolation {
+                path: component,
+                kind: ViolationKind::Symlink,
+            });
+        }
+    }
+
+    let absolute = std::fs::canonicalize(path).map_err(|err| unreadable(path, &err))?;
+    for ancestor in absolute.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(ancestor).map_err(|err| unreadable(ancestor, &err))?;
+        if let Some(kind) = check_entry(entry_meta(&meta)) {
+            return Err(OwnershipViolation {
+                path: ancestor.to_path_buf(),
+                kind,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Root-only form of [`check_secure_ancestors`].
+///
+/// Unprivileged development and test runs may use user-owned temporary roots; when the process is
+/// not root the check is a no-op. Every production caller runs as root.
+#[cfg(unix)]
+pub fn ensure_root_owned_ancestors(path: &Path) -> Result<(), OwnershipViolation> {
+    if rustix::process::geteuid().as_raw() != 0 {
+        return Ok(());
+    }
+    check_secure_ancestors(path)
+}
+
 /// Lists `path` (symlinks resolved) and its ancestors that a non-root user owns or that are
 /// group- or world-writable. Entries that cannot be inspected are skipped.
 #[cfg(unix)]
@@ -284,6 +336,48 @@ mod tests {
         let missing = dir.0.join("absent");
         let violation = check_root_only_tree(&missing).expect_err("missing tree must fail");
         assert_eq!(violation.path, missing);
+        assert!(matches!(violation.kind, ViolationKind::Unreadable(_)));
+    }
+
+    #[test]
+    fn secure_ancestors_reject_a_user_owned_root() {
+        let dir = TestDir::new("secure-ancestors-owned");
+        let root = fs::canonicalize(&dir.0).expect("canonical temp root");
+        let leaf = root.join("zerodeck");
+        fs::create_dir_all(&leaf).expect("create leaf");
+
+        let violation = check_secure_ancestors(&leaf).expect_err("user-owned root must fail");
+        assert_eq!(violation.path, leaf);
+        assert_eq!(
+            violation.kind,
+            ViolationKind::NotRootOwned {
+                uid: rustix::process::geteuid().as_raw()
+            }
+        );
+    }
+
+    #[test]
+    fn secure_ancestors_reject_a_symlinked_ancestor() {
+        let dir = TestDir::new("secure-ancestors-link");
+        let root = fs::canonicalize(&dir.0).expect("canonical temp root");
+        let real = root.join("real");
+        fs::create_dir_all(real.join("nested")).expect("create real tree");
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("create symlink ancestor");
+
+        let violation = check_secure_ancestors(&link.join("nested"))
+            .expect_err("a symlinked ancestor must fail");
+        assert_eq!(violation.path, link);
+        assert_eq!(violation.kind, ViolationKind::Symlink);
+    }
+
+    #[test]
+    fn secure_ancestors_report_unreadable_paths_fail_closed() {
+        let dir = TestDir::new("secure-ancestors-missing");
+        let missing = fs::canonicalize(&dir.0)
+            .expect("canonical temp root")
+            .join("absent");
+        let violation = check_secure_ancestors(&missing).expect_err("missing path must fail");
         assert!(matches!(violation.kind, ViolationKind::Unreadable(_)));
     }
 

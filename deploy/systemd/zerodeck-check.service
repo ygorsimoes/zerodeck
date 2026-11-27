@@ -1,0 +1,13 @@
+[Unit]
+Description=ZeroDeck loader update availability check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+# The timer only verifies the trusted catalog and reports an available release. It never stages or
+# activates anything.
+EnvironmentFile=-/etc/zerodeck/update.env
+ExecStart=/home/.zerodeck/bin/zerodeckctl update --check-only --root /home/.zerodeck
+Nice=10

@@ -101,6 +101,9 @@ struct Runtime {
     fail_build: Mutex<Option<String>>,
     fail_invocation: AtomicBool,
     fail_stop: AtomicBool,
+    /// After answering a failed readiness probe the unit stops being `active`, like a daemon in
+    /// the gap between two systemd restarts.
+    go_inactive_after_failed_ready: AtomicBool,
     ready_invocation_override: Mutex<Option<String>>,
     readiness_hits: AtomicUsize,
 }
@@ -117,6 +120,7 @@ impl Runtime {
             fail_build: Mutex::new(None),
             fail_invocation: AtomicBool::new(false),
             fail_stop: AtomicBool::new(false),
+            go_inactive_after_failed_ready: AtomicBool::new(false),
             ready_invocation_override: Mutex::new(None),
             readiness_hits: AtomicUsize::new(0),
         }
@@ -311,6 +315,14 @@ async fn readyz(State(server): State<ServerState>, headers: HeaderMap) -> Respon
         .expect("fail build lock")
         .as_deref()
         == Some(build_id.as_str());
+    if failed
+        && server
+            .runtime
+            .go_inactive_after_failed_ready
+            .swap(false, Ordering::SeqCst)
+    {
+        server.runtime.active.store(false, Ordering::SeqCst);
+    }
     let reported_build = if failed {
         "failed-readiness".to_owned()
     } else {
@@ -1991,6 +2003,55 @@ async fn failed_candidate_is_quarantined_and_previous_is_kept() {
     assert!(state.pending.is_none());
     assert!(state.quarantined.contains(&candidate));
     assert!(state.last_error.is_some());
+}
+
+#[tokio::test]
+async fn a_crash_looping_candidate_is_stopped_before_the_previous_generation_starts() {
+    let harness = Harness::new("crash-loop-revert").await;
+    let (previous, _) = harness.add_generation('a', "1.0.0", "build-old");
+    let (candidate, candidate_release) = harness.add_generation('b', "2.0.0", "build-new");
+    harness
+        .store
+        .switch_to(&previous)
+        .expect("activate previous");
+    harness.write_state(&UpdateState {
+        last_confirmed: Some(previous.clone()),
+        ..UpdateState::new()
+    });
+    harness.set_catalog(candidate_release.clone(), now() - 10, now() + 3_600);
+    harness.set_running(true);
+    // systemd restarts a crashing daemon every few seconds; between attempts the unit is not
+    // `active`, yet its restart timer is still armed and must be cancelled by a stop.
+    harness.fail_build(Some("build-new"));
+    harness
+        .runtime
+        .go_inactive_after_failed_ready
+        .store(true, Ordering::SeqCst);
+    harness.enqueue(&ApplyRequest::upgrade(
+        candidate_release,
+        Some(previous.clone()),
+        false,
+    ));
+
+    harness
+        .apply()
+        .await
+        .expect_err("a candidate that cannot serve must fail");
+    harness.fail_build(None);
+
+    assert_eq!(harness.current(), Some(previous));
+    assert!(harness.runtime.active.load(Ordering::SeqCst));
+    assert!(harness.read_state().quarantined.contains(&candidate));
+    assert_eq!(
+        harness.calls(),
+        vec![
+            ServiceCall::Stop,
+            ServiceCall::Start,
+            ServiceCall::Stop,
+            ServiceCall::Start
+        ],
+        "the revert must stop the restart-looping unit before starting the previous generation"
+    );
 }
 
 #[test]

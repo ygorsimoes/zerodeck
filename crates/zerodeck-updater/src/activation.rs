@@ -668,8 +668,10 @@ async fn reconcile_failure(
     pending.phase = TransactionPhase::Reverting;
     state.write(&reverting)?;
 
-    let active = service.is_active().await?;
-    if start_attempted && active {
+    // Stop whenever a start was attempted, not only while the unit is `active`: a crashing daemon
+    // sits in systemd's auto-restart gap (not `active`) with its restart timer still armed, and
+    // would otherwise race the previous generation's start.
+    if start_attempted {
         service.stop().await?;
     }
 
@@ -909,7 +911,8 @@ async fn recover_inner(
             })?;
             let previous_id = generation_from_layout(&previous)?;
             let current = store.current_reference()?;
-            if current.as_ref() != Some(&previous_id) && service.is_active().await? {
+            if current.as_ref() != Some(&previous_id) {
+                // Also cancels a pending systemd auto-restart of a crashing candidate.
                 service.stop().await?;
             }
             if store.current_reference()?.as_ref() != Some(&previous_id) {

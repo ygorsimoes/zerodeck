@@ -53,78 +53,58 @@ source_sha="$(download_verified "${tag}" "${candidate_dir}" .managed)"
 candidate="${candidate_dir}/zerodeck-${tag}-linux-x86_64.managed.tar.gz"
 digest="$(sha256sum "${candidate}" | cut -d' ' -f1)"
 
-baseline_dir="${out}/baseline"
-baseline_kind="release"
-baseline=""
-channels_commit="$("${gh_bin}" api "repos/${repo}/git/matching-refs/heads/channels" \
-    --jq '.[] | select(.ref == "refs/heads/channels") | .object.sha')"
-if [[ -n "${channels_commit}" ]]; then
-    [[ "${channels_commit}" =~ ^[0-9a-f]{40}$ ]] || exit 1
-    entries="$("${gh_bin}" api "repos/${repo}/contents?ref=${channels_commit}" \
-        --jq '.[] | select(.name == "stable.json" or .name == "stable.json.sig") | .name')"
-    if [[ -n "${entries}" ]]; then
-        mkdir -p "${baseline_dir}"
-        for file in stable.json stable.json.sig; do
-            "${gh_bin}" api "repos/${repo}/contents/${file}?ref=${channels_commit}" \
-                -H 'Accept: application/vnd.github.raw+json' >"${baseline_dir}/${file}"
-        done
-        baseline="$(python3 - "${tag}" "${tag_pattern}" "${baseline_dir}" \
-            "${here}/../trusted-root.json" <<'PY'
+# Pick the baseline from immutable release history. Stable is only a baseline when its exact
+# archive carries a qualification attestation; the mutable channels branch is never consulted.
+releases_file="${out}/releases.json"
+"${gh_bin}" api "repos/${repo}/releases?per_page=100" >"${releases_file}"
+stable_candidates="$(python3 - "${tag}" "${tag_pattern}" "${releases_file}" <<'PY'
 import json
-from pathlib import Path
 import re
-import subprocess
 import sys
 
-tag, pattern, directory, trust = sys.argv[1:]
-root = Path(directory)
-document = root / "stable.json"
-signature = root / "stable.sig"
-signature.write_bytes(bytes.fromhex((root / "stable.json.sig").read_text()))
-pubkey = root / "stable-key.der"
-for key in json.loads(Path(trust).read_text())["keys"]:
-    # SubjectPublicKeyInfo prefix for a raw Ed25519 public key.
-    pubkey.write_bytes(bytes.fromhex("302a300506032b6570032100" + key))
-    verified = subprocess.run(
-        [
-            "openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER",
-            "-inkey", pubkey, "-in", document, "-sigfile", signature,
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
-    )
-    if verified.returncode == 0:
-        break
-else:
-    raise SystemExit("qualify-stable: cannot authenticate previous Stable channel")
-
+candidate, pattern, path = sys.argv[1:4]
 def version(value):
     match = re.fullmatch(pattern, value)
     return tuple(map(int, match.groups()[:3])) if match else ()
 
-data = json.loads(document.read_text())
-previous = data["target"].split("/", 1)[0]
-digest = data["digest"]
-if (
-    data.get("schema") != 1 or data.get("channel") != "stable"
-    or not version(previous) or not re.fullmatch(r"[0-9a-f]{64}", digest)
-    or data["target"] != f"{previous}/zerodeck-{previous}-linux-x86_64.managed.tar.gz"
-):
-    raise SystemExit("qualify-stable: invalid previous Stable channel document")
-if version(previous) > version(tag):
-    raise SystemExit("qualify-stable: candidate version is older than Stable")
-if version(previous) < version(tag):
-    print(previous, digest)
+current = version(candidate)
+entries = []
+for release in json.load(open(path, encoding="utf-8")):
+    if release.get("draft") or release.get("prerelease") or release.get("immutable") is not True:
+        continue
+    tag = release.get("tag_name", "")
+    previous = version(tag)
+    if previous and previous < current:
+        entries.append((previous, tag))
+for _, tag in sorted(entries, reverse=True):
+    print(tag)
 PY
-        )"
+)"
+baseline_dir="${out}/baseline"
+baseline_tag=""
+if [[ -n "${stable_candidates}" ]]; then
+    while IFS= read -r previous; do
+        [[ -n "${previous}" ]] || continue
+        if ! download_verified "${previous}" "${baseline_dir}" "" .managed >/dev/null; then
+            continue
+        fi
+        previous_archive="${baseline_dir}/zerodeck-${previous}-linux-x86_64.managed.tar.gz"
+        if "${gh_bin}" attestation verify "${previous_archive}" \
+            --repo "${repo}" \
+            --signer-workflow "${repo}/.github/workflows/qualify-stable.yml" \
+            --source-ref refs/heads/main \
+            --predicate-type "https://github.com/${repo}/attestations/stable-vm/v1" \
+            --deny-self-hosted-runners >/dev/null 2>&1; then
+            baseline_tag="${previous}"
+            break
+        fi
+    done <<<"${stable_candidates}"
+    if [[ -z "${baseline_tag}" ]]; then
+        echo "qualify-stable: no previous Stable release has VM qualification evidence" >&2
+        echo "qualify-stable: qualify that release first; a fixture is only allowed for the first release" >&2
+        exit 1
     fi
-fi
-
-if [[ -n "${baseline}" ]]; then
-    read -r baseline_tag baseline_digest <<<"${baseline}"
-    download_verified "${baseline_tag}" "${baseline_dir}" "" .managed >/dev/null || exit 1
-    printf '%s  %s\n' "${baseline_digest}" \
-        "${baseline_dir}/zerodeck-${baseline_tag}-linux-x86_64.managed.tar.gz" \
-        | sha256sum --check --status
+    baseline_kind="release"
 else
     baseline_tag="v0.0.0"
     baseline_kind="fixture"

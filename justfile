@@ -322,6 +322,7 @@ _release-scripts:
     bash deploy/update/tests/bootstrap.sh
     bash deploy/update/tests/publish.sh
     bash deploy/update/tests/sign-channel.sh
+    bash deploy/update/tests/update-channels.sh
     bash deploy/update/tests/qualification.sh
     just _test-updater-vm-selftest
 

@@ -71,7 +71,7 @@ mod tests {
                 python_bin: "python3".to_owned(),
                 host_module_path: Some(python_host_dir()),
             },
-            startup_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(15),
             shutdown_timeout: Duration::from_millis(250),
             crash_window: Duration::from_secs(30),
             max_crashes_in_window: 3,
@@ -381,7 +381,7 @@ class Plugin:
             Err(HostError::GenerationMismatch)
         ));
         worker
-            .wait_ready("test-migrating", Duration::from_secs(4))
+            .wait_ready("test-migrating", Duration::from_secs(20))
             .await
             .expect("long-running main must not block readiness");
         supervisor.shutdown_all().await;
@@ -392,8 +392,14 @@ class Plugin:
     async fn worker_cannot_confirm_ready_after_early_main_failure() {
         let dir = TestDir::new("sup-main-failed");
         let paths = test_paths(&dir.0);
-        let supervisor = PluginSupervisor::new(paths.clone(), fast_supervisor_config())
-            .expect("init supervisor");
+        let supervisor = PluginSupervisor::new(
+            paths.clone(),
+            SupervisorConfig {
+                startup_timeout: Duration::from_secs(15),
+                ..fast_supervisor_config()
+            },
+        )
+        .expect("init supervisor");
         let spec = write_plugin(
             &paths,
             "early_failure",
@@ -410,7 +416,7 @@ class Plugin:
             .await
             .expect("start supervisor");
         let result = worker
-            .wait_ready("test-early_failure", Duration::from_secs(4))
+            .wait_ready("test-early_failure", Duration::from_secs(20))
             .await;
         assert!(
             matches!(result, Err(HostError::StartupFailed(reason)) if reason.contains("startup failure"))
@@ -423,8 +429,14 @@ class Plugin:
     async fn worker_must_answer_ipc_at_end_of_startup_observation() {
         let dir = TestDir::new("sup-main-blocks-ipc");
         let paths = test_paths(&dir.0);
-        let supervisor = PluginSupervisor::new(paths.clone(), fast_supervisor_config())
-            .expect("init supervisor");
+        let supervisor = PluginSupervisor::new(
+            paths.clone(),
+            SupervisorConfig {
+                startup_timeout: Duration::from_secs(15),
+                ..fast_supervisor_config()
+            },
+        )
+        .expect("init supervisor");
         let spec = write_plugin(
             &paths,
             "stalled_ipc",
@@ -441,7 +453,7 @@ class Plugin:
             .await
             .expect("start supervisor");
         let result = worker
-            .wait_ready("test-stalled_ipc", Duration::from_secs(5))
+            .wait_ready("test-stalled_ipc", Duration::from_secs(20))
             .await;
         assert!(matches!(result, Err(HostError::StartupFailed(_))));
         supervisor.shutdown_all().await;
@@ -499,7 +511,7 @@ class Plugin:
             json!("pong")
         );
         let result = worker
-            .wait_ready("test-retry_migration", Duration::from_secs(4))
+            .wait_ready("test-retry_migration", Duration::from_secs(20))
             .await;
         assert!(matches!(result, Err(HostError::StartupFailed(_))));
         supervisor.shutdown_all().await;

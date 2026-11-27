@@ -39,7 +39,7 @@ All file routes percent-decode path segments, reject empty/`..`/backslash/null-b
 - `POST /methods/get_plugins`: returns `200 OK` `{ "success": true, "result": ["<plugin_name>", ...] }` in `pluginOrder` + directory order.
 - `POST /methods/call_plugin_method`: accepts JSON `{ "plugin_name": string, "method_name": string, "args"?: object | array, "legacy"?: bool }`.
   - When `legacy` is omitted, infers `api_version == 0` from the target plugin's `plugin.json`; omitted `args` defaults to `{}` (legacy) or `[]` (`api_version >= 1`).
-  - Rejects empty or `_`-prefixed private methods (`400 Bad Request`), unknown plugins (`404 Not Found`), and disabled, passive, blocked (spawn preflight refused, see `failure_reason`), failed, or stopped workers (`503 Service Unavailable`).
+  - Rejects empty or `_`-prefixed private methods (`400 Bad Request`), unknown plugins (`404 Not Found`), and disabled, passive, blocked (launch policy refused, see `failure_reason`), failed, or stopped workers (`503 Service Unavailable`).
   - Returns `200 OK` `{ "success": true, "result": <value> }` on success, or `200 OK` `{ "success": false, "result": { "name": string, "error": string, "traceback": string | null } }` when the Python plugin raises an exception.
 
 ### WebSocket Router (`/ws?auth=<token>`)
@@ -58,7 +58,7 @@ Messages are JSON objects keyed by integer `type`:
 Implemented WS routes:
 - `utilities/ping` -> `REPLY` `"pong"`.
 - `utilities/filepicker` with positional `[path?, include_files?, filter?, extensions?, show_hidden?, max_entries?, include_folders?]` or 1-element options object -> lists entries within `SafePathSet` (`$DECKY_USER_HOME`/`$HOME`, `/run/media`, `$UNPRIVILEGED_PATH`/`$DECKY_HOME`), returning `{ path, realpath, files: [{ name, path, realpath, isdir, size, modified }], truncated }`. Symlink targets escaping allowed roots are omitted; a requested path outside every allowed root fails with `PathEscapeError`, whose message lists all allowed roots.
-- `loader/get_plugins` -> `REPLY` array of `PluginSummary` `{ "name", "version", "load_type", "disabled", "passive", "state", "failure_reason" }` ordered by `pluginOrder`. `failure_reason` is `null` unless the spawn preflight refused to start the plugin's worker; then `state` is `"Failed"` and `failure_reason` says why (the Python worker host is unavailable, or a `"root"` plugin's tree is not root-only, naming the offending path). Calls to such a plugin, and the `loader/reload_plugin`, `loader/enable_plugin` or `loader/install_plugin` call that tried to start it, fail with `PluginBlockedError`.
+- `loader/get_plugins` -> `REPLY` array of `PluginSummary` `{ "name", "version", "load_type", "disabled", "passive", "state", "failure_reason" }` ordered by `pluginOrder`. `failure_reason` names why a worker is refused or failed: a launch-policy refusal (the Python worker host is unavailable, a `"root"` plugin tree or import root is not root-only, or a host path is unsafe), a startup failure (import, migration, timeout, early `_main` failure), or a crash-loop stop. A launch-policy refusal makes calls fail with `PluginBlockedError`; a startup or runtime failure leaves the worker retrying until the crash-loop guard marks it `Failed`.
 - `loader/call_plugin_method` with `args: [plugin_name, method_name, ...positional_args]` -> dispatches `legacy: false`. Private `_`-prefixed methods are rejected with `PermissionError`.
 - `loader/call_legacy_plugin_method` with `args: [plugin_name, method_name, kwargs_object?]` -> dispatches `legacy: true` (defaults omitted kwargs to `{}`).
 - `loader/reload_plugin` with `args: [plugin_name]` -> restarts the plugin worker cleanly and replies `true`. If the refreshed `plugin.json` renames the plugin onto a name another plugin directory already owns, the reload fails with `DuplicatePluginNameError` and both plugins stay as they were.
@@ -71,7 +71,7 @@ Implemented WS routes:
 
 Server-to-client `EVENT` (`type: 5`) frames:
 - `loader/plugin_event`: `args` is `[{ "plugin": string, "event": string, "args": Value[] }]` emitted by a worker's `decky.emit(...)`, matching `WSRouter` listener spreading (`listener(...data.args)`).
-- `loader/plugins_changed`: `args` is `[PluginSummary[]]` (same shape as `loader/get_plugins`, including `failure_reason`) broadcast after plugin install, uninstall, enable, disable, order changes, debug manifest updates, or a reload that the spawn preflight refused or that clears an earlier refusal.
+- `loader/plugins_changed`: `args` is `[PluginSummary[]]` (same shape as `loader/get_plugins`, including `failure_reason`) broadcast after plugin install, uninstall, enable, disable, order changes, debug manifest updates, a launch-policy refusal or clearing it, or a worker startup failure.
 - `zerodeck/plugin_reloaded`: `args` is `[{ "plugin": string, "directory": string }]` broadcast when the debug watcher reloads a `"debug"` plugin backend.
 - `zerodeck/frontend_reloaded`: `args` is `[{ "plugin": string, "directory": string }]` broadcast when the debug watcher detects changes under a `"debug"` plugin's `dist/` directory.
 

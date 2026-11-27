@@ -131,13 +131,21 @@ Signing is automatic and lives only in `.github/workflows/channels.yml`:
 - `deploy/update/sign-channel.sh` refuses to sign unless the archive digest, `release.json` identity
   and GitHub build provenance (exact repository, signer workflow, source commit) verify;
 - Stable also requires a VM attestation for that same managed archive digest from
-  `Qualify Stable` on `main`. It exercises activation and rollback from the previous
-  signed Stable release, or a lower-version fixture for the first release. The release workflow
-  dispatches qualification after publication, and a passing qualification asks the channels
-  workflow to sign immediately. If it fails, rerun `Qualify Stable` for the same tag. A published
-  candidate can enter Testing while Stable waits for a passing result;
-- documents are valid for 90 days and re-signed when 30 days remain, so the daily run keeps them
-  fresh. A release that was never made immutable or is still a draft is never signed.
+  `Qualify Stable` on `main`. Qualification always updates from the newest published Stable
+  release that already has VM evidence; a lower-version fixture is allowed only when no previous
+  immutable stable release exists. The channels job selects the newest qualified Stable release
+  directly from immutable release history. It never reads the mutable `channels` branch to choose
+  a target, so rewriting that branch cannot redirect signing or downgrade Stable. A published
+  candidate can enter Testing while Stable waits for a passing result. The release workflow
+  dispatches qualification after publication; a passing qualification asks the channels workflow
+  to sign immediately. If it fails, rerun `Qualify Stable` for the same tag. If no release has a
+  qualified result, the channels run leaves Stable unchanged, so qualify the intended release
+  before its 90-day document expires. The qualification
+  workflow enforces the baseline from immutable release history, and `sign-channel.sh` trusts only
+  attestations from that workflow on `main`;
+- documents are valid for 90 days and the daily run re-signs the selected release, so a channel
+  that has a qualified target does not expire. A release that was never made immutable or is still
+  a draft is never signed.
 
 The qualification VM runs generic Linux with systemd. SteamOS survival and Game Mode compatibility
 are recorded independently in [COMPATIBILITY.md](COMPATIBILITY.md).

@@ -565,9 +565,12 @@ async fn run_supervisor_loop(
     initial_ready: oneshot::Sender<Result<(), HostError>>,
 ) {
     let mut initial_ready = Some(initial_ready);
-    let mut recent_crashes: VecDeque<Instant> = VecDeque::new();
-    let mut backoff = ctx.config.initial_backoff;
-    let mut startup_failures = 0usize;
+    let mut restart = RestartState {
+        recent_crashes: VecDeque::new(),
+        backoff: ctx.config.initial_backoff,
+        startup_failures: 0,
+    };
+    let env_python_path = std::env::var("PYTHONPATH").ok();
 
     loop {
         ctx.set_state(PluginState::Starting);
@@ -577,7 +580,13 @@ async fn run_supervisor_loop(
                 acknowledge_stopped(&ctx, command);
                 return;
             }
-            result = validate_worker_launch(&ctx.paths, &ctx.spec, &ctx.allow_unsafe_root_plugins) => result,
+            result = validate_worker_launch(
+                &ctx.paths,
+                &ctx.spec,
+                &ctx.allow_unsafe_root_plugins,
+                ctx.config.python_host.host_module_path.as_deref()
+                    .or(env_python_path.as_deref()),
+            ) => result,
         };
         if let Err(err) = validation {
             let reason = err.to_string();
@@ -606,19 +615,19 @@ async fn run_supervisor_loop(
             Err(err) => {
                 error!(plugin = %ctx.spec.manifest.name, error = %err, "failed to spawn plugin worker");
                 ctx.record_failure(err.to_string());
-                startup_failures = startup_failures.saturating_add(1);
+                restart.startup_failures = restart.startup_failures.saturating_add(1);
                 if handle_unexpected_exit(
                     &mut ctx,
                     spawned_at,
-                    &mut recent_crashes,
-                    &mut backoff,
-                    startup_failures,
+                    &mut restart.recent_crashes,
+                    &mut restart.backoff,
+                    restart.startup_failures,
                 )
                 .await
                 {
                     return;
                 }
-                backoff = next_backoff(backoff, ctx.config.max_backoff);
+                restart.backoff = next_backoff(restart.backoff, ctx.config.max_backoff);
                 continue;
             }
         };
@@ -628,38 +637,13 @@ async fn run_supervisor_loop(
         ctx.set_state(PluginState::Stopping);
         fail_pending_calls(&running.pending);
         *lock_unpoisoned(&ctx.active) = None;
-
-        let reason = match exit_reason {
-            WorkerExit::Shutdown { uninstall, done } => {
-                let res = terminate_worker(running, uninstall, ctx.config.shutdown_timeout).await;
-                ctx.set_state(PluginState::Stopped);
-                let _ = done.send(res);
-                return;
-            }
-            WorkerExit::IpcClosed => {
-                let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
-                "plugin IPC reader terminated".to_owned()
-            }
-            WorkerExit::StartupFailed(reason) => {
-                ctx.record_failure(reason.clone());
-                let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
-                reason
-            }
-            WorkerExit::Crashed(reason) => reason,
-        };
-        warn!(plugin = %ctx.spec.manifest.name, %reason, "plugin worker exited unexpectedly");
-        if confirmed {
-            startup_failures = 0;
-        } else {
-            ctx.record_failure(reason);
-            startup_failures = startup_failures.saturating_add(1);
-        }
-        if handle_unexpected_exit(
+        if handle_worker_exit(
             &mut ctx,
+            exit_reason,
+            running,
+            confirmed,
             spawned_at,
-            &mut recent_crashes,
-            &mut backoff,
-            startup_failures,
+            &mut restart,
         )
         .await
         {
@@ -668,11 +652,62 @@ async fn run_supervisor_loop(
     }
 }
 
+struct RestartState {
+    recent_crashes: VecDeque<Instant>,
+    backoff: Duration,
+    startup_failures: usize,
+}
+
+async fn handle_worker_exit(
+    ctx: &mut SupervisorTaskCtx,
+    exit_reason: WorkerExit,
+    running: RunningWorkerProcess,
+    confirmed: bool,
+    spawned_at: Instant,
+    restart: &mut RestartState,
+) -> bool {
+    let reason = match exit_reason {
+        WorkerExit::Shutdown { uninstall, done } => {
+            let res = terminate_worker(running, uninstall, ctx.config.shutdown_timeout).await;
+            ctx.set_state(PluginState::Stopped);
+            let _ = done.send(res);
+            return true;
+        }
+        WorkerExit::IpcClosed => {
+            ctx.record_failure("plugin IPC reader terminated".to_owned());
+            let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
+            "plugin IPC reader terminated".to_owned()
+        }
+        WorkerExit::StartupFailed(reason) => {
+            ctx.record_failure(reason.clone());
+            let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
+            reason
+        }
+        WorkerExit::Crashed(reason) => reason,
+    };
+    warn!(plugin = %ctx.spec.manifest.name, %reason, "plugin worker exited unexpectedly");
+    ctx.record_failure(reason);
+    if confirmed {
+        restart.startup_failures = 0;
+    } else {
+        restart.startup_failures = restart.startup_failures.saturating_add(1);
+    }
+    handle_unexpected_exit(
+        ctx,
+        spawned_at,
+        &mut restart.recent_crashes,
+        &mut restart.backoff,
+        restart.startup_failures,
+    )
+    .await
+}
+
 /// Checks the actual executable tree for every launch, including supervisor-owned retries.
 async fn validate_worker_launch(
     paths: &PlatformPaths,
     spec: &PluginSpawnSpec,
     allow_unsafe_root_plugins: &AtomicBool,
+    python_path: Option<&str>,
 ) -> Result<(), HostError> {
     #[cfg(unix)]
     if spec.privilege_target() == PrivilegeTarget::Root && current_process_identity().euid == 0 {
@@ -683,6 +718,7 @@ async fn validate_worker_launch(
         let directory = paths.plugins_dir().join(&spec.directory);
         let entrypoint = spec.entrypoint.clone();
         let plugin = spec.manifest.name.clone();
+        let python_path = python_path.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
             // Shared ancestors make both plugin import roots reachable through a trusted path.
             check_secure_ancestors(&entrypoint)?;
@@ -692,6 +728,17 @@ async fn validate_worker_launch(
             if let Some(parent) = entrypoint.parent().filter(|parent| *parent != directory) {
                 check_root_only_tree(parent)?;
             }
+            // A root worker also imports the Python host and any other PYTHONPATH modules. Never
+            // let a user-writable entry shadow root-owned code.
+            if let Some(path) = python_path {
+                for entry in std::env::split_paths(&path) {
+                    if entry.as_os_str().is_empty() {
+                        continue;
+                    }
+                    check_secure_ancestors(&entry)?;
+                    check_root_only_tree(&entry)?;
+                }
+            }
             Ok(())
         })
         .await
@@ -699,7 +746,7 @@ async fn validate_worker_launch(
         .map_err(HostError::UnsafeRootPlugin)?;
     }
     #[cfg(not(unix))]
-    let _ = (paths, spec, allow_unsafe_root_plugins);
+    let _ = (paths, spec, allow_unsafe_root_plugins, python_path);
     Ok(())
 }
 

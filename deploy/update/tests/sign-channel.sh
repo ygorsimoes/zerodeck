@@ -50,6 +50,20 @@ expect_failure() {
     fi
 }
 
+expect_exit() {
+    local label="$1" expected="$2"
+    shift 2
+    set +e
+    "$@" >"${tmp}/${label}.log" 2>&1
+    local actual=$?
+    set -e
+    if [[ "${actual}" -ne "${expected}" ]]; then
+        echo "error: ${label} exited ${actual}, expected ${expected}" >&2
+        cat "${tmp}/${label}.log" >&2
+        exit 1
+    fi
+}
+
 export GH_BIN="${fake_gh}"
 
 sign_ok() {
@@ -80,7 +94,8 @@ FAKE_GH_ATTEST_FAIL=1 expect_failure attest sign_ok stable "${tmp}/out2"
 [[ ! -e "${tmp}/out2/stable.json" ]]
 
 # Stable needs VM evidence attested for the very same archive; Testing can still advance.
-FAKE_GH_VM_ATTEST_FAIL=1 expect_failure unqualified sign_ok stable "${tmp}/unqualified"
+unqualified() { FAKE_GH_VM_ATTEST_FAIL=1 sign_ok stable "$1"; }
+expect_exit unqualified 33 unqualified "${tmp}/unqualified"
 [[ ! -e "${tmp}/unqualified/stable.json" ]]
 FAKE_GH_VM_ATTEST_FAIL=1 sign_ok testing "${tmp}/unqualified" >/dev/null
 [[ -s "${tmp}/unqualified/testing.json.sig" ]]

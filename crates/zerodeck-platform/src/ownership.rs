@@ -327,6 +327,11 @@ mod tests {
     }
 
     #[test]
+    fn secure_ancestors_accept_the_root_directory() {
+        check_secure_ancestors(Path::new("/")).expect("the filesystem root is a trusted anchor");
+    }
+
+    #[test]
     fn missing_tree_fails_closed() {
         let dir = TestDir::new("ownership-missing");
         let missing = dir.0.join("absent");

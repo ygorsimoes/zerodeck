@@ -5,8 +5,7 @@
 #   ZERODECK_EXPECTED_VERSION=0.1.0 ZERODECK_EXPECTED_BUILD_ID=v0.1.0-abc \
 #     bash deploy/update/tests/release.sh dist/zerodeck-v0.1.0-linux-x86_64.managed.tar.gz
 #
-# `--validate-only` validates one archive and skips the mutation/publish/promotion simulations; the
-# promotion script uses that mode after it has independently verified the published source bytes.
+# `ZERODECK_RELEASE_SKIP_SIMULATIONS=1` validates one archive and skips the publish/signing simulations.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -92,10 +91,10 @@ for mutation in "${mutations[@]}"; do
     printf 'release archive rejected (%s): %s\n' "${mutation}" "$(tail -n 1 "${tmp}/${mutation}.log")"
 done
 
-# ── Publication and TUF promotion boundaries ────────────────────────────────────────────────────
+# ── Publication and channel-signing boundaries ────────────────────────────────────────────────────
 if [[ "${ZERODECK_RELEASE_SKIP_SIMULATIONS:-0}" != "1" ]]; then
     bash "${tests_dir}/publish.sh"
-    bash "${tests_dir}/promotion.sh"
+    bash "${tests_dir}/sign-channel.sh"
 fi
 
 echo "release package test passed: ${name} (${mode}, version ${expected_version}, build ${expected_build_id})"

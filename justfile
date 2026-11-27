@@ -130,6 +130,11 @@ check-release:
 test-updater-vm image ssh_key ssh_user manual managed candidate="-":
     just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}" "{{ candidate }}"
 
+# Run the updater VM gate against the pinned Arch cloud image (needs KVM, qemu, cloud-image-utils)
+[group('checks')]
+test-updater-vm-ci dist_dir tag:
+    bash deploy/update/tests/vm-ci.sh "{{ dist_dir }}" "{{ tag }}"
+
 # Exercise the VM harness itself with fake qemu/ssh (no image or hardware required)
 [group('checks')]
 test-updater-vm-selftest:

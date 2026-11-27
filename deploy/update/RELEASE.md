@@ -274,7 +274,9 @@ version with a different digest, or a release that requires a newer controller.
 - **VM crash gate:** CI job `vm` boots the packaged release in a KVM VM (pinned Arch Linux cloud
   image) and drives update, rollback, hard poweroff, `SIGKILL` of the apply helper, port collision,
   corrupt rollback, reboot during recovery and a second recovery pass:
-  `just test-updater-vm-ci dist <tag>`. To run it against another image use
+  `just test-updater-vm-ci dist <tag> <candidate>`, where the candidate comes from
+  `just build-vm-candidate 0.1.1 <dir>` (a second build with a bumped version, because the updater
+  rightly refuses a new digest under an installed version). To run it against another image use
   `just test-updater-vm <image> <key> <user> <manual> <managed> [<next-managed>]`; it exits `77`
   with `skipped: no qemu/image` when the host cannot run it, and a skip is not a pass. The update
   scenarios write the catalog authorization directly instead of fetching a channel; the channel

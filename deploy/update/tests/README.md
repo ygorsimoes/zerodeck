@@ -8,7 +8,7 @@ The source image is never opened for writing. Every run uses a new overlay and Q
 removed by an `EXIT` trap, including on failure or interrupt.
 
 In CI the `vm` job runs it on KVM against a pinned Arch Linux cloud image
-(`just test-updater-vm-ci dist <tag>`, see `vm-ci.sh`). That is a generic systemd VM, not SteamOS;
+(`just test-updater-vm-ci dist <tag> <candidate>`, see `vm-ci.sh`). That is a generic systemd VM, not SteamOS;
 SteamOS-specific behavior is recorded in [`../COMPATIBILITY.md`](../COMPATIBILITY.md). The harness
 itself is exercised without QEMU by `vm.sh --self-test`.
 

@@ -132,8 +132,13 @@ test-updater-vm image ssh_key ssh_user manual managed candidate="-":
 
 # Run the updater VM gate against the pinned Arch cloud image (needs KVM, qemu, cloud-image-utils)
 [group('checks')]
-test-updater-vm-ci dist_dir tag:
-    bash deploy/update/tests/vm-ci.sh "{{ dist_dir }}" "{{ tag }}"
+test-updater-vm-ci dist_dir tag candidate:
+    bash deploy/update/tests/vm-ci.sh "{{ dist_dir }}" "{{ tag }}" "{{ candidate }}"
+
+# Build a managed archive of a newer version (a second image build) for the VM update scenarios
+[group('checks')]
+build-vm-candidate version out_dir:
+    bash deploy/update/tests/build-candidate.sh "{{ version }}" "{{ out_dir }}"
 
 # Exercise the VM harness itself with fake qemu/ssh (no image or hardware required)
 [group('checks')]

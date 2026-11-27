@@ -45,6 +45,13 @@
 - [ ] 🐳 **Docker / CI:** `just ci` passes (when `Dockerfile`, `compose.yaml`, `justfile`, `.devcontainer/` or `.github/**` changed)
 - [ ] 🛡️ **Safety & Licensing:** Any `unsafe` code is minimized and documented with `// SAFETY:` invariants; clean-room **MIT** boundaries are strictly respected (no GPL code copied)
 
-## 📸 Screenshots, Logs, or Benchmarks (Optional)
+## 📸 Evidence (Steam Deck, logs, benchmarks)
 
-<!-- Attach screenshots, benchmark numbers, or CI run highlights if applicable. -->
+<!--
+  CI proves the code and the update path on a generic Linux VM. For a change that alters behavior on
+  the device, attach what the reviewer needs to see it working: a screenshot or recording from a
+  Steam Deck, `journalctl -u zerodeck` output, or benchmark numbers. State the Steam/SteamOS build.
+  Say "not applicable" for changes with no on-device effect.
+-->
+
+- [ ] Evidence attached (or not applicable): 

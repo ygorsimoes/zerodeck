@@ -1,13 +1,14 @@
-# ZeroDeck loader compatibility and release evidence
+# ZeroDeck loader compatibility checklist
 
-Copy this template to `deploy/update/evidence/<tag>.md` (for example `v0.1.0.md`) for each release
-candidate and fill every field from observed hardware. **Never mark Stable eligible from an unrecorded run.**
-Every field below starts as **PENDING**; replace it only with an observed value or `PASS`/`FAIL`
-plus the evidence reference (log, screenshot, command output or trace).
+Observations that only a real Steam Deck / SteamOS install can confirm. The update path itself
+(signed channel, staging, activation, rollback, crash recovery) is tested in CI, including a KVM
+VM run (see [`tests/README.md`](tests/README.md)); this file records what that cannot show. It
+informs a release and does **not** gate publication or the channels. Copy it per release
+(`deploy/update/evidence/<tag>.md` if you want it kept), replace each field with an observed value or
+`PASS`/`FAIL` plus a reference (log, screenshot, command output), and leave unobserved fields
+**PENDING**.
 
-**Current status: Deck evidence is PENDING. No Steam Deck or real SteamOS image run is recorded in
-this repository.** The VM harness is documented in [`tests/README.md`](tests/README.md) and its
-fake-qemu/fake-SSH self-test runs in `just check`; a real image run is still PENDING.
+**Current status: no Steam Deck or real SteamOS run is recorded yet.**
 
 ## Release identity
 
@@ -17,12 +18,12 @@ fake-qemu/fake-SSH self-test runs in `just check`; a real image run is still PEN
 | Loader version / build ID | PENDING |
 | Manual asset SHA-256 | PENDING |
 | Managed asset SHA-256 (generation identity) | PENDING |
-| Signed TUF targets version | PENDING |
-| TUF root version / out-of-band fingerprint | PENDING |
+| Channel document sequence / expiry | PENDING |
+| Trusted key fingerprint (`trusted-root.json`) | PENDING |
 | Runtime image digest | PENDING |
 | Source commit | PENDING |
 | Release workflow run URL | PENDING |
-| Promotion request / TUF signing run URL | PENDING |
+| `Channels` workflow run URL | PENDING |
 
 ## Host, Steam and invocation identity
 
@@ -147,10 +148,4 @@ before adopting a new archive compression format.
 ## Sign-off
 
 - Operator: PENDING
-- Independent reviewer: PENDING
 - Date: PENDING
-- Stable eligible: PENDING
-
-Reason: hardware evidence not recorded. Replace the exact line above with
-`Stable eligible: PASS` only after every value in this file is observed; the promotion workflow
-refuses any remaining `PENDING` value.

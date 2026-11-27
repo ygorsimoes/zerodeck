@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,14 +43,13 @@ impl Drop for TestDir {
 struct MemorySource(HashMap<String, Vec<u8>>);
 
 impl ChannelSource for MemorySource {
-    async fn fetch(&self, url: &Url) -> Result<Vec<u8>, UpdateError> {
-        self.0
-            .get(url.as_str())
-            .cloned()
-            .ok_or_else(|| UpdateError::ChannelFetch {
+    fn fetch(&self, url: &Url) -> impl Future<Output = Result<Vec<u8>, UpdateError>> + Send {
+        std::future::ready(self.0.get(url.as_str()).cloned().ok_or_else(|| {
+            UpdateError::ChannelFetch {
                 url: url.to_string(),
                 reason: "not found".to_owned(),
-            })
+            }
+        }))
     }
 }
 
@@ -97,12 +97,11 @@ fn document(channel: &str, version: &str, sequence: u64, fill: char) -> Value {
 fn publish(source: &mut MemorySource, channel: &str, document: &Value, key: &SigningKey) {
     let bytes = serde_json::to_vec_pretty(document).expect("serialize document");
     let signature = hex::encode(key.sign(&bytes).to_bytes());
-    source
-        .0
-        .insert(format!("{CHANNELS}{channel}.json"), bytes);
-    source
-        .0
-        .insert(format!("{CHANNELS}{channel}.json.sig"), signature.into_bytes());
+    source.0.insert(format!("{CHANNELS}{channel}.json"), bytes);
+    source.0.insert(
+        format!("{CHANNELS}{channel}.json.sig"),
+        signature.into_bytes(),
+    );
 }
 
 async fn load(
@@ -134,7 +133,12 @@ fn generation(fill: char) -> GenerationId {
 async fn a_signed_channel_authorizes_exactly_its_release() {
     let key = signing_key(1);
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &key,
+    );
     let root = TestDir::new("ok");
 
     let catalog = load(&root, &source, &keys_document(&[&key]), Channel::Stable)
@@ -167,12 +171,22 @@ async fn any_pinned_key_may_sign() {
     let old = signing_key(1);
     let new = signing_key(2);
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &new);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &new,
+    );
     let root = TestDir::new("two-keys");
 
-    load(&root, &source, &keys_document(&[&old, &new]), Channel::Stable)
-        .await
-        .expect("the second pinned key verifies the document");
+    load(
+        &root,
+        &source,
+        &keys_document(&[&old, &new]),
+        Channel::Stable,
+    )
+    .await
+    .expect("the second pinned key verifies the document");
 }
 
 #[tokio::test]
@@ -182,7 +196,12 @@ async fn an_untrusted_or_tampered_document_is_rejected() {
     let keys = keys_document(&[&trusted]);
 
     let mut forged = MemorySource::default();
-    publish(&mut forged, "stable", &document("stable", "0.2.0", 1, 'a'), &attacker);
+    publish(
+        &mut forged,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &attacker,
+    );
     let root = TestDir::new("forged");
     assert!(matches!(
         load(&root, &forged, &keys, Channel::Stable).await,
@@ -190,7 +209,12 @@ async fn an_untrusted_or_tampered_document_is_rejected() {
     ));
 
     let mut tampered = MemorySource::default();
-    publish(&mut tampered, "stable", &document("stable", "0.2.0", 1, 'a'), &trusted);
+    publish(
+        &mut tampered,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &trusted,
+    );
     let key = format!("{CHANNELS}stable.json");
     let altered = String::from_utf8(tampered.0[&key].clone())
         .expect("utf8")
@@ -240,13 +264,25 @@ async fn an_older_sequence_is_a_replay_but_the_same_sequence_is_fine() {
     let root = TestDir::new("sequence");
 
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 5, 'a'), &key);
-    load(&root, &source, &keys, Channel::Stable).await.expect("sequence 5");
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 5, 'a'),
+        &key,
+    );
+    load(&root, &source, &keys, Channel::Stable)
+        .await
+        .expect("sequence 5");
     load(&root, &source, &keys, Channel::Stable)
         .await
         .expect("re-reading the same sequence is allowed");
 
-    publish(&mut source, "stable", &document("stable", "0.1.0", 4, 'b'), &key);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.1.0", 4, 'b'),
+        &key,
+    );
     assert!(matches!(
         load(&root, &source, &keys, Channel::Stable).await,
         Err(UpdateError::ChannelRollback {
@@ -261,7 +297,12 @@ async fn an_older_sequence_is_a_replay_but_the_same_sequence_is_fine() {
 async fn a_clock_behind_the_last_verification_fails_closed() {
     let key = signing_key(1);
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &key,
+    );
     let root = TestDir::new("clock");
     let store = CatalogStateStore::new(root.0.join("state/catalog.json"));
     store
@@ -315,7 +356,12 @@ async fn unsafe_targets_and_bad_digests_are_rejected() {
 async fn unusable_trusted_keys_are_rejected() {
     let key = signing_key(1);
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &key,
+    );
     for keys in [&br#"{"keys":[]}"#[..], br#"{"keys":["zz"]}"#, b"not json"] {
         let root = TestDir::new("bad-keys");
         assert!(matches!(
@@ -333,8 +379,15 @@ async fn selection_applies_policy_to_the_signed_release() {
 
     // Prerelease: only with the Testing policy.
     let mut source = MemorySource::default();
-    publish(&mut source, "testing", &document("testing", "0.3.0-rc.1", 1, 'c'), &key);
-    let catalog = load(&root, &source, &keys, Channel::Testing).await.expect("load");
+    publish(
+        &mut source,
+        "testing",
+        &document("testing", "0.3.0-rc.1", 1, 'c'),
+        &key,
+    );
+    let catalog = load(&root, &source, &keys, Channel::Testing)
+        .await
+        .expect("load");
     let testing = policy().with_channel(Channel::Testing);
     assert!(catalog.preview_candidate(&testing).unwrap().is_none());
     assert!(
@@ -357,7 +410,12 @@ async fn selection_applies_policy_to_the_signed_release() {
 
     // Installed version: older/equal are skipped, same version with another digest conflicts.
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &key,
+    );
     let installed_root = TestDir::new("installed");
     let catalog = load(&installed_root, &source, &keys, Channel::Stable)
         .await
@@ -398,9 +456,16 @@ async fn only_candidate_persists_and_a_changed_channel_drops_a_stale_authorizati
     let keys = keys_document(&[&key]);
     let root = TestDir::new("persist");
     let mut source = MemorySource::default();
-    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.2.0", 1, 'a'),
+        &key,
+    );
 
-    let catalog = load(&root, &source, &keys, Channel::Stable).await.expect("load");
+    let catalog = load(&root, &source, &keys, Channel::Stable)
+        .await
+        .expect("load");
     assert!(catalog.preview_candidate(&policy()).unwrap().is_some());
     assert_eq!(
         catalog.persisted_authorization().unwrap(),
@@ -409,7 +474,9 @@ async fn only_candidate_persists_and_a_changed_channel_drops_a_stale_authorizati
     );
 
     let staged = catalog.candidate(&policy()).unwrap().expect("stage 0.2.0");
-    let reloaded = load(&root, &source, &keys, Channel::Stable).await.expect("reload");
+    let reloaded = load(&root, &source, &keys, Channel::Stable)
+        .await
+        .expect("reload");
     assert_eq!(
         reloaded
             .persisted_authorization()
@@ -419,8 +486,15 @@ async fn only_candidate_persists_and_a_changed_channel_drops_a_stale_authorizati
         "an unchanged channel keeps the staged authorization"
     );
 
-    publish(&mut source, "stable", &document("stable", "0.3.0", 2, 'b'), &key);
-    let moved = load(&root, &source, &keys, Channel::Stable).await.expect("load 0.3.0");
+    publish(
+        &mut source,
+        "stable",
+        &document("stable", "0.3.0", 2, 'b'),
+        &key,
+    );
+    let moved = load(&root, &source, &keys, Channel::Stable)
+        .await
+        .expect("load 0.3.0");
     assert_eq!(
         moved.persisted_authorization().unwrap(),
         None,
@@ -436,4 +510,54 @@ async fn offline_catalogs_cannot_select() {
         offline.candidate(&policy()),
         Err(UpdateError::CatalogNotLoaded | UpdateError::CatalogNotVerified)
     ));
+}
+
+/// The release automation signs with `openssl`; the client must accept exactly what it produces.
+/// Skipped where the local `openssl` cannot do raw ed25519 (for example macOS `LibreSSL`); the dev
+/// image and CI have `OpenSSL` 3.
+#[tokio::test]
+async fn documents_signed_by_openssl_verify() {
+    use std::process::Command;
+
+    let dir = TestDir::new("openssl");
+    let key = dir.0.join("key.pem");
+    let generated = Command::new("openssl")
+        .args(["genpkey", "-algorithm", "ed25519", "-out"])
+        .arg(&key)
+        .output();
+    if !generated.is_ok_and(|output| output.status.success()) {
+        eprintln!("skipped: openssl without ed25519 support");
+        return;
+    }
+    let public = Command::new("openssl")
+        .args(["pkey", "-pubout", "-outform", "DER", "-in"])
+        .arg(&key)
+        .output()
+        .expect("derive public key");
+    let der = public.stdout;
+    let raw = &der[der.len() - 32..];
+
+    let mut source = MemorySource::default();
+    let bytes = serde_json::to_vec_pretty(&document("stable", "0.2.0", 1, 'a')).expect("document");
+    let path = dir.0.join("stable.json");
+    fs::write(&path, &bytes).expect("write document");
+    let signed = Command::new("openssl")
+        .args(["pkeyutl", "-sign", "-rawin", "-inkey"])
+        .arg(&key)
+        .arg("-in")
+        .arg(&path)
+        .output()
+        .expect("sign with openssl");
+    assert!(signed.status.success(), "openssl failed to sign");
+    source.0.insert(format!("{CHANNELS}stable.json"), bytes);
+    source.0.insert(
+        format!("{CHANNELS}stable.json.sig"),
+        format!("{}\n", hex::encode(signed.stdout)).into_bytes(),
+    );
+    let keys = serde_json::to_vec(&json!({ "keys": [hex::encode(raw)] })).expect("keys");
+
+    let root = TestDir::new("openssl-root");
+    load(&root, &source, &keys, Channel::Stable)
+        .await
+        .expect("an openssl ed25519 signature must verify");
 }

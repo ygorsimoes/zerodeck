@@ -116,7 +116,7 @@ py-test-on version:
 py-matrix:
     for v in {{ python_versions }}; do just py-test-on "$v"; done
 
-# Release tooling tests: publish/promotion/evidence-gate scripts, bootstrap and the VM harness
+# Release tooling tests: publish and channel-signing scripts, bootstrap and the VM harness
 [group('checks')]
 check-release:
     {{ dev }} just _release-scripts
@@ -204,7 +204,7 @@ smoke *flags="--build":
     echo
     echo "smoke: zerodeckd is healthy"
 
-# Package the manual/diagnostic tarball, the managed TUF generation archive and SHA256SUMS from one
+# Package the manual/diagnostic tarball, the managed generation archive and SHA256SUMS from one
 # runtime image into dist/. Set ZERODECK_BUILD_ID for a real release.
 [group('runtime')]
 dist tag image="zerodeck:runtime":
@@ -220,13 +220,11 @@ dist-managed tag image="zerodeck:runtime":
 test-release-package archive:
     just _test-release-package "{{ archive }}"
 
-# Fail closed unless a completed hardware evidence record authorizes this Stable release
+# Re-sign the stable/testing channel documents when a release changed or one is close to expiry
+# (runs in the `channels` workflow; needs gh, openssl and python3 on the host)
 [group('runtime')]
-verify-stable-evidence tag build_id sha256:
-    bash deploy/update/verify-stable-evidence.sh \
-        --tag "{{ tag }}" --version "$(printf '%s' '{{ tag }}' | sed 's/^v//')" \
-        --build-id "{{ build_id }}" --sha256 "{{ sha256 }}" \
-        --evidence "deploy/update/evidence/{{ tag }}.md"
+update-channels repository channels_dir key:
+    bash deploy/update/update-channels.sh "{{ repository }}" "{{ channels_dir }}" "{{ key }}"
 
 # Unpack a managed archive and require the packaged daemon to accept its embedded identity and
 # importable Python worker host
@@ -295,8 +293,7 @@ _release-scripts:
     bash deploy/update/tests/release-fixture.sh
     bash deploy/update/tests/bootstrap.sh
     bash deploy/update/tests/publish.sh
-    bash deploy/update/tests/promotion.sh
-    bash deploy/update/tests/stable-gate.sh
+    bash deploy/update/tests/sign-channel.sh
     just _test-updater-vm-selftest
 
 [private]

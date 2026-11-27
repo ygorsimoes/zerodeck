@@ -67,6 +67,7 @@ jobs:
       packages: write
       id-token: write
       attestations: write
+      actions: write
     steps:
       - name: Resolve the unpublished draft ID and exact commit
         id: identity
@@ -307,3 +308,10 @@ jobs:
           bash deploy/update/publish-release.sh \
             --repo "${GITHUB_REPOSITORY}" --release-id "${RELEASE_ID}" \
             --tag "${TAG}" --dist dist --publish
+
+      - name: Ask the channels workflow to sign the new release
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Best effort: the daily channels run picks the release up anyway if this dispatch fails.
+        run: gh workflow run channels.yml --repo "${GITHUB_REPOSITORY}" --ref main || echo "channels dispatch failed; the daily run will sign it"

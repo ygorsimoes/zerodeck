@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Verified administrative bootstrap for a managed ZeroDeck installation.
 #
-# Run only after obtaining the package hashes and the TUF root from an independent, trusted channel.
-# Nothing is extracted or executed until both archives and the trusted root match caller-supplied
-# SHA-256 digests. A new install never starts or enables anything unless `--start` is given.
+# Run only after obtaining the package hashes from the release's SHA256SUMS. Nothing is extracted or
+# executed until both archives match caller-supplied SHA-256 digests. A new install never starts or
+# enables anything unless `--start` is given. The channel public key (`trusted-root.json`) ships next
+# to this script and the channel/release URLs default to this project's GitHub, so a plain install is:
 #
 #   sudo ./bootstrap.sh \
 #     --package zerodeck-v0.1.0-linux-x86_64.tar.gz --sha256 <manual-sha256> \
 #     --generation zerodeck-v0.1.0-linux-x86_64.managed.tar.gz --generation-sha256 <managed-sha256> \
-#     --trusted-root root.json --trusted-root-sha256 <root-sha256> \
-#     --metadata-url https://updates.example/loader/metadata/ \
-#     --targets-url https://updates.example/loader/targets/ \
 #     --start
+#
+# After that, `sudo zerodeckctl update && sudo zerodeckctl upgrade --start` follows the channel.
 set -euo pipefail
 
 PROGRAM="bootstrap.sh"
@@ -32,10 +32,12 @@ package=""
 package_sha=""
 generation=""
 generation_sha=""
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 trusted_root=""
 trusted_root_sha=""
-metadata_url=""
-targets_url=""
+# Signed channel documents live on a dedicated branch; release archives on GitHub releases.
+metadata_url="https://raw.githubusercontent.com/ygorsimoes/zerodeck/channels/"
+targets_url="https://github.com/ygorsimoes/zerodeck/releases/download/"
 root="${DEFAULT_ROOT}"
 controller_root="${DEFAULT_CONTROLLER_ROOT}"
 systemd_dir="${DEFAULT_SYSTEMD_DIR}"
@@ -54,17 +56,17 @@ usage() {
     cat >&2 <<EOF
 usage: ${PROGRAM} --package <manual.tar.gz> --sha256 <hex>
                   --generation <managed.tar.gz> --generation-sha256 <hex>
-                  --trusted-root <root.json> --trusted-root-sha256 <hex>
-                  --metadata-url URL --targets-url URL
+                  [--trusted-root <trusted-root.json> --trusted-root-sha256 <hex>]
+                  [--metadata-url URL] [--targets-url URL]
                   [--convert-existing-zerodeck] [--import-inactive-decky PATH]
                   [--start] [--dry-run] [--ready-url URL]
                   [--root DIR] [--controller-root DIR] [--systemd-dir DIR]
                   [--config-dir DIR] [--bin-link PATH] [--data-dir DIR]
                   [--systemctl PATH]
 
-The package and generation hashes must come from outside the downloaded files (release notes,
-signed metadata, or another trusted channel). The TUF root is installed as the trust anchor; this
-script does not trust the first root it sees.
+The package and generation hashes must come from outside the downloaded files (the release's
+SHA256SUMS or another trusted channel). trusted-root.json holds the channel public key(s); it
+ships next to this script and is installed as the trust anchor for `zerodeckctl update`.
 EOF
     exit 2
 }
@@ -112,8 +114,13 @@ done
 
 [[ -n "${package}" ]] || usage
 [[ -n "${generation}" ]] || usage
-[[ -n "${trusted_root}" ]] || usage
-[[ -n "${metadata_url}" && -n "${targets_url}" ]] || usage
+if [[ -z "${trusted_root}" ]]; then
+    # The public key ships inside the verified manual archive, next to this script.
+    trusted_root="${script_dir}/trusted-root.json"
+    [[ -z "${trusted_root_sha}" ]] || die "--trusted-root-sha256 needs --trusted-root"
+    [[ -f "${trusted_root}" ]] || die "trusted-root.json not found next to ${PROGRAM}"
+    trusted_root_sha="$(sha256sum "${trusted_root}" | cut -d' ' -f1)"
+fi
 [[ "${package_sha}" =~ ^[0-9A-Fa-f]{64}$ ]] || die "--sha256 must be a 64-character SHA-256 hex digest"
 [[ "${generation_sha}" =~ ^[0-9A-Fa-f]{64}$ ]] || die "--generation-sha256 must be a SHA-256 digest"
 [[ "${trusted_root_sha}" =~ ^[0-9A-Fa-f]{64}$ ]] || die "--trusted-root-sha256 must be a SHA-256 digest"
@@ -317,39 +324,19 @@ check_digest "${inputs}/root.json" "${trusted_root_sha}" "trusted root"
 
 python3 - "${inputs}/root.json" <<'PY'
 import json
+import re
 import sys
-import time
 
 path = sys.argv[1]
 try:
     document = json.load(open(path, encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as error:
-    raise SystemExit(f"trusted root is not valid JSON: {error}")
-signed = document.get("signed")
-if not isinstance(signed, dict) or signed.get("_type") != "root":
-    raise SystemExit("trusted root is not a TUF root document")
-if not isinstance(signed.get("version"), int) or signed["version"] < 1:
-    raise SystemExit("trusted root has an invalid version")
-if signed.get("expires") and signed["expires"] <= time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()):
-    raise SystemExit("trusted root is expired")
-roles = signed.get("roles")
-keys = signed.get("keys")
-if not isinstance(roles, dict) or not isinstance(keys, dict) or not keys:
-    raise SystemExit("trusted root has no keys or roles")
-root_role = roles.get("root")
-targets_role = roles.get("targets")
-if not isinstance(root_role, dict) or not isinstance(targets_role, dict):
-    raise SystemExit("trusted root does not define root and targets roles")
-for role_name, role in (("root", root_role), ("targets", targets_role)):
-    keyids = role.get("keyids")
-    threshold = role.get("threshold")
-    if not isinstance(keyids, list) or not keyids or threshold not in (1, 2, 3, len(keyids)):
-        raise SystemExit(f"trusted root {role_name} role is incomplete")
-    if any(keyid not in keys for keyid in keyids):
-        raise SystemExit(f"trusted root {role_name} role references an unknown key")
-signatures = document.get("signatures")
-if not isinstance(signatures, list) or not signatures:
-    raise SystemExit("trusted root is unsigned")
+    raise SystemExit(f"trusted keys file is not valid JSON: {error}")
+keys = document.get("keys") if isinstance(document, dict) else None
+if set(document) != {"keys"} or not isinstance(keys, list) or not keys:
+    raise SystemExit('trusted keys file must be {"keys": ["<64 hex chars>", ...]}')
+if any(not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key) for key in keys):
+    raise SystemExit("trusted keys must be 32-byte lowercase hex ed25519 public keys")
 PY
 : >"${work}/.inputs-verified"
 

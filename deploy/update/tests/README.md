@@ -7,10 +7,10 @@ image under QEMU with a qcow2 overlay, installs the packaged release with the sh
 The source image is never opened for writing. Every run uses a new overlay and QEMU is always
 removed by an `EXIT` trap, including on failure or interrupt.
 
-**Status in this repository: the VM gate has not been executed against a real image.**
-`qemu-system-x86_64` and a systemd/SSH image were not available, so the recorded result is
-`skipped: no qemu/image` and deck evidence remains **PENDING**. The harness itself is exercised by
-`vm.sh --self-test`.
+In CI the `vm` job runs it on KVM against a pinned Arch Linux cloud image
+(`just test-updater-vm-ci dist <tag>`, see `vm-ci.sh`). That is a generic systemd VM, not SteamOS;
+SteamOS-specific behavior is recorded in [`../COMPATIBILITY.md`](../COMPATIBILITY.md). The harness
+itself is exercised without QEMU by `vm.sh --self-test`.
 
 ## Requirements
 
@@ -117,8 +117,8 @@ the start timeout to `ExecStartPre` as well as `ExecStart`, so a delay equal to 
 make `recover-boot` never run.
 
 The update scenarios use a local fixture authorization in `state/catalog.json` rather than a live
-TUF repository. TUF metadata selection, expiry, rotation and staging are covered by the Rust
-catalog/staging tests. The VM gate focuses on privileged systemd activation and crash recovery.
+channel. Channel signature, expiry, replay and selection are covered by the Rust catalog tests, and
+channel signing by `sign-channel.sh`. The VM gate focuses on privileged systemd activation and crash recovery.
 The harness never fetches a real release, never publishes anything, and never contacts Steam.
 
 ## Exit codes and evidence
@@ -148,12 +148,8 @@ byte-identical afterwards. It is part of `just check`/`just ci` through `_releas
 
 ## Steam Deck checklist
 
-The VM gate is necessary but not sufficient for Stable. `deploy/update/tests/stable-gate.sh`
-(part of `just check`) proves the promotion gate rejects a PENDING, mismatched or unsigned-off
-evidence record and accepts only an exact, complete `Stable eligible: PASS` record. The exact
-Steam/SteamOS/build identity,
+The VM gate cannot show SteamOS-specific behavior. Record the exact Steam/SteamOS/build identity,
 filesystems, invocation identity, on-device update and offline rollback, SteamOS-update survival
 with a read-only root, unchanged plugin inventory for a loader-only upgrade, peak RSS, bytes,
-temporary disk and stop-to-ready/stop-to-recovered timings must be recorded from observed hardware
-in [`../COMPATIBILITY.md`](../COMPATIBILITY.md). Every unexecuted item there is **PENDING**; do not
-mark Stable eligible without it.
+temporary disk and stop-to-ready/stop-to-recovered timings from observed hardware in
+[`../COMPATIBILITY.md`](../COMPATIBILITY.md). Unexecuted items stay **PENDING**.

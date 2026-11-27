@@ -101,13 +101,14 @@ if [[ "${mode}" == "manual" || "${mode}" == "all" ]]; then
     container=""
     cp deploy/systemd/*.service deploy/systemd/*.timer "${stage_manual}/systemd/"
     cp deploy/update/bootstrap.sh "${stage_manual}/bootstrap.sh"
+    cp deploy/update/trusted-root.json "${stage_manual}/trusted-root.json"
     cp deploy/update/RELEASE.md "${stage_manual}/docs/RELEASE.md"
     cp deploy/update/COMPATIBILITY.md "${stage_manual}/docs/COMPATIBILITY.md"
     cp LICENSE README.md "${stage_manual}/"
     chmod 0755 "${stage_manual}/bin/zerodeckd" "${stage_manual}/bin/zerodeckctl" \
         "${stage_manual}/bootstrap.sh"
     chmod 0644 "${stage_manual}"/systemd/* "${stage_manual}"/docs/* \
-        "${stage_manual}/LICENSE" "${stage_manual}/README.md"
+        "${stage_manual}/LICENSE" "${stage_manual}/README.md" "${stage_manual}/trusted-root.json"
 fi
 
 stage_managed=""

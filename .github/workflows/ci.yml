@@ -103,7 +103,7 @@ jobs:
       - uses: ./.github/actions/dev-image
       - name: ruff, pyright (strict), unittest
         run: just check-python
-      - name: Release scripts (publish, promotion, evidence gate, bootstrap, VM harness)
+      - name: Release scripts (publish, channel signing, bootstrap, VM harness)
         run: just check-release
 
   frontend:

@@ -267,6 +267,7 @@ def validate_manual(archive: Path, members: dict[str, tarfile.TarInfo], handle: 
     require_file(members, f"{wrapper}/bin/zerodeckd", 0o755)
     require_file(members, f"{wrapper}/bin/zerodeckctl", 0o755)
     require_file(members, f"{wrapper}/bootstrap.sh", 0o755)
+    require_file(members, f"{wrapper}/trusted-root.json")
     require_file(members, f"{wrapper}/LICENSE")
     require_file(members, f"{wrapper}/README.md")
     require_file(members, f"{wrapper}/docs/RELEASE.md")

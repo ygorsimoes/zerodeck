@@ -1,0 +1,70 @@
+name: Channels
+
+# Publishes the signed `stable` and `testing` channel documents that `zerodeckctl update` follows.
+# Fully automatic: the release workflow dispatches this right after publishing, and a daily run
+# both catches anything missed and re-signs a channel before its document expires. Signing happens only here, in the
+# `release-signing` environment (restricted to protected branches); the private key never leaves it.
+# The documents live on the unprotected `channels` branch, so a push there cannot forge a channel
+# without the key.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: channels
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-signing
+    permissions:
+      contents: write
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: just@1.59.0
+      - name: Check out the channels branch (created on first use)
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/${GITHUB_REPOSITORY}.git" channels >/dev/null; then
+            git clone --quiet --depth 1 --branch channels "https://github.com/${GITHUB_REPOSITORY}.git" channels
+          else
+            git init --quiet --initial-branch=channels channels
+          fi
+      - name: Sign what changed
+        env:
+          SIGNING_KEY: ${{ secrets.CHANNEL_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          key="${RUNNER_TEMP}/channel-signing-key.pem"
+          (umask 077 && printf '%s\n' "${SIGNING_KEY}" >"${key}")
+          trap 'rm -f "${key}"' EXIT
+          just update-channels "${GITHUB_REPOSITORY}" channels "${key}"
+      - name: Publish the channels branch
+        run: |
+          set -euo pipefail
+          cd channels
+          git add -A
+          if git diff --cached --quiet; then
+            echo "channels are up to date"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit --quiet -m "chore(channels): update signed channels"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:channels

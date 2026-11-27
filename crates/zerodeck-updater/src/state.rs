@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::schema::{Schema, SchemaFile};

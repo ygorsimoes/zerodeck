@@ -191,7 +191,7 @@ struct TrustedKeys {
 
 /// Where the two channel files come from: HTTPS in production, memory in tests.
 pub trait ChannelSource {
-    /// Fetches at most [`MAX_CHANNEL_BYTES`] from `url`.
+    /// Fetches a small channel file (implementations cap it at 16 KiB) from `url`.
     fn fetch(&self, url: &Url) -> impl Future<Output = Result<Vec<u8>, UpdateError>> + Send;
 }
 
@@ -623,10 +623,11 @@ fn release_from_document(
 }
 
 fn join(base: &Url, path: &str) -> Result<Url, UpdateError> {
-    base.join(path).map_err(|error| UpdateError::InvalidBaseUrl {
-        url: base.to_string(),
-        reason: error.to_string(),
-    })
+    base.join(path)
+        .map_err(|error| UpdateError::InvalidBaseUrl {
+            url: base.to_string(),
+            reason: error.to_string(),
+        })
 }
 
 fn directory_url(url: Url) -> Result<Url, UpdateError> {

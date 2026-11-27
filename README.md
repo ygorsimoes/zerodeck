@@ -153,7 +153,7 @@ curl -s -X POST -H "X-Decky-Auth: $TOKEN" http://127.0.0.1:1337/methods/get_plug
 Starting with the first release, every
 [GitHub release](https://github.com/ygorsimoes/zerodeck/releases) ships a manual `linux-x86_64`
 tarball (daemon and controller binaries, Python worker, frontend bundle, systemd units and
-documentation) and a root-level `.managed.tar.gz` generation archive for TUF-authorized updates,
+documentation) and a root-level `.managed.tar.gz` generation archive for signed-channel updates,
 both with `SHA256SUMS.txt`, plus a container image at `ghcr.io/ygorsimoes/zerodeck`. Both archives
 carry signed build-provenance attestations, and the image also ships an SBOM. Verify them with the
 GitHub CLI:
@@ -163,11 +163,11 @@ gh attestation verify zerodeck-v*-linux-x86_64.tar.gz --repo ygorsimoes/zerodeck
 gh attestation verify zerodeck-v*-linux-x86_64.managed.tar.gz --repo ygorsimoes/zerodeck
 ```
 
-A managed first install or conversion is deliberately not a one-liner: `bootstrap.sh` requires the
-release SHA-256 and TUF root to come from an independent trusted channel, refuses a running Decky or
-an unreviewed existing ZeroDeck install, and starts nothing without `--start`. See
-[`deploy/update/RELEASE.md`](deploy/update/RELEASE.md) for the exact commands, conflict behavior,
-conversion backup and recovery, and TUF signing-role responsibilities.
+A managed first install or conversion is deliberately explicit: `bootstrap.sh` requires the archive
+SHA-256 digests from the release, refuses a running Decky or an unreviewed existing ZeroDeck install,
+and starts nothing without `--start`. After that, updates follow the signed `stable` channel on
+their own. See [`deploy/update/RELEASE.md`](deploy/update/RELEASE.md) for the exact commands,
+conflict behavior, conversion backup and recovery, and how channels are signed.
 
 <details>
 <summary><strong>Configuration</strong></summary>
@@ -208,23 +208,19 @@ must not be able to grant themselves root.
 ## On Steam Deck
 
 > [!NOTE]
-> 🚧 **Implemented, hardware qualification PENDING.** The managed installer and updater are in the
-> tree and covered by unit, fault-injection, packaging and VM-harness tests, but no real Steam Deck
-> or SteamOS run is recorded yet. Stable promotion is blocked until that evidence exists.
+> 🚧 **Implemented; real Steam Deck qualification is still being recorded.** The managed installer
+> and updater are covered by unit, fault-injection, packaging and VM tests (a KVM VM runs in CI),
+> but SteamOS-specific behavior is only confirmed on hardware, tracked in
+> [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md).
 
-- **Install:** a verified `bootstrap.sh` (out-of-band SHA-256 and TUF root) installs `zerodeckd` as
-  a managed systemd service that uses your existing `~/homebrew/plugins`.
-- **Update:** `zerodeckctl update` verifies TUF metadata and stages a release; `zerodeckctl upgrade`
-  activates it explicitly, with offline rollback to the retained generation.
+- **Install:** a verified `bootstrap.sh` installs `zerodeckd` as a managed systemd service that uses
+  your existing `~/homebrew/plugins`.
+- **Update:** merging the Release Please PR publishes an immutable release and CI signs the channel
+  automatically. On the Deck, `zerodeckctl update` verifies the signed channel and stages the
+  release; `zerodeckctl upgrade` activates it explicitly, with offline rollback to the retained
+  generation. Nothing is signed or promoted by hand.
 - **Recovery:** an interrupted activation restores the previous generation or leaves a recoverable
   stopped state; `zerodeckctl recover` reconciles a request left by an interrupted helper.
-- **Release gate:** a disposable systemd VM (QEMU, no KVM required) exercises update, rollback and
-  crash recovery via
-  `just test-updater-vm <image> <ssh-key> <ssh-user> <manual> <managed> [<candidate>]`; exact
-  Steam/SteamOS/build, filesystem, offline, SteamOS-update and resource evidence is recorded in
-  [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md). Deck evidence is **PENDING**,
-  so Stable stays blocked until that checklist is filled from observed hardware and promoted
-  manually through the protected `production` environment with `Stable eligible: PASS`.
 
 Want it sooner? [Help build it](#contributing).
 

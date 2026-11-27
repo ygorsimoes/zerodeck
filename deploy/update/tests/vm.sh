@@ -535,34 +535,8 @@ PY
 }
 
 write_trusted_root() {
-    cat >"$1" <<'JSON'
-{
-  "signed": {
-    "_type": "root",
-    "version": 1,
-    "expires": "2099-01-01T00:00:00Z",
-    "keys": {
-      "vm-root-1": {
-        "keytype": "ed25519",
-        "scheme": "ed25519",
-        "keyval": {"public": "vm-fixture-root-public-key"}
-      },
-      "vm-targets-1": {
-        "keytype": "ed25519",
-        "scheme": "ed25519",
-        "keyval": {"public": "vm-fixture-targets-public-key"}
-      }
-    },
-    "roles": {
-      "root": {"keyids": ["vm-root-1"], "threshold": 1},
-      "targets": {"keyids": ["vm-targets-1"], "threshold": 1},
-      "snapshot": {"keyids": ["vm-targets-1"], "threshold": 1},
-      "timestamp": {"keyids": ["vm-targets-1"], "threshold": 1}
-    }
-  },
-  "signatures": [{"keyid": "vm-root-1", "sig": "00"}]
-}
-JSON
+    # A pinned ed25519 public key (the matching private key does not exist anywhere).
+    printf '{"keys": ["%s"]}\n' "$(printf '11%.0s' {1..32})" >"$1"
 }
 
 install_bootstrap() {
@@ -1643,6 +1617,7 @@ for mode, name in (("managed", "fixture.managed.tar.gz"), ("manual", "fixture.ta
         if mode == "manual":
             add(prefix + "bin/zerodeckctl", b"#!/bin/sh\nexit 0\n", 0o755)
             add(prefix + "bootstrap.sh", b"#!/bin/sh\nexit 0\n", 0o755)
+            add(prefix + "trusted-root.json", b'{"keys": []}\n')
             add(prefix + "systemd/zerodeck.service", b"# fixture\n")
             add(prefix + "systemd/zerodeck-apply.service", b"# fixture\n")
             add(prefix + "systemd/zerodeck-recovery.service", b"# fixture\n")

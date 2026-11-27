@@ -38,7 +38,7 @@ const EXIT_REQUIRES_START: i32 = 75;
                   (rerun `upgrade --start`); 1 error."
 )]
 struct Cli {
-    /// Root-owned update root (`current`, `generations/`, `state/`, `tuf/`).
+    /// Root-owned update root (`current`, `generations/`, `state/`).
     #[arg(
         long,
         global = true,

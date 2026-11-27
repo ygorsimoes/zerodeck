@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared fixtures for the release/publish/promotion/bootstrap shell tests.
+# Shared fixtures for the release/publish/signing/bootstrap shell tests.
 set -euo pipefail
 # macOS bsdtar otherwise stores AppleDouble `._*` files beside copied fixtures.
 export COPYFILE_DISABLE=1
@@ -20,34 +20,8 @@ PY
 
 fixture_trusted_root() {
     local destination="$1"
-    cat >"${destination}" <<'JSON'
-{
-  "signed": {
-    "_type": "root",
-    "version": 1,
-    "expires": "2099-01-01T00:00:00Z",
-    "keys": {
-      "loader-root-1": {
-        "keytype": "ed25519",
-        "scheme": "ed25519",
-        "keyval": {"public": "fixture-root-public-key"}
-      },
-      "loader-targets-1": {
-        "keytype": "ed25519",
-        "scheme": "ed25519",
-        "keyval": {"public": "fixture-targets-public-key"}
-      }
-    },
-    "roles": {
-      "root": {"keyids": ["loader-root-1"], "threshold": 1},
-      "targets": {"keyids": ["loader-targets-1"], "threshold": 1},
-      "snapshot": {"keyids": ["loader-targets-1"], "threshold": 1},
-      "timestamp": {"keyids": ["loader-targets-1"], "threshold": 1}
-    }
-  },
-  "signatures": [{"keyid": "loader-root-1", "sig": "00"}]
-}
-JSON
+    # A pinned ed25519 public key (the matching private key does not exist anywhere).
+    printf '{"keys": ["%s"]}\n' "$(printf '11%.0s' {1..32})" >"${destination}"
 }
 
 fixture_fake_controller() {
@@ -266,6 +240,7 @@ fixture_release_assets() {
     cp "${FIXTURE_REPO_ROOT}/deploy/systemd/"*.service \
         "${FIXTURE_REPO_ROOT}/deploy/systemd/"*.timer "${manual}/systemd/"
     cp "${FIXTURE_REPO_ROOT}/deploy/update/bootstrap.sh" "${manual}/bootstrap.sh"
+    fixture_trusted_root "${manual}/trusted-root.json"
     cp "${FIXTURE_REPO_ROOT}/deploy/update/RELEASE.md" "${manual}/docs/RELEASE.md"
     cp "${FIXTURE_REPO_ROOT}/deploy/update/COMPATIBILITY.md" \
         "${manual}/docs/COMPATIBILITY.md"

@@ -762,8 +762,22 @@ if [[ "${start}" -eq 1 ]]; then
         rollback_install "could not enable the managed units"
         exit 1
     fi
-    if ! "${systemctl}" start --wait zerodeck.service; then
-        rollback_install "zerodeck.service did not become ready"
+    # `start` already waits for a Type=notify unit to send READY=1; `--wait` additionally blocks
+    # until the long-running daemon exits, which is never the intent here.
+    if ! "${systemctl}" start zerodeck.service; then
+        rollback_install "zerodeck.service did not start"
+        exit 1
+    fi
+    active=0
+    for (( attempt = 0; attempt < 15; attempt++ )); do
+        if "${systemctl}" is-active --quiet zerodeck.service; then
+            active=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ "${active}" -eq 0 ]]; then
+        rollback_install "zerodeck.service did not become active"
         exit 1
     fi
 fi

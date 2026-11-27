@@ -52,6 +52,9 @@ just test-updater-vm \
   dist/zerodeck-v0.2.0-linux-x86_64.managed.tar.gz
 ```
 
+For a pre-change image with an existing loader, add `--mode convert` (or leave the default
+`--mode auto`). The conversion path retains the previous generation as the rollback target.
+
 Run the script directly for image digests, checksum manifests, firmware, memory, port and logging
 options:
 
@@ -74,6 +77,7 @@ bash deploy/update/tests/vm.sh \
 | `--image-sha256` | Fail before QEMU if the image does not match the supplied digest. |
 | `--sha256sums` | Check the release archives against the adjacent `SHA256SUMS.txt`. |
 | `--manual-sha256`, `--managed-sha256`, `--candidate-sha256` | Explicit trusted digests; they override/complete the manifest. |
+| `--mode auto\|clean\|convert` | Auto-detect an existing ZeroDeck installation and pass `--convert-existing-zerodeck`, or force clean/convert. Use `convert` for a pre-change image with an old loader already installed. |
 | `--work-dir` | Keep the overlay, console log, QEMU log and scenario output in this directory. |
 | `--accel auto\|tcg\|kvm\|hvf` | Default picks KVM only when `/dev/kvm` is writable, otherwise TCG. |
 | `--firmware` / `--qemu-arg` | UEFI/BIOS or other machine-specific QEMU setup. |
@@ -82,20 +86,25 @@ bash deploy/update/tests/vm.sh \
 
 The script computes release digests itself and passes them to `bootstrap.sh`; when a checksum
 manifest or explicit digest is supplied, a mismatch fails closed. The source image digest is
-re-checked after the run and must be unchanged.
+re-checked in the cleanup trap on success and failure, and must be unchanged.
+
+For a pre-change systemd image that already has an old ZeroDeck controller, units or
+`/var/lib/zerodeck/current`, `--mode auto` (the default) detects that installation and passes
+`--convert-existing-zerodeck`; `--mode convert` forces that path. A clean image uses `--mode clean`.
 
 ## Scenarios
 
 Each scenario verifies the active `current` digest, the running `zerodeckd` executable under
-`/var/lib/zerodeck/generations/<digest>/bin/`, `/readyz` version/build ID, root ownership of
-`current`, `last_confirmed`, absence of a pending transaction, and `zerodeck.service` state.
+`/var/lib/zerodeck/generations/<digest>/bin/`, `/readyz` version/build ID, a non-empty systemd
+`InvocationID` (and whether it changed for scenarios that must restart the service), root ownership
+of `current`, `last_confirmed`, absence of a pending transaction, and `zerodeck.service` state.
 
 | Scenario | What is proven |
 |---|---|
-| `bootstrap` | Clean install with the packaged bootstrap and systemd readiness. |
+| `bootstrap` | Clean or converted install with the packaged bootstrap and systemd readiness. |
 | `port-collision` | A daemon that cannot bind 1337 does not start; releasing the port recovers. |
 | `successful-update` | Staged candidate applies through `zerodeck-apply.service`; ready identity and `current` switch; rollback target is retained. With a real `--candidate` this is a cross-version update. |
-| `corrupt-rollback` | Removing the rollback binary is refused before the service is stopped; restoring the generation allows an offline rollback. |
+| `corrupt-rollback` | A missing generation directory and a generation without `release.json` are both refused before the service is stopped; restoring the generation allows an offline rollback. |
 | `unhealthy-candidate` | A candidate that passes layout validation but cannot serve is quarantined and the previous generation is restored. |
 | `hard-poweroff-during-apply` | QEMU `SIGKILL` while the apply transaction is `verifying`; reboot recovery restores the previous generation. |
 | `sigkill-apply-helper` | `SIGKILL` of the independent `zerodeckctl apply` process; `ExecStopPost` recovery restores the previous generation. |

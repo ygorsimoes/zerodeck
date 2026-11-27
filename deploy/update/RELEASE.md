@@ -265,10 +265,11 @@ Run the following in a fork or staging repository; never use production signing 
   the image and release digests, installs with the packaged bootstrap, and drives update, rollback,
   hard poweroff, `SIGKILL` of the apply helper, port collision, corrupt rollback, reboot during
   recovery and a second recovery pass. It exits `77` with `skipped: no qemu/image` when the host
-  cannot run it; a skip is not a pass. Use `--work-dir` to preserve evidence. The harness self-test
-  (fake QEMU/SSH) runs in `just check`. Update scenarios use a local fixture authorization rather
-  than a live TUF repository; TUF fetch/selection is covered by the Rust catalog and staging tests.
-  See [`tests/README.md`](tests/README.md).
+  cannot run it; a skip is not a pass. Use `--work-dir` to preserve evidence. `--mode auto`
+  converts an existing pre-change installation; `--mode clean|convert` forces the choice. The
+  harness self-test (fake QEMU/SSH) runs in `just check`. Update scenarios use a local fixture
+  authorization rather than a live TUF repository; TUF fetch/selection is covered by the Rust
+  catalog and staging tests. See [`tests/README.md`](tests/README.md).
 - **Steam Deck hardware gate:** record every field in
   [`COMPATIBILITY.md`](COMPATIBILITY.md) from observed hardware: exact Steam/SteamOS/build,
   filesystems and read-only root, invocation identity, online update, offline rollback,

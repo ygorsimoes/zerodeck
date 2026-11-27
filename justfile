@@ -116,9 +116,11 @@ py-test-on version:
 py-matrix:
     for v in {{ python_versions }}; do just py-test-on "$v"; done
 
-# Boot a disposable Linux/systemd VM and run the updater crash/rollback gate. Runs on this host (it
-# needs qemu-system-x86_64, qemu-img and the caller's image); exits 77 with `skipped: no qemu/image`
-# when they are absent. Pass `-` as candidate to test the installed generation's apply/rollback path.
+# Boot a disposable Linux/systemd VM and run the updater crash/rollback gate:
+#   just test-updater-vm <image> <ssh-key> <ssh-user> <manual> <managed> [<candidate>]
+# Runs on this host (it needs qemu-system-x86_64, qemu-img and the caller's image); exits 77 with
+# `skipped: no qemu/image` when they are absent. Pass `-` as candidate to test the installed
+# generation's apply/rollback path.
 [group('checks')]
 test-updater-vm image ssh_key ssh_user manual managed candidate="-":
     just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}" "{{ candidate }}"

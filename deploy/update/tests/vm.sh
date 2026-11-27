@@ -19,7 +19,6 @@ PROGRAM="vm.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 PYTHON="${PYTHON:-python3}"
-ZERODECK_ROOT="/var/lib/zerodeck"
 ZERODECK_CTL="/usr/local/lib/zerodeck/bin/zerodeckctl"
 DEFAULT_GUEST_DIR_PREFIX="/var/tmp/zerodeck-vm"
 
@@ -35,6 +34,7 @@ sha256sums=""
 manual_sha256=""
 managed_sha256=""
 candidate_sha256=""
+install_mode="auto"
 work_dir=""
 keep_work=0
 qemu_bin="${QEMU_SYSTEM_X86_64:-qemu-system-x86_64}"
@@ -61,6 +61,8 @@ guest_dir=""
 ssh_opts=()
 scp_opts=()
 results=()
+last_invocation_id=""
+image_source_digest=""
 
 usage() {
     cat >&2 <<EOF
@@ -79,6 +81,8 @@ Optional:
   --candidate PATH          Managed archive for a genuinely newer release. If omitted the harness
                             repacks the installed generation with a different digest and the same
                             release identity; that proves apply/rollback but not a version upgrade.
+  --mode auto|clean|convert  Auto-detect an existing /var/lib/zerodeck/current and pass
+                            --convert-existing-zerodeck when present (default: auto).
   --image-sha256 HEX        Required image digest; a mismatch fails before QEMU starts.
   --sha256sums PATH         SHA256SUMS.txt covering the release archives.
   --manual-sha256 HEX       Expected manual archive digest.
@@ -139,6 +143,7 @@ parse_args() {
             --manual) need_value "$@"; manual="$2"; shift 2 ;;
             --managed) need_value "$@"; managed="$2"; shift 2 ;;
             --candidate) need_value "$@"; candidate="$2"; shift 2 ;;
+            --mode) need_value "$@"; install_mode="$2"; shift 2 ;;
             --sha256sums) need_value "$@"; sha256sums="$2"; shift 2 ;;
             --manual-sha256) need_value "$@"; manual_sha256="$2"; shift 2 ;;
             --managed-sha256) need_value "$@"; managed_sha256="$2"; shift 2 ;;
@@ -354,7 +359,7 @@ wait_ssh() {
             tail -n 60 "${work}/logs/qemu.log" >&2 || true
             die "QEMU exited before SSH became reachable"
         fi
-        if "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" true >/dev/null 2>&1; then
+        if "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" true </dev/null >/dev/null 2>&1; then
             log "SSH is reachable"
             return 0
         fi
@@ -367,7 +372,7 @@ wait_ssh() {
 wait_ssh_down() {
     local deadline=$((SECONDS + 60))
     while (( SECONDS < deadline )); do
-        if ! "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" true >/dev/null 2>&1; then
+        if ! "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" true </dev/null >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -378,7 +383,7 @@ wait_ssh_down() {
 guest_cmd() {
     local quoted
     printf -v quoted '%q ' "$@"
-    "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "${quoted}"
+    "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "${quoted}" </dev/null
 }
 
 guest_root_cmd() {
@@ -389,31 +394,27 @@ guest_root_cmd() {
     fi
 }
 
-guest_script() {
+guest_script_impl() {
+    local prefix="$1"
+    shift
     local script
     script="$(cat)"
     local quoted=""
     if [[ $# -gt 0 ]]; then
         printf -v quoted '%q ' "$@"
     fi
-    if [[ "${ssh_user}" == "root" ]]; then
-        "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "bash -s -- ${quoted}" <<<"${script}"
-    else
-        "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "sudo -n bash -s -- ${quoted}" <<<"${script}"
-    fi
+    "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "${prefix}bash -s -- ${quoted}" <<<"${script}"
+}
+
+guest_script() {
+    guest_script_impl "" "$@"
 }
 
 guest_root_script() {
-    local script
-    script="$(cat)"
-    local quoted=""
-    if [[ $# -gt 0 ]]; then
-        printf -v quoted '%q ' "$@"
-    fi
     if [[ "${ssh_user}" == "root" ]]; then
-        "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "bash -s -- ${quoted}" <<<"${script}"
+        guest_script_impl "" "$@"
     else
-        "${ssh_bin}" "${ssh_opts[@]}" "${ssh_user}@127.0.0.1" "sudo -n bash -s -- ${quoted}" <<<"${script}"
+        guest_script_impl "sudo -n " "$@"
     fi
 }
 
@@ -465,6 +466,14 @@ cleanup() {
         fi
         wait "${qemu_pid}" 2>/dev/null || true
     fi
+    if [[ -n "${image_source_digest}" && -f "${image}" ]]; then
+        local digest
+        digest="$(sha256_file "${image}" 2>/dev/null || true)"
+        if [[ "${digest}" != "${image_source_digest}" ]]; then
+            printf '[vm] error: source image changed during the run\n' >&2
+            [[ "${status}" == "0" ]] && status=1
+        fi
+    fi
     if [[ -n "${work}" && -d "${work}" ]]; then
         if [[ "${work_owned}" == "1" && "${keep_work}" != "1" ]]; then
             rm -rf "${work}"
@@ -476,7 +485,7 @@ cleanup() {
 }
 
 guest_preflight() {
-    guest_script <<'SCRIPT'
+    guest_root_script <<'SCRIPT'
 set -euo pipefail
 [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]] || {
     echo "guest: PID 1 is not systemd" >&2
@@ -557,26 +566,60 @@ JSON
 }
 
 install_bootstrap() {
-    local manual_digest="$1" managed_digest="$2" root_digest="$3"
+    local manual_digest="$1" managed_digest="$2" root_digest="$3" mode="$4"
     upload "${manual}" "${guest_dir}/manual.tar.gz"
-    upload "${managed}" "${guest_dir}/managed.tar.gz"
+    upload "${managed}" "${guest_dir}/generation.managed.tar.gz"
     upload "${work}/bootstrap.sh" "${guest_dir}/bootstrap.sh"
     upload "${work}/trusted-root.json" "${guest_dir}/trusted-root.json"
-    guest_root_script <<'SCRIPT' "${guest_dir}" "${manual_digest}" "${managed_digest}" "${root_digest}"
+    guest_root_script <<'SCRIPT' "${guest_dir}" "${manual_digest}" "${managed_digest}" \
+        "${root_digest}" "${mode}"
 set -euo pipefail
 dir="$1"
 manual_sha="$2"
 managed_sha="$3"
 root_sha="$4"
+mode="$5"
+convert=()
+if [[ "${mode}" == "convert" ]]; then
+    convert=(--convert-existing-zerodeck)
+fi
 cd "${dir}"
 bash ./bootstrap.sh \
     --package manual.tar.gz --sha256 "${manual_sha}" \
-    --generation managed.tar.gz --generation-sha256 "${managed_sha}" \
+    --generation generation.managed.tar.gz --generation-sha256 "${managed_sha}" \
     --trusted-root trusted-root.json --trusted-root-sha256 "${root_sha}" \
     --metadata-url "http://127.0.0.1:9/metadata/" \
     --targets-url "http://127.0.0.1:9/targets/" \
-    --start
+    "${convert[@]}" --start
 SCRIPT
+}
+
+resolve_install_mode() {
+    case "${install_mode}" in
+        clean|convert) return 0 ;;
+        auto)
+            if guest_root_script <<'SCRIPT'
+set -e
+for path in \
+    /var/lib/zerodeck/current \
+    /var/lib/zerodeck/state/update.json \
+    /usr/local/lib/zerodeck/bin/zerodeckctl \
+    /etc/systemd/system/zerodeck.service; do
+    if [[ -e "${path}" ]]; then
+        exit 0
+    fi
+done
+exit 1
+SCRIPT
+            then
+                install_mode="convert"
+            else
+                install_mode="clean"
+            fi
+            log "auto-detected install mode: ${install_mode}"
+            ;;
+        *) die "--mode must be auto, clean or convert" ;;
+    esac
 }
 
 stage_generation() {
@@ -697,8 +740,15 @@ temporary = path + ".tmp"
 with open(temporary, "w", encoding="utf-8") as handle:
     json.dump(document, handle, indent=2)
     handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
 os.chmod(temporary, 0o600)
 os.replace(temporary, path)
+directory = os.open(os.path.dirname(path), os.O_RDONLY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
 PY
 chown root:root /var/lib/zerodeck/state/catalog.json
 chmod 0600 /var/lib/zerodeck/state/catalog.json
@@ -829,7 +879,8 @@ SCRIPT
 
 verify_guest() {
     local expected_digest="$1" expected_version="$2" expected_build="$3" label="$4"
-    local output ready
+    local expect_invocation="${5:-any}"
+    local output ready invocation
     output="$(guest_root_script <<'SCRIPT' "${expected_digest}" "${expected_version}" "${expected_build}"
 set -euo pipefail
 expected="$1"
@@ -880,10 +931,29 @@ PY
     echo "current is not root-owned" >&2
     exit 1
 }
-printf 'current=%s exe=%s invocation=%s\n' \
-    "${current}" "${exe}" "$(systemctl show -p InvocationID --value zerodeck.service)"
+invocation="$(systemctl show -p InvocationID --value zerodeck.service)"
+[[ -n "${invocation}" ]] || {
+    echo "zerodeck.service has an empty InvocationID" >&2
+    exit 1
+}
+printf 'current=%s\nexe=%s\ninvocation=%s\n' "${current}" "${exe}" "${invocation}"
 SCRIPT
 )"
+    invocation="$(printf '%s\n' "${output}" | sed -n 's/^invocation=//p')"
+    [[ -n "${invocation}" ]] || die "${label}: missing InvocationID"
+    case "${expect_invocation}" in
+        yes)
+            [[ -z "${last_invocation_id}" || "${last_invocation_id}" != "${invocation}" ]] || \
+                die "${label}: service InvocationID did not change"
+            ;;
+        no)
+            [[ -z "${last_invocation_id}" || "${last_invocation_id}" == "${invocation}" ]] || \
+                die "${label}: service restarted when it should not have"
+            ;;
+        any) ;;
+        *) die "invalid InvocationID expectation: ${expect_invocation}" ;;
+    esac
+    last_invocation_id="${invocation}"
     ready="$(read_readyz)"
     "${PYTHON}" - "${ready}" "${expected_version}" "${expected_build}" <<'PY'
 import json
@@ -903,29 +973,46 @@ PY
 }
 
 scenario_bootstrap() {
-    log "scenario: clean bootstrap and running identity"
-    install_bootstrap "${manual_digest}" "${managed_digest}" "${trusted_root_digest}"
+    log "scenario: ${install_mode} bootstrap and running identity"
+    install_bootstrap "${manual_digest}" "${managed_digest}" "${trusted_root_digest}" \
+        "${install_mode}"
     verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "bootstrap"
     local status
     status="$(guest_root_cmd "${ZERODECK_CTL}" status)"
     printf '%s\n' "${status}" | grep -q "^active: ${managed_digest}$"
-    printf '%s\n' "${status}" | grep -q "^rollback: none$"
+    if [[ "${install_mode}" == "convert" ]]; then
+        printf '%s\n' "${status}" | grep -Eq '^rollback: ([0-9a-f]{64}|none)$'
+    else
+        printf '%s\n' "${status}" | grep -q "^rollback: none$"
+    fi
 }
 
 scenario_port_collision() {
     log "scenario: port collision fails closed and a clean start recovers"
+    install_dropin zerodeck.service $'[Service]\nRestart=no\nTimeoutStartSec=15'
     guest_root_script <<'SCRIPT'
 set -euo pipefail
 systemctl stop zerodeck.service
-cat >/etc/systemd/system/zerodeck.service.d/vm-gate.conf <<'CONF'
-[Service]
-Restart=no
-TimeoutStartSec=15
-CONF
-systemctl daemon-reload
 python3 -m http.server 1337 --bind 127.0.0.1 >/var/tmp/zerodeck-port-blocker.log 2>&1 &
 echo $! >/var/tmp/zerodeck-port-blocker.pid
-sleep 1
+bound=0
+for _ in {1..50}; do
+    if python3 - <<'PY' 2>/dev/null
+import socket
+with socket.create_connection(("127.0.0.1", 1337), timeout=1):
+    pass
+PY
+    then
+        bound=1
+        break
+    fi
+    sleep 0.1
+done
+if [[ "${bound}" -eq 0 ]]; then
+    echo "port blocker never bound 127.0.0.1:1337" >&2
+    kill "$(cat /var/tmp/zerodeck-port-blocker.pid)" 2>/dev/null || true
+    exit 1
+fi
 if systemctl start zerodeck.service; then
     echo "zerodeck.service unexpectedly started while 1337 was occupied" >&2
     kill "$(cat /var/tmp/zerodeck-port-blocker.pid)" 2>/dev/null || true
@@ -939,12 +1026,22 @@ fi
 kill "$(cat /var/tmp/zerodeck-port-blocker.pid)" 2>/dev/null || true
 wait "$(cat /var/tmp/zerodeck-port-blocker.pid)" 2>/dev/null || true
 rm -f /var/tmp/zerodeck-port-blocker.pid
-rm -f /etc/systemd/system/zerodeck.service.d/vm-gate.conf
-rmdir /etc/systemd/system/zerodeck.service.d 2>/dev/null || true
-systemctl daemon-reload
-systemctl start --wait zerodeck.service
 SCRIPT
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "port-collision-recovered"
+    remove_dropin zerodeck.service
+    guest_root_script <<'SCRIPT'
+set -euo pipefail
+systemctl start zerodeck.service
+for _ in {1..30}; do
+    if systemctl is-active --quiet zerodeck.service; then
+        exit 0
+    fi
+    sleep 1
+done
+echo "zerodeck.service did not become active after the port was released" >&2
+exit 1
+SCRIPT
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" \
+        "port-collision-recovered" yes
 }
 
 scenario_successful_update() {
@@ -955,32 +1052,16 @@ scenario_successful_update() {
     local started=$SECONDS
     run_upgrade
     local elapsed=$((SECONDS - started))
-    verify_guest "${candidate_digest}" "${candidate_version}" "${candidate_build}" "update"
+    verify_guest "${candidate_digest}" "${candidate_version}" "${candidate_build}" "update" yes
     local status
     status="$(guest_root_cmd "${ZERODECK_CTL}" status)"
     printf '%s\n' "${status}" | grep -q "^rollback: ${managed_digest}$"
     results+=("PASS update stop-to-ready: ${elapsed}s")
 }
 
-scenario_corrupt_rollback() {
-    log "scenario: missing/corrupt rollback generation refuses before stopping"
-    guest_root_script <<'SCRIPT' "${managed_digest}"
-set -euo pipefail
-generation="$1"
-rm -f "/var/lib/zerodeck/generations/${generation}/bin/zerodeckd"
-if /usr/local/lib/zerodeck/bin/zerodeckctl rollback >/var/tmp/zerodeck-bad-rollback.log 2>&1; then
-    echo "rollback unexpectedly succeeded with a corrupt target" >&2
-    exit 1
-fi
-grep -qi "corrupt\\|missing\\|generation" /var/tmp/zerodeck-bad-rollback.log || {
-    echo "rollback failure did not explain the corrupt generation" >&2
-    cat /var/tmp/zerodeck-bad-rollback.log >&2
-    exit 1
-}
-SCRIPT
-    verify_guest "${candidate_digest}" "${candidate_version}" "${candidate_build}" \
-        "corrupt-rollback-refused"
-    guest_root_script <<'SCRIPT' "${guest_dir}/managed.tar.gz" "${managed_digest}"
+restore_generation_from_archive() {
+    local archive="$1" digest="$2"
+    guest_root_script <<'SCRIPT' "${archive}" "${digest}"
 set -euo pipefail
 archive="$1"
 digest="$2"
@@ -998,10 +1079,10 @@ archive_path, destination = sys.argv[1:3]
 with tarfile.open(archive_path, "r:gz") as archive:
     for member in archive.getmembers():
         if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
-            raise SystemExit(f"unsafe candidate entry: {member.name!r}")
+            raise SystemExit(f"unsafe generation entry: {member.name!r}")
         path = PurePosixPath(member.name)
         if path.is_absolute() or any(part == ".." for part in path.parts):
-            raise SystemExit(f"unsafe candidate path: {member.name!r}")
+            raise SystemExit(f"unsafe generation path: {member.name!r}")
     os.makedirs(destination, mode=0o755)
     for member in archive.getmembers():
         name = "/".join(
@@ -1014,7 +1095,7 @@ with tarfile.open(archive_path, "r:gz") as archive:
         os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
         source = archive.extractfile(member)
         if source is None:
-            raise SystemExit("candidate entry is unreadable")
+            raise SystemExit("generation entry is unreadable")
         with open(target, "wb") as output:
             output.write(source.read())
         os.chmod(target, 0o755 if member.mode & 0o111 else 0o644)
@@ -1025,10 +1106,48 @@ find "${staging}/tree" -type f -exec chmod 0644 {} +
 chmod 0755 "${staging}/tree/bin/zerodeckd"
 mv "${staging}/tree" "${destination}"
 SCRIPT
+}
+
+rollback_refusal_case() {
+    local label="$1" mutation="$2"
+    guest_root_script <<'SCRIPT' "${managed_digest}" "${label}" "${mutation}"
+set -euo pipefail
+generation="$1"
+label="$2"
+mutation="$3"
+directory="/var/lib/zerodeck/generations/${generation}"
+case "${mutation}" in
+    missing) rm -rf "${directory}" ;;
+    release) rm -f "${directory}/release.json" ;;
+    *) echo "unknown rollback mutation: ${mutation}" >&2; exit 2 ;;
+esac
+log="/var/tmp/zerodeck-bad-rollback-${mutation}.log"
+if /usr/local/lib/zerodeck/bin/zerodeckctl rollback >"${log}" 2>&1; then
+    echo "rollback unexpectedly succeeded with ${label}" >&2
+    exit 1
+fi
+grep -qi "corrupt\\|missing\\|generation" "${log}" || {
+    echo "rollback failure did not explain ${label}" >&2
+    cat "${log}" >&2
+    exit 1
+}
+SCRIPT
+}
+
+scenario_corrupt_rollback() {
+    log "scenario: missing/corrupt rollback generation refuses before stopping"
+    rollback_refusal_case "missing-generation" "missing"
+    verify_guest "${candidate_digest}" "${candidate_version}" "${candidate_build}" \
+        "missing-rollback-refused" no
+    restore_generation_from_archive "${guest_dir}/generation.managed.tar.gz" "${managed_digest}"
+    rollback_refusal_case "missing-release-json" "release"
+    verify_guest "${candidate_digest}" "${candidate_version}" "${candidate_build}" \
+        "corrupt-rollback-refused" no
+    restore_generation_from_archive "${guest_dir}/generation.managed.tar.gz" "${managed_digest}"
     local started=$SECONDS
     guest_root_cmd "${ZERODECK_CTL}" rollback
     local elapsed=$((SECONDS - started))
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "offline-rollback"
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "offline-rollback" yes
     results+=("PASS rollback stop-to-ready: ${elapsed}s")
 }
 
@@ -1104,7 +1223,7 @@ scenario_unhealthy_candidate() {
     if run_upgrade; then
         die "unhealthy candidate unexpectedly activated"
     fi
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "unhealthy-rollback"
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "unhealthy-rollback" yes
     guest_root_script <<'SCRIPT' "${unhealthy_digest}"
 set -euo pipefail
 digest="$1"
@@ -1147,7 +1266,7 @@ scenario_hard_poweroff() {
     wait_ssh
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck.service
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "hard-poweroff-recovered"
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "hard-poweroff-recovered" yes
 }
 
 scenario_sigkill_apply() {
@@ -1160,7 +1279,7 @@ scenario_sigkill_apply() {
     kill_apply_helper
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck.service
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "sigkill-recovered"
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "sigkill-recovered" yes
 }
 
 scenario_reboot_during_recovery() {
@@ -1169,32 +1288,42 @@ scenario_reboot_during_recovery() {
     make_fixture_candidate "${managed}" "${crash}" "healthy"
     local crash_digest
     crash_digest="$(check_digest "${crash}" "" "reboot-recovery candidate")"
-    install_dropin zerodeck-recovery.service $'[Service]\nExecStartPre=/bin/sleep 20'
+    install_dropin zerodeck-recovery.service $'[Service]\nExecStartPre=/bin/sleep 60'
     prepare_pending_crash "${crash}" "${crash_digest}"
     hard_poweroff
     start_qemu
     wait_ssh
-    guest_root_script <<'SCRIPT' || true
+    local boot_before boot_after
+    boot_before="$(guest_cmd cat /proc/sys/kernel/random/boot_id)"
+    [[ -n "${boot_before}" ]] || die "guest did not report a boot ID"
+    guest_root_script <<'SCRIPT'
 set -euo pipefail
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
     state="$(systemctl show -p ActiveState --value zerodeck-recovery.service 2>/dev/null || true)"
-    if [[ "${state}" == "activating" || "${state}" == "active" ]]; then
-        echo "rebooting while zerodeck-recovery.service is ${state}"
-        systemctl reboot --force
+    if [[ "${state}" == "activating" ]]; then
+        echo "observed zerodeck-recovery.service activating"
         exit 0
     fi
     sleep 0.1
 done
-echo "did not observe boot recovery before it completed" >&2
+echo "did not observe boot recovery activating before it completed" >&2
 exit 1
 SCRIPT
-    wait_ssh_down || true
+    guest_root_script <<'SCRIPT'
+set -euo pipefail
+nohup systemctl reboot --force >/var/tmp/zerodeck-reboot.log 2>&1 &
+exit 0
+SCRIPT
+    wait_ssh_down
     wait_ssh
+    boot_after="$(guest_cmd cat /proc/sys/kernel/random/boot_id)"
+    [[ -n "${boot_after}" && "${boot_after}" != "${boot_before}" ]] || \
+        die "guest boot ID did not change after the reboot trigger"
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck-recovery.service
     remove_dropin zerodeck.service
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "reboot-recovery"
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "reboot-recovery" yes
 }
 
 scenario_second_recovery() {
@@ -1215,7 +1344,7 @@ sha256sum /var/lib/zerodeck/current /var/lib/zerodeck/state/update.json
 SCRIPT
 )"
     [[ "${before}" == "${after}" ]] || die "second recovery pass changed current/state"
-    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "second-recovery"
+    verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "second-recovery" no
 }
 
 run_scenario() {
@@ -1333,6 +1462,10 @@ main() {
     [[ -n "${ssh_key}" ]] || usage
     [[ -n "${manual}" ]] || usage
     [[ -n "${managed}" ]] || usage
+    case "${install_mode}" in
+        auto|clean|convert) ;;
+        *) die "--mode must be auto, clean or convert" ;;
+    esac
 
     for tool in "${qemu_bin}" "${qemu_img_bin}" "${ssh_bin}" "${scp_bin}" "${PYTHON}"; do
         command -v "${tool}" >/dev/null 2>&1 || skip "no qemu/image (${tool} not found)"
@@ -1356,6 +1489,7 @@ main() {
     start_qemu
     wait_ssh
     guest_preflight
+    resolve_install_mode
     guest_dir="$(guest_cmd mktemp -d "${DEFAULT_GUEST_DIR_PREFIX}.XXXXXX")"
     [[ -n "${guest_dir}" ]] || die "could not create a guest work directory"
     log "guest work directory: ${guest_dir}"
@@ -1515,8 +1649,21 @@ script="$(cat)"
 case "$*" in
     *" true") exit 0 ;;
     *"mktemp -d /var/tmp/zerodeck-vm."*) printf '/var/tmp/fake-guest-dir\n'; exit 0 ;;
-    *"systemctl is-system-running"*) printf 'running\n'; exit 0 ;;
     *"bash -s --"*)
+        if grep -q "bootstrap.sh" <<<"${script}"; then
+            generation="$(sed -n 's/.*--generation \([^ ]*\).*/\1/p' <<<"${script}" | head -n 1)"
+            if [[ "${generation}" != *.managed.tar.gz ]]; then
+                printf 'fake bootstrap rejected generation=%s\n' "${generation}" >&2
+                exit 1
+            fi
+            if [[ "${VM_SELFTEST_REQUIRE_CONVERT:-0}" == "1" ]]; then
+                if ! grep -q -- "--convert-existing-zerodeck" <<<"${script}"; then
+                    printf 'fake bootstrap did not receive --convert-existing-zerodeck\n' >&2
+                    exit 1
+                fi
+                printf 'convert-ok\n' >>"${VM_SELFTEST_LOG}.convert"
+            fi
+        fi
         if grep -q "cat /var/lib/zerodeck/current" <<<"${script}"; then
             printf 'fake current digest mismatch\n' >&2
             exit 1
@@ -1560,9 +1707,16 @@ SCRIPT
         --qemu-img "${tmp}/bin/qemu-img"
         --ssh "${tmp}/bin/ssh"
         --scp "${tmp}/bin/scp"
+        --mode clean
         --boot-timeout 5
         --scenario-timeout 5
     )
+
+    if grep -nE 'systemctl[[:space:]]+start[[:space:]]+--wait' \
+        "${SCRIPT_DIR}/vm.sh" "${REPO_ROOT}/deploy/update/bootstrap.sh"; then
+        echo "self-test: blocking --wait on service start is not allowed" >&2
+        exit 1
+    fi
 
     local image_before
     image_before="$(sha256_file "${tmp}/image.raw")"
@@ -1584,6 +1738,11 @@ SCRIPT
     # its temporary work directory while leaving the source image byte-identical.
     expect_status 1 fake-guest-failure \
         env TMPDIR="${tmp}/tmp" bash "${SCRIPT_DIR}/vm.sh" "${common[@]}"
+    grep -q "fake current digest mismatch" "${tmp}/fake-guest-failure.log" || {
+        echo "self-test: fake guest failed before the running-identity check" >&2
+        cat "${tmp}/fake-guest-failure.log" >&2
+        exit 1
+    }
     grep -q -- "-drive file=.*overlay.qcow2" "${VM_SELFTEST_LOG}.qemu" || {
         echo "self-test: QEMU did not receive the overlay drive" >&2
         exit 1
@@ -1605,7 +1764,20 @@ SCRIPT
         echo "self-test: source image changed" >&2
         exit 1
     }
-    printf 'self-test passed: qemu command, overlay, checksum refusal and trap cleanup\n'
+
+    rm -f "${VM_SELFTEST_LOG}.convert"
+    expect_status 1 convert-argument \
+        env TMPDIR="${tmp}/tmp" VM_SELFTEST_REQUIRE_CONVERT=1 \
+        bash "${SCRIPT_DIR}/vm.sh" "${common[@]}" --mode convert
+    grep -qx "convert-ok" "${VM_SELFTEST_LOG}.convert" || {
+        echo "self-test: convert mode did not pass --convert-existing-zerodeck" >&2
+        exit 1
+    }
+    if compgen -G "${tmp}/tmp/zerodeck-vm.*" >/dev/null; then
+        echo "self-test: convert run left a temporary work directory behind" >&2
+        exit 1
+    fi
+    printf 'self-test passed: qemu command, overlay, checksum refusal, convert mode and trap cleanup\n'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

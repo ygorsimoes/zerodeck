@@ -747,6 +747,8 @@ mkdir -p "/etc/systemd/system/${unit}.d"
 printf '%s\n' "${payload}" >"/etc/systemd/system/${unit}.d/vm-gate.conf"
 chmod 0644 "/etc/systemd/system/${unit}.d/vm-gate.conf"
 systemctl daemon-reload
+# The scenarios cut power right after this; without a sync the drop-in would not survive it.
+sync
 SCRIPT
 }
 

@@ -1,8 +1,10 @@
 //! `zerodeckctl` command-line entry point.
 
 #![forbid(unsafe_code)]
+#![cfg(unix)]
 
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -525,29 +527,11 @@ fn exec_current(root: &Path) -> Result<(), UpdateError> {
         .env_remove("PYTHONPATH")
         .env_remove("ZERODECK_FRONTEND_DIR");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let error = command.exec();
-        Err(UpdateError::Io {
-            path: layout.binary().to_path_buf(),
-            source: error,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let status = command.status().map_err(|source| UpdateError::Io {
-            path: layout.binary().to_path_buf(),
-            source,
-        })?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(UpdateError::ActivationFailed(format!(
-                "managed daemon exited with {status}"
-            )))
-        }
-    }
+    let error = command.exec();
+    Err(UpdateError::Io {
+        path: layout.binary().to_path_buf(),
+        source: error,
+    })
 }
 
 fn installed_release(store: &GenerationStore) -> Option<(Version, zerodeck_updater::GenerationId)> {

@@ -1,6 +1,7 @@
 //! Durable update state and immutable loader generations for `zerodeckctl`.
 
 #![forbid(unsafe_code)]
+#![cfg(unix)]
 
 mod activation;
 mod boot;
@@ -8,6 +9,7 @@ mod bootstrap;
 mod catalog;
 mod generation;
 mod request;
+mod schema;
 pub mod service;
 mod stage;
 mod state;
@@ -31,6 +33,7 @@ pub use bootstrap::{BootstrapOutcome, bootstrap_generation, confirm_bootstrap, p
 pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
 pub use generation::{GenerationId, GenerationLayout, GenerationRelease, GenerationStore};
 pub use request::{APPLY_REQUEST_SCHEMA, ApplyKind, ApplyRequest, ApplyRequestStore};
+pub use schema::{Schema, SchemaFile};
 pub use service::{
     ACTIVATION_DEADLINE, ReleaseIdentity, Systemctl, SystemctlFuture, SystemdService,
     TokioSystemctl, verify_ready,
@@ -99,6 +102,9 @@ pub enum UpdateError {
         "boot recovery has not completed for this boot; run `zerodeckctl recover-boot` before starting the daemon"
     )]
     BootRecoveryRequired,
+    /// The kernel boot ID could not be read, so boot recovery cannot be attested.
+    #[error("cannot read the kernel boot id at `{0}`")]
+    BootIdUnavailable(std::path::PathBuf),
 
     /// An atomic filesystem operation failed.
     #[error(transparent)]

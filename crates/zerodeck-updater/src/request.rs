@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zerodeck_platform::atomic_write;
+use zerodeck_platform::atomic_write_mode;
 
 use crate::{AuthorizedRelease, GenerationId, StateStore, UpdateError};
 
@@ -211,8 +211,7 @@ impl ApplyRequestStore {
         request.validate()?;
         let mut bytes = serde_json::to_vec_pretty(request)?;
         bytes.push(b'\n');
-        atomic_write(&self.path, &bytes)?;
-        set_private_mode(&self.path)?;
+        atomic_write_mode(&self.path, &bytes, 0o600)?;
         Ok(())
     }
 
@@ -238,22 +237,6 @@ impl ApplyRequestStore {
         }
         sync_parent(&self.path)
     }
-}
-
-fn set_private_mode(path: &Path) -> Result<(), UpdateError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            UpdateError::Io {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 fn sync_parent(path: &Path) -> Result<(), UpdateError> {

@@ -707,13 +707,10 @@ fn read_release_manifest(directory: &Path) -> Result<ReleaseManifest, UpdateErro
 }
 
 fn create_private_file(path: &Path) -> Result<File, UpdateError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options.write(true).create_new(true).mode(0o600);
     options.open(path).map_err(|source| UpdateError::Io {
         path: path.to_path_buf(),
         source,
@@ -721,21 +718,11 @@ fn create_private_file(path: &Path) -> Result<File, UpdateError> {
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), UpdateError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
-            UpdateError::Io {
-                path: path.to_path_buf(),
-                source,
-            }
-        })?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| UpdateError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn sync_directory(path: &Path) -> Result<(), UpdateError> {

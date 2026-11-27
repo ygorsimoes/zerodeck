@@ -1,13 +1,9 @@
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zerodeck_platform::atomic_write;
 
-use crate::{AuthorizedRelease, Channel, GenerationId, UpdateError};
+use crate::schema::{Schema, SchemaFile};
+use crate::{AuthorizedRelease, Channel, GenerationId};
 
 /// Current on-disk [`UpdateState`] schema version.
 pub const UPDATE_STATE_SCHEMA: u32 = 1;
@@ -143,59 +139,16 @@ pub enum TransactionPhase {
     Reverting,
 }
 
+impl Schema for UpdateState {
+    const SCHEMA: u32 = UPDATE_STATE_SCHEMA;
+
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+}
+
 /// JSON persistence for [`UpdateState`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateStore {
-    path: PathBuf,
-}
-
-impl StateStore {
-    /// Creates a state store backed by `path`.
-    #[must_use]
-    pub fn new(path: impl AsRef<Path>) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-        }
-    }
-
-    /// Returns the backing state file path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Reads and validates the persisted state, returning an empty document when absent.
-    pub fn read(&self) -> Result<UpdateState, UpdateError> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(UpdateState::new());
-            }
-            Err(source) => {
-                return Err(UpdateError::Io {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
-        };
-        let state: UpdateState = serde_json::from_slice(&bytes)?;
-        if state.schema != UPDATE_STATE_SCHEMA {
-            return Err(UpdateError::UnsupportedSchema(state.schema));
-        }
-        Ok(state)
-    }
-
-    /// Atomically persists `state` after rejecting an unknown schema.
-    pub fn write(&self, state: &UpdateState) -> Result<(), UpdateError> {
-        if state.schema != UPDATE_STATE_SCHEMA {
-            return Err(UpdateError::UnsupportedSchema(state.schema));
-        }
-        let mut bytes = serde_json::to_vec_pretty(state)?;
-        bytes.push(b'\n');
-        atomic_write(&self.path, &bytes)?;
-        Ok(())
-    }
-}
+pub type StateStore = SchemaFile<UpdateState>;
 
 /// Persisted outcome of the freshest successful trusted catalog verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,59 +209,16 @@ impl Default for CatalogState {
     }
 }
 
+impl Schema for CatalogState {
+    const SCHEMA: u32 = CATALOG_STATE_SCHEMA;
+
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+}
+
 /// JSON persistence for [`CatalogState`] under the owned update state root.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CatalogStateStore {
-    path: PathBuf,
-}
-
-impl CatalogStateStore {
-    /// Creates a catalog state store backed by `path`.
-    #[must_use]
-    pub fn new(path: impl AsRef<Path>) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-        }
-    }
-
-    /// Returns the backing state file path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Reads and validates the persisted catalog state, returning an empty document when absent.
-    pub fn read(&self) -> Result<CatalogState, UpdateError> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(CatalogState::new());
-            }
-            Err(source) => {
-                return Err(UpdateError::Io {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
-        };
-        let state: CatalogState = serde_json::from_slice(&bytes)?;
-        if state.schema != CATALOG_STATE_SCHEMA {
-            return Err(UpdateError::UnsupportedSchema(state.schema));
-        }
-        Ok(state)
-    }
-
-    /// Atomically persists `state` after rejecting an unknown schema.
-    pub fn write(&self, state: &CatalogState) -> Result<(), UpdateError> {
-        if state.schema != CATALOG_STATE_SCHEMA {
-            return Err(UpdateError::UnsupportedSchema(state.schema));
-        }
-        let mut bytes = serde_json::to_vec_pretty(state)?;
-        bytes.push(b'\n');
-        atomic_write(&self.path, &bytes)?;
-        Ok(())
-    }
-}
+pub type CatalogStateStore = SchemaFile<CatalogState>;
 
 #[cfg(test)]
 mod tests {

@@ -89,13 +89,13 @@ manifest or explicit digest is supplied, a mismatch fails closed. The source ima
 re-checked in the cleanup trap on success and failure, and must be unchanged.
 
 For a pre-change systemd image that already has an old ZeroDeck controller, units or
-`/var/lib/zerodeck/current`, `--mode auto` (the default) detects that installation and passes
+`/home/.zerodeck/current`, `--mode auto` (the default) detects that installation and passes
 `--convert-existing-zerodeck`; `--mode convert` forces that path. A clean image uses `--mode clean`.
 
 ## Scenarios
 
 Each scenario verifies the active `current` digest, the running `zerodeckd` executable under
-`/var/lib/zerodeck/generations/<digest>/bin/`, `/readyz` version/build ID, a non-empty systemd
+`/home/.zerodeck/generations/<digest>/bin/`, `/readyz` version/build ID, a non-empty systemd
 `InvocationID` (and whether it changed for scenarios that must restart the service), root ownership
 of `current`, `last_confirmed`, absence of a pending transaction, and `zerodeck.service` state.
 

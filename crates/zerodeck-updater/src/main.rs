@@ -19,7 +19,10 @@ use zerodeck_updater::{
     enqueue_upgrade_with_channel, prepare_bootstrap, recover, recover_before_boot, stage_release,
 };
 
-const DEFAULT_ROOT: &str = "/var/lib/zerodeck";
+/// Root-owned update root. `/home` persists across `SteamOS` updates; `/usr` and most of `/var` do not.
+const DEFAULT_ROOT: &str = "/home/.zerodeck";
+/// Settings file written by the installer; `sudo` strips the environment, so it backs the variables.
+const UPDATE_ENV_FILE: &str = "/etc/zerodeck/update.env";
 const DEFAULT_READY_URL: &str = "http://127.0.0.1:1337";
 const APPLY_LOCK_WAIT: Duration = Duration::from_secs(30);
 const APPLY_LOCK_POLL: Duration = Duration::from_millis(200);
@@ -203,8 +206,7 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     let installed = installed_release(&store);
     let metadata_url = environment_url("ZERODECK_UPDATE_METADATA_URL")?;
     let targets_url = environment_url("ZERODECK_UPDATE_TARGETS_URL")?;
-    let trusted_root_path = std::env::var("ZERODECK_UPDATE_TRUSTED_ROOT")
-        .map_err(|_| UpdateError::MissingEnvironment("ZERODECK_UPDATE_TRUSTED_ROOT"))?;
+    let trusted_root_path = update_setting("ZERODECK_UPDATE_TRUSTED_ROOT")?;
     let trusted_root = fs::read(&trusted_root_path).map_err(|source| UpdateError::Io {
         path: PathBuf::from(&trusted_root_path),
         source,
@@ -615,8 +617,27 @@ fn managed_service() -> Result<SystemdService, UpdateError> {
     Ok(SystemdService::new(DAEMON_UNIT, url))
 }
 
+/// Looks `name` up in the environment first, then in the installer's `update.env`.
+fn update_setting(name: &'static str) -> Result<String, UpdateError> {
+    if let Ok(value) = std::env::var(name) {
+        return Ok(value);
+    }
+    fs::read_to_string(UPDATE_ENV_FILE)
+        .ok()
+        .and_then(|contents| env_file_value(&contents, name))
+        .ok_or(UpdateError::MissingEnvironment(name))
+}
+
+/// Extracts `name` from `KEY=VALUE` lines, ignoring comments and blank lines.
+fn env_file_value(contents: &str, name: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == name && !value.trim().is_empty()).then(|| value.trim().to_owned())
+    })
+}
+
 fn environment_url(name: &'static str) -> Result<Url, UpdateError> {
-    let value = std::env::var(name).map_err(|_| UpdateError::MissingEnvironment(name))?;
+    let value = update_setting(name)?;
     Url::parse(&value).map_err(|error| UpdateError::InvalidEnvironmentUrl {
         name,
         reason: error.to_string(),
@@ -672,6 +693,17 @@ fn apply_kind_name(kind: zerodeck_updater::ApplyKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn env_file_value_reads_keys_and_skips_comments() {
+        let contents = "# generated\nZERODECK_UPDATE_TRUSTED_ROOT=/etc/zerodeck/trusted-root.json\n\nOTHER=1\nEMPTY=\n";
+        assert_eq!(
+            super::env_file_value(contents, "ZERODECK_UPDATE_TRUSTED_ROOT").as_deref(),
+            Some("/etc/zerodeck/trusted-root.json")
+        );
+        assert_eq!(super::env_file_value(contents, "EMPTY"), None);
+        assert_eq!(super::env_file_value(contents, "MISSING"), None);
+    }
+
     use std::time::Duration;
 
     use super::apply_waiting_for_lock;

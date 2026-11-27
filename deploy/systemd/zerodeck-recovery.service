@@ -10,7 +10,7 @@ User=root
 TimeoutStartSec=60
 # Disk-only reconciliation: never starts or stops the daemon. The ordered daemon unit owns startup
 # when a good generation remains.
-ExecStart=/usr/local/lib/zerodeck/bin/zerodeckctl recover-boot --root /var/lib/zerodeck
+ExecStart=/home/.zerodeck/bin/zerodeckctl recover-boot --root /home/.zerodeck
 
 [Install]
 WantedBy=multi-user.target

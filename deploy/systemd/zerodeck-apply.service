@@ -1,7 +1,7 @@
 [Unit]
 Description=ZeroDeck managed loader activation
 After=local-fs.target
-ConditionPathExists=/var/lib/zerodeck
+ConditionPathExists=/home/.zerodeck
 
 [Service]
 Type=oneshot
@@ -11,8 +11,8 @@ User=root
 # test fails if these timeouts drop below it.
 TimeoutStartSec=240
 TimeoutStopSec=240
-ExecStart=/usr/local/lib/zerodeck/bin/zerodeckctl apply --root /var/lib/zerodeck
+ExecStart=/home/.zerodeck/bin/zerodeckctl apply --root /home/.zerodeck
 # Runs after the apply process exits, whether it succeeded, failed, or was killed. The helper waits
 # for the maintenance lock instead of stealing it and only restarts a daemon that was recorded as
 # running before the failed apply.
-ExecStopPost=/usr/local/lib/zerodeck/bin/zerodeckctl recover-after-apply --root /var/lib/zerodeck
+ExecStopPost=/home/.zerodeck/bin/zerodeckctl recover-after-apply --root /home/.zerodeck

@@ -9,5 +9,5 @@ User=root
 # The timer only verifies the trusted catalog and reports an available release. It never stages or
 # activates anything.
 EnvironmentFile=-/etc/zerodeck/update.env
-ExecStart=/usr/local/lib/zerodeck/bin/zerodeckctl update --check-only --root /var/lib/zerodeck
+ExecStart=/home/.zerodeck/bin/zerodeckctl update --check-only --root /home/.zerodeck
 Nice=10

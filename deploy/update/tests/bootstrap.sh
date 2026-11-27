@@ -433,6 +433,38 @@ fi
     echo "controller link conflict overwrote the foreign file" >&2; exit 1;
 }
 
+# SteamOS keeps only allow-listed /etc files across an OS update: bootstrap registers the units.
+read -r root controller units config < <(new_install keep-list)
+base="$(base_for "${root}")"
+keep_dir="${base}/etc/atomic-update.conf.d"
+mkdir -p "${keep_dir}"
+run_bootstrap "${base}" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" --keep-list-dir "${keep_dir}" >"${tmp}/keep-list.log"
+keep_file="${keep_dir}/zerodeck.conf"
+[[ -f "${keep_file}" ]] || { echo "bootstrap did not write ${keep_file}" >&2; exit 1; }
+for entry in \
+    /etc/systemd/system/zerodeck.service \
+    /etc/systemd/system/zerodeck-apply.service \
+    /etc/systemd/system/zerodeck-recovery.service \
+    /etc/systemd/system/zerodeck-check.service \
+    /etc/systemd/system/zerodeck-check.timer \
+    '/etc/systemd/system/*.wants/zerodeck*' \
+    /etc/atomic-update.conf.d/zerodeck.conf; do
+    grep -qxF "${entry}" "${keep_file}" || {
+        echo "keep-list is missing ${entry}" >&2; cat "${keep_file}" >&2; exit 1;
+    }
+done
+
+# Without the SteamOS keep-list directory nothing is written for it.
+read -r root controller units config < <(new_install no-keep-list)
+base="$(base_for "${root}")"
+run_bootstrap "${base}" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" --keep-list-dir "${base}/etc/atomic-update.conf.d" \
+    >"${tmp}/no-keep-list.log"
+[[ ! -e "${base}/etc/atomic-update.conf.d" ]] || {
+    echo "bootstrap created the SteamOS keep-list directory on a host without it" >&2; exit 1;
+}
+
 # ── Inputs are copied and verified before use: swapping the source cannot change the install ────
 # Add a large member so the extraction window is observable, then replace the caller's files as
 # soon as the verified copies are complete. The installation must still come from the copies.

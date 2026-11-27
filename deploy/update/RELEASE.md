@@ -207,9 +207,9 @@ sudo ./bootstrap.sh \
 The helper first copies the package, generation and trusted root into a root-only work directory
 and verifies those copies. No caller-controlled path is re-opened for extraction or execution, so a
 file swapped after a hash check cannot be installed. Before extracting anything it also verifies all
-three SHA-256 digests and parses the root. It installs a root-owned
-`/usr/local/bin/zerodeckctl` symlink (override with `--bin-link`) and refuses if an install path or
-any of its ancestors is a symlink, non-root-owned, or group/other-writable. It then validates both
+three SHA-256 digests and parses the root. It refuses if an install path or any of its ancestors is
+a symlink, non-root-owned, or group/other-writable. `/usr/local` is read-only on SteamOS, so no PATH
+link is installed unless `--bin-link` asks for one; call `/home/.zerodeck/bin/zerodeckctl` directly. It then validates both
 archives and refuses if:
 
 - `decky.service` or `plugin_loader.service` is active (Decky files are never stopped or rewritten);
@@ -220,10 +220,11 @@ archives and refuses if:
 - the manual and managed archives disagree on version/build ID, a required component is missing, or
   a path/mode is unsafe.
 
-The helper installs the verified generation under `/var/lib/zerodeck/generations/<sha256>`, the
-controller at `/usr/local/lib/zerodeck/bin/zerodeckctl`, the PATH link at
-`/usr/local/bin/zerodeckctl`, units in `/etc/systemd/system`, the trusted root and update endpoints
-in `/etc/zerodeck/`, and prepares `state/update.json` through `zerodeckctl bootstrap --prepare`. It
+The helper installs the verified generation under `/home/.zerodeck/generations/<sha256>`, the
+controller at `/home/.zerodeck/bin/zerodeckctl`, units in `/etc/systemd/system`, the trusted root and
+update endpoints in `/etc/zerodeck/`, and (when `/etc/atomic-update.conf.d` exists, as on SteamOS
+3.6+) `/etc/atomic-update.conf.d/zerodeck.conf`, which lists the units, their `*.wants` enablement
+symlinks and itself so they survive an OS update (`--keep-list-dir` overrides the location), and prepares `state/update.json` through `zerodeckctl bootstrap --prepare`. It
 fsyncs the complete generation tree before switching `current`. It does not create or modify
 `/home/deck/homebrew` during a clean install. Without `--start` it installs units but neither
 enables nor starts anything, and immediately runs `bootstrap --confirm` because no process exists
@@ -243,7 +244,7 @@ sudo ./bootstrap.sh ... --convert-existing-zerodeck --start
 
 Before replacing anything, the helper snapshots the controller, units, unit drop-ins,
 `/etc/zerodeck` files, `current`, and update/apply state under
-`/var/lib/zerodeck/backup/bootstrap-<timestamp>-<pid>/`. The previous generation is retained as the
+`/home/.zerodeck/backup/bootstrap-<timestamp>-<pid>/`. The previous generation is retained as the
 rollback target. If start/readiness fails, the old controller, units, drop-ins, config, `current`
 and state are restored and the previous service is restarted when it was running. Data under
 `/home/deck/homebrew` is never rewritten. Keep the backup until the managed generation has been
@@ -260,7 +261,7 @@ sudo ./bootstrap.sh ... --import-inactive-decky /path/to/inactive/homebrew --sta
 
 The source must not have an active Decky service, and the helper never writes into
 `/home/deck/homebrew`. It copies the tree with `cp -a` into a root-only staging directory
-(`/var/lib/zerodeck/import/decky-<timestamp>-<pid>/`, mode `0700`) and records `state/import.json`
+(`/home/.zerodeck/import/decky-<timestamp>-<pid>/`, mode `0700`) and records `state/import.json`
 with the staged path, `root_plugins: "blocked"`, `activated: false`, and the expected host data
 root. Imported code is not on any plugin search path and cannot be activated implicitly; review the
 staged copy and install individual plugins with a verified package before adopting them. The host
@@ -286,7 +287,7 @@ disk, so stale state cannot cause deletion of the running generation.
 `min_updater` in the signed target prevents an old controller from activating a newer generation.
 To replace the controller itself, use the verified bootstrap helper with
 `--convert-existing-zerodeck`; it refuses during a pending activation or when the persisted state
-cannot be read. Do not replace `/usr/local/lib/zerodeck/bin/zerodeckctl` by hand while an apply is
+cannot be read. Do not replace `/home/.zerodeck/bin/zerodeckctl` by hand while an apply is
 pending. An offline rollback uses the retained generation and does not consult TUF or the network.
 
 ```bash

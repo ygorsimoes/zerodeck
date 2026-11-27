@@ -7,7 +7,7 @@ After=network.target zerodeck-recovery.service
 # it the daemon must not start; recovery clears it when no good generation remains. `exec-current`
 # also refuses to start unless boot recovery recorded a marker for the current kernel boot, so a
 # failed or skipped recovery cannot leave the daemon running with unreconciled disk state.
-ConditionPathExists=/var/lib/zerodeck/current
+ConditionPathExists=/home/.zerodeck/current
 
 # Paths default to the stock Steam Deck layout (`/home/deck/homebrew`). systemd does not expand
 # shell-style variables in WorkingDirectory=, so to use another location create a drop-in with
@@ -24,7 +24,7 @@ RestartSec=2
 KillMode=process
 TimeoutStopSec=15
 TimeoutStartSec=90
-ExecStart=/usr/local/lib/zerodeck/bin/zerodeckctl exec-current --root /var/lib/zerodeck
+ExecStart=/home/.zerodeck/bin/zerodeckctl exec-current --root /home/.zerodeck
 # The leading `-` keeps the unit starting if the directory does not exist yet.
 WorkingDirectory=-/home/deck/homebrew/services
 Environment=UNPRIVILEGED_PATH=/home/deck/homebrew

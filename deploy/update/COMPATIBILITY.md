@@ -34,7 +34,7 @@ fake-qemu/fake-SSH self-test runs in `just check`; a real image run is still PEN
 | Kernel (`uname -r`) | PENDING |
 | SteamOS update channel | PENDING (stable / beta / preview) |
 | Invocation identity | PENDING (user, uid/gid, `sudo`/root shell/SSH, terminal or Desktop Mode) |
-| Install root | PENDING (`/var/lib/zerodeck`, controller, units, config) |
+| Install root | PENDING (`/home/.zerodeck`, controller, units, config) |
 | Homebrew/data root | PENDING (`/home/deck/homebrew`) |
 | Existing Decky state | PENDING (none / inactive import / converted) |
 | Existing ZeroDeck state | PENDING (clean / converted) |
@@ -51,7 +51,7 @@ effective uid/gid, whether `sudo` was used, and whether it ran from Game Mode, D
 | `/` (rootfs) | PENDING | PENDING | PENDING | PENDING |
 | `/home` | PENDING | PENDING | PENDING | PENDING |
 | `/var` | PENDING | PENDING | PENDING | PENDING |
-| `/var/lib/zerodeck` | PENDING | PENDING | PENDING | PENDING |
+| `/home/.zerodeck` | PENDING | PENDING | PENDING | PENDING |
 | `/home/deck/homebrew` | PENDING | PENDING | PENDING | PENDING |
 | Temporary directory used by staging | PENDING | PENDING | PENDING | PENDING |
 
@@ -79,7 +79,7 @@ update and rollback all still work through the documented writable locations.
 | Import inactive Decky tree | PENDING | PENDING | PENDING | PENDING |
 | Running Decky conflict refusal | PENDING | PENDING | PENDING | PENDING |
 
-For each lifecycle row record the actual `/var/lib/zerodeck/current` digest, the `zerodeckd`
+For each lifecycle row record the actual `/home/.zerodeck/current` digest, the `zerodeckd`
 executable resolved from the unit's `MainPID`, `/readyz` version/build ID, and the service state
 before and after. A rollback is offline only if the network was disabled or unavailable and the
 operation still used the retained generation.

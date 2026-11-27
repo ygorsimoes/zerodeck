@@ -19,7 +19,7 @@ PROGRAM="vm.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 PYTHON="${PYTHON:-python3}"
-ZERODECK_CTL="/usr/local/lib/zerodeck/bin/zerodeckctl"
+ZERODECK_CTL="/home/.zerodeck/bin/zerodeckctl"
 DEFAULT_GUEST_DIR_PREFIX="/var/tmp/zerodeck-vm"
 
 image=""
@@ -81,7 +81,7 @@ Optional:
   --candidate PATH          Managed archive for a genuinely newer release. If omitted the harness
                             repacks the installed generation with a different digest and the same
                             release identity; that proves apply/rollback but not a version upgrade.
-  --mode auto|clean|convert  Auto-detect an existing /var/lib/zerodeck/current and pass
+  --mode auto|clean|convert  Auto-detect an existing /home/.zerodeck/current and pass
                             --convert-existing-zerodeck when present (default: auto).
   --image-sha256 HEX        Required image digest; a mismatch fails before QEMU starts.
   --sha256sums PATH         SHA256SUMS.txt covering the release archives.
@@ -601,9 +601,9 @@ resolve_install_mode() {
             if guest_root_script <<'SCRIPT'
 set -e
 for path in \
-    /var/lib/zerodeck/current \
-    /var/lib/zerodeck/state/update.json \
-    /usr/local/lib/zerodeck/bin/zerodeckctl \
+    /home/.zerodeck/current \
+    /home/.zerodeck/state/update.json \
+    /home/.zerodeck/bin/zerodeckctl \
     /etc/systemd/system/zerodeck.service; do
     if [[ -e "${path}" ]]; then
         exit 0
@@ -645,7 +645,7 @@ PY
     echo "${label}: archive digest mismatch: expected ${digest}, got ${actual}" >&2
     exit 1
 }
-destination="/var/lib/zerodeck/generations/${digest}"
+destination="/home/.zerodeck/generations/${digest}"
 if [[ -e "${destination}" ]]; then
     [[ -f "${destination}/release.json" ]] || {
         echo "${label}: existing generation is incomplete" >&2
@@ -654,7 +654,7 @@ if [[ -e "${destination}" ]]; then
     echo "${label}: generation ${digest} already staged"
     exit 0
 fi
-staging="$(mktemp -d "/var/lib/zerodeck/generations/.vm-stage.XXXXXX")"
+staging="$(mktemp -d "/home/.zerodeck/generations/.vm-stage.XXXXXX")"
 trap 'rm -rf "${staging}"' EXIT
 python3 - "${archive}" "${staging}/tree" <<'PY'
 import os
@@ -714,7 +714,7 @@ version="$2"
 build_id="$3"
 size="$4"
 target="$5"
-python3 - "/var/lib/zerodeck/state/catalog.json" "${digest}" "${version}" "${build_id}" "${size}" "${target}" <<'PY'
+python3 - "/home/.zerodeck/state/catalog.json" "${digest}" "${version}" "${build_id}" "${size}" "${target}" <<'PY'
 import json
 import os
 import sys
@@ -750,8 +750,8 @@ try:
 finally:
     os.close(directory)
 PY
-chown root:root /var/lib/zerodeck/state/catalog.json
-chmod 0600 /var/lib/zerodeck/state/catalog.json
+chown root:root /home/.zerodeck/state/catalog.json
+chmod 0600 /home/.zerodeck/state/catalog.json
 SCRIPT
 }
 
@@ -786,7 +786,7 @@ run_upgrade() {
 start_upgrade_background() {
     guest_root_script <<'SCRIPT'
 set -euo pipefail
-nohup /usr/local/lib/zerodeck/bin/zerodeckctl upgrade \
+nohup /home/.zerodeck/bin/zerodeckctl upgrade \
     >/var/tmp/zerodeck-upgrade.log 2>&1 &
 echo $!
 SCRIPT
@@ -799,7 +799,7 @@ set -euo pipefail
 phase="$1"
 deadline=$((SECONDS + $2))
 while (( SECONDS < deadline )); do
-    state="/var/lib/zerodeck/state/update.json"
+    state="/home/.zerodeck/state/update.json"
     if [[ -f "${state}" ]] && grep -q "\"phase\": \"${phase}\"" "${state}"; then
         echo "apply reached phase ${phase}"
         exit 0
@@ -820,14 +820,14 @@ deadline=$((SECONDS + $2))
 while (( SECONDS < deadline )); do
     if [[ "$(systemctl show -p ActiveState --value zerodeck.service 2>/dev/null || true)" == "active" ]]; then
         pid="$(systemctl show -p MainPID --value zerodeck.service 2>/dev/null || true)"
-        current="$(cat /var/lib/zerodeck/current 2>/dev/null || true)"
+        current="$(cat /home/.zerodeck/current 2>/dev/null || true)"
         if [[ "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 0 && "${current}" == "${expected}" ]] && python3 - <<'PY' 2>/dev/null
 import json
 import sys
 import urllib.request
 
 try:
-    document = json.load(open("/var/lib/zerodeck/state/update.json", encoding="utf-8"))
+    document = json.load(open("/home/.zerodeck/state/update.json", encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
     raise SystemExit(1)
 if document.get("pending") is not None:
@@ -898,7 +898,7 @@ set -euo pipefail
 expected="$1"
 version="$2"
 build_id="$3"
-current="$(cat /var/lib/zerodeck/current)"
+current="$(cat /home/.zerodeck/current)"
 [[ "${current}" == "${expected}" ]] || {
     echo "current digest mismatch: expected ${expected}, got ${current}" >&2
     exit 1
@@ -913,11 +913,11 @@ pid="$(systemctl show -p MainPID --value zerodeck.service)"
     exit 1
 }
 exe="$(readlink -f "/proc/${pid}/exe")"
-[[ "${exe}" == "/var/lib/zerodeck/generations/${expected}/bin/zerodeckd" ]] || {
+[[ "${exe}" == "/home/.zerodeck/generations/${expected}/bin/zerodeckd" ]] || {
     echo "running binary is ${exe}, expected generation ${expected}" >&2
     exit 1
 }
-installed_sha="$(sha256sum "/var/lib/zerodeck/generations/${expected}/bin/zerodeckd" | awk '{print $1}')"
+installed_sha="$(sha256sum "/home/.zerodeck/generations/${expected}/bin/zerodeckd" | awk '{print $1}')"
 running_sha="$(sha256sum "/proc/${pid}/exe" | awk '{print $1}')"
 [[ "${installed_sha}" == "${running_sha}" ]] || {
     echo "running binary digest does not match the installed generation" >&2
@@ -927,7 +927,7 @@ python3 - "${expected}" <<'PY'
 import json
 import sys
 
-path = "/var/lib/zerodeck/state/update.json"
+path = "/home/.zerodeck/state/update.json"
 try:
     document = json.load(open(path, encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as error:
@@ -939,7 +939,7 @@ if document.get("last_confirmed") != sys.argv[1]:
         f"last_confirmed is {document.get('last_confirmed')!r}, expected {sys.argv[1]!r}"
     )
 PY
-[[ "$(stat -c '%u' /var/lib/zerodeck/current)" == "0" ]] || {
+[[ "$(stat -c '%u' /home/.zerodeck/current)" == "0" ]] || {
     echo "current is not root-owned" >&2
     exit 1
 }
@@ -1081,9 +1081,9 @@ restore_generation_from_archive() {
 set -euo pipefail
 archive="$1"
 digest="$2"
-destination="/var/lib/zerodeck/generations/${digest}"
+destination="/home/.zerodeck/generations/${digest}"
 rm -rf "${destination}"
-staging="$(mktemp -d "/var/lib/zerodeck/generations/.vm-stage.XXXXXX")"
+staging="$(mktemp -d "/home/.zerodeck/generations/.vm-stage.XXXXXX")"
 trap 'rm -rf "${staging}"' EXIT
 python3 - "${archive}" "${staging}/tree" <<'PY'
 import os
@@ -1131,14 +1131,14 @@ set -euo pipefail
 generation="$1"
 label="$2"
 mutation="$3"
-directory="/var/lib/zerodeck/generations/${generation}"
+directory="/home/.zerodeck/generations/${generation}"
 case "${mutation}" in
     missing) rm -rf "${directory}" ;;
     release) rm -f "${directory}/release.json" ;;
     *) echo "unknown rollback mutation: ${mutation}" >&2; exit 2 ;;
 esac
 log="/var/tmp/zerodeck-bad-rollback-${mutation}.log"
-if /usr/local/lib/zerodeck/bin/zerodeckctl rollback >"${log}" 2>&1; then
+if /home/.zerodeck/bin/zerodeckctl rollback >"${log}" 2>&1; then
     echo "rollback unexpectedly succeeded with ${label}" >&2
     exit 1
 fi
@@ -1243,7 +1243,7 @@ scenario_unhealthy_candidate() {
     guest_root_script <<'SCRIPT' "${unhealthy_digest}"
 set -euo pipefail
 digest="$1"
-python3 - "/var/lib/zerodeck/state/update.json" "${digest}" <<'PY'
+python3 - "/home/.zerodeck/state/update.json" "${digest}" <<'PY'
 import json
 import sys
 
@@ -1276,7 +1276,7 @@ assert_quarantined() {
 set -euo pipefail
 digest="$1"
 label="$2"
-python3 - "/var/lib/zerodeck/state/update.json" "${digest}" "${label}" <<'PY'
+python3 - "/home/.zerodeck/state/update.json" "${digest}" "${label}" <<'PY'
 import json
 import sys
 
@@ -1373,7 +1373,7 @@ scenario_second_recovery() {
     local before after
     before="$(guest_root_script <<'SCRIPT'
 set -euo pipefail
-sha256sum /var/lib/zerodeck/current /var/lib/zerodeck/state/update.json
+sha256sum /home/.zerodeck/current /home/.zerodeck/state/update.json
 SCRIPT
 )"
     guest_root_cmd "${ZERODECK_CTL}" recover-boot >/dev/null
@@ -1382,7 +1382,7 @@ SCRIPT
     guest_root_cmd "${ZERODECK_CTL}" recover-after-apply >/dev/null
     after="$(guest_root_script <<'SCRIPT'
 set -euo pipefail
-sha256sum /var/lib/zerodeck/current /var/lib/zerodeck/state/update.json
+sha256sum /home/.zerodeck/current /home/.zerodeck/state/update.json
 SCRIPT
 )"
     [[ "${before}" == "${after}" ]] || die "second recovery pass changed current/state"
@@ -1713,7 +1713,7 @@ case "$*" in
                 printf 'convert-ok\n' >>"${VM_SELFTEST_LOG}.convert"
             fi
         fi
-        if grep -q "cat /var/lib/zerodeck/current" <<<"${script}"; then
+        if grep -q "cat /home/.zerodeck/current" <<<"${script}"; then
             printf 'fake current digest mismatch\n' >&2
             exit 1
         fi

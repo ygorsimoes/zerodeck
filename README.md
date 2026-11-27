@@ -217,6 +217,11 @@ must not be able to grant themselves root.
 - **Uninstall/recovery:** the controller and confirmed generations remain independent of your
   plugins and settings; an interrupted activation restores the previous generation or leaves a
   recoverable stopped state.
+- **Release gate:** a disposable systemd VM (QEMU, no KVM required) exercises update, rollback and
+  crash recovery via `just test-updater-vm`; exact Steam/SteamOS/build, filesystem, offline,
+  SteamOS-update and resource evidence is recorded in
+  [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md). Deck evidence is **PENDING**,
+  so Stable stays blocked until that checklist is filled from observed hardware.
 
 Want it sooner? [Help build it](#contributing).
 

@@ -260,6 +260,21 @@ sudo zerodeckctl unquarantine <generation-digest>  # only after review
 
 Run the following in a fork or staging repository; never use production signing keys for a drill.
 
+- **VM crash gate:** boot a disposable image with `just test-updater-vm <image> <key> <user>
+  <manual> <managed> [<next-managed>]` (or call `deploy/update/tests/vm.sh` directly). It verifies
+  the image and release digests, installs with the packaged bootstrap, and drives update, rollback,
+  hard poweroff, `SIGKILL` of the apply helper, port collision, corrupt rollback, reboot during
+  recovery and a second recovery pass. It exits `77` with `skipped: no qemu/image` when the host
+  cannot run it; a skip is not a pass. Use `--work-dir` to preserve evidence. The harness self-test
+  (fake QEMU/SSH) runs in `just check`. Update scenarios use a local fixture authorization rather
+  than a live TUF repository; TUF fetch/selection is covered by the Rust catalog and staging tests.
+  See [`tests/README.md`](tests/README.md).
+- **Steam Deck hardware gate:** record every field in
+  [`COMPATIBILITY.md`](COMPATIBILITY.md) from observed hardware: exact Steam/SteamOS/build,
+  filesystems and read-only root, invocation identity, online update, offline rollback,
+  SteamOS-update survival, unchanged plugin inventory in a loader-only upgrade, peak RSS, bytes,
+  temporary disk and stop-to-ready/stop-to-recovered timings. Every unexecuted field is
+  **PENDING**. Do not mark Stable eligible from a VM run alone.
 - **Staging release:** create a draft, build from an exact commit, package by image digest, run the
   package test, upload/verify twice, publish once. Record the asset digests and attestation output.
 - **Retry:** inject an upload failure (the local `deploy/update/tests/publish.sh` does this), confirm
@@ -277,5 +292,6 @@ Run the following in a fork or staging repository; never use production signing 
 
 The local shell tests exercise bootstrap refusal/conversion/import, release-ID upload retry and
 provenance/descriptor refusal without keys: `deploy/update/tests/{bootstrap,publish,promotion}.sh`.
-Rust catalog tests cover TUF expiry/rotation/selection. Hardware evidence is recorded in
-`deploy/update/COMPATIBILITY.md`.
+Rust catalog tests cover TUF expiry/rotation/selection. The VM gate is
+`deploy/update/tests/vm.sh`; its fake-QEMU self-test is part of `just check`. Hardware evidence is
+recorded in `deploy/update/COMPATIBILITY.md`, with every unexecuted item **PENDING**.

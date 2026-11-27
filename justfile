@@ -116,6 +116,18 @@ py-test-on version:
 py-matrix:
     for v in {{ python_versions }}; do just py-test-on "$v"; done
 
+# Boot a disposable Linux/systemd VM and run the updater crash/rollback gate. Runs on this host (it
+# needs qemu-system-x86_64, qemu-img and the caller's image); exits 77 with `skipped: no qemu/image`
+# when they are absent. Pass `-` as candidate to test the installed generation's apply/rollback path.
+[group('checks')]
+test-updater-vm image ssh_key ssh_user manual managed candidate="-":
+    just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}" "{{ candidate }}"
+
+# Exercise the VM harness itself with fake qemu/ssh (no image or hardware required)
+[group('checks')]
+test-updater-vm-selftest:
+    {{ dev }} just _test-updater-vm-selftest
+
 # Lint the infrastructure: version pins in sync, compose, workflows (actionlint, zizmor), Dockerfile (hadolint)
 [group('checks')]
 lint-infra: _toolchain-sync
@@ -246,6 +258,27 @@ _release-scripts:
     bash deploy/update/tests/bootstrap.sh
     bash deploy/update/tests/publish.sh
     bash deploy/update/tests/promotion.sh
+    just _test-updater-vm-selftest
+
+[private]
+_test-updater-vm image ssh_key ssh_user manual managed candidate:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(
+        --image "{{ image }}"
+        --ssh-key "{{ ssh_key }}"
+        --ssh-user "{{ ssh_user }}"
+        --manual "{{ manual }}"
+        --managed "{{ managed }}"
+    )
+    if [[ "{{ candidate }}" != "-" ]]; then
+        args+=(--candidate "{{ candidate }}")
+    fi
+    exec bash deploy/update/tests/vm.sh "${args[@]}"
+
+[private]
+_test-updater-vm-selftest:
+    bash deploy/update/tests/vm.sh --self-test
 
 [private]
 _coverage:

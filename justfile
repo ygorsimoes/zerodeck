@@ -116,6 +116,11 @@ py-test-on version:
 py-matrix:
     for v in {{ python_versions }}; do just py-test-on "$v"; done
 
+# Release tooling tests: publish/promotion/evidence-gate scripts, bootstrap and the VM harness
+[group('checks')]
+check-release:
+    {{ dev }} just _release-scripts
+
 # Boot a disposable Linux/systemd VM and run the updater crash/rollback gate:
 #   just test-updater-vm <image> <ssh-key> <ssh-user> <manual> <managed> [<candidate>]
 # Runs on this host (it needs qemu-system-x86_64, qemu-img and the caller's image); exits 77 with
@@ -230,7 +235,7 @@ verify-managed-image image archive:
     # The runtime image runs as an unprivileged user; mktemp creates 0700 and the
     # container must be able to traverse the bind mount to execute the packaged daemon.
     chmod -R a+rX "${generation}"
-    image_arch="$(docker image inspect '{{ image }}' | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["Architecture"])')"
+    image_arch="$(docker image inspect --format '{{{{.Architecture}}' '{{ image }}')"
     docker run --rm --platform "linux/${image_arch}" -v "${generation}:/generation:ro" \
         -e UNPRIVILEGED_PATH=/homebrew -e PRIVILEGED_PATH=/homebrew -e PYTHONPATH= \
         --entrypoint /generation/bin/zerodeckd "{{ image }}" \
@@ -288,23 +293,6 @@ _release-scripts:
     bash deploy/update/tests/promotion.sh
     bash deploy/update/tests/stable-gate.sh
     just _test-updater-vm-selftest
-
-# VM gate for CI: exit 0 when the environment cannot provide qemu/image (77), fail otherwise.
-[private]
-_test-updater-vm-ci image ssh_key ssh_user manual managed:
-    #!/usr/bin/env bash
-    set +e
-    just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}" "-"
-    status=$?
-    set -e
-    if [[ "${status}" -eq 0 ]]; then
-        exit 0
-    fi
-    if [[ "${status}" -eq 77 ]]; then
-        echo "updater-vm: skipped (77): no qemu/image on this runner"
-        exit 0
-    fi
-    exit "${status}"
 
 [private]
 _test-updater-vm image ssh_key ssh_user manual managed candidate:
@@ -392,6 +380,13 @@ _toolchain-sync:
         "$(sed -n 's/^ARG PNPM_VERSION=//p' Dockerfile)"
     expect "just in workflows vs Dockerfile JUST_VERSION" "$(sed -n 's/^ARG JUST_VERSION=//p' Dockerfile)" \
         $(grep -rhoE 'just@[0-9][0-9.]*' .github | cut -d@ -f2)
+    # Every external base image is pinned by digest; stage-to-stage references have no `:` or `/`.
+    while read -r image; do
+        if [[ "${image}" == *[:/]* && "${image}" != *@sha256:* ]]; then
+            echo "error: Dockerfile base image is not pinned by digest: ${image}" >&2
+            fail=1
+        fi
+    done < <(sed -nE 's/^FROM[[:space:]]+([^[:space:]]+).*/\1/p' Dockerfile)
     [[ "${fail}" -eq 0 ]] && echo "toolchain pins in sync (rust ${rust}, pnpm ${pnpm})"
     exit "${fail}"
 

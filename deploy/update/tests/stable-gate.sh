@@ -73,6 +73,13 @@ expect_failure wrong-digest bash "${gate}" --tag "${tag}" --version "${version}"
     --build-id "${build_id}" --sha256 "${digest}" --evidence "${tmp}/wrong-digest.md"
 grep -q "Managed asset SHA-256" "${tmp}/wrong-digest.log"
 
+# Evidence for a prerelease of the same version must not satisfy the stable tag.
+write_evidence "${tmp}/rc.md" "PASS" no "${digest}"
+sed -i.bak "s/^| Release tag | ${tag} |/| Release tag | ${tag}-rc.1 |/" "${tmp}/rc.md"
+expect_failure prerelease-tag bash "${gate}" --tag "${tag}" --version "${version}" \
+    --build-id "${build_id}" --sha256 "${digest}" --evidence "${tmp}/rc.md"
+grep -q "Release tag" "${tmp}/prerelease-tag.log"
+
 expect_failure missing-evidence bash "${gate}" --tag "${tag}" --version "${version}" \
     --build-id "${build_id}" --sha256 "${digest}" --evidence "${tmp}/absent.md"
 

@@ -349,4 +349,18 @@ grep -q "no longer a draft" "${tmp}/concurrent.log" || {
 }
 unset FAKE_GH_CONCURRENT_PUBLISH
 
+# Without --gh/--curl the tools are resolved through PATH (the way the workflows call the script).
+reset_release
+write_sums
+path_bin="${tmp}/path-bin"
+mkdir -p "${path_bin}"
+cp "${fake_gh}" "${path_bin}/gh"
+cp "${fake_curl}" "${path_bin}/curl"
+PATH="${path_bin}:${PATH}" bash "${repo_root}/deploy/update/publish-release.sh" \
+    --repo fixture/repo --release-id 42 --tag v1.2.3 --dist "${dist}" >"${tmp}/path.log" 2>&1 || {
+    echo "error: publish-release.sh could not resolve gh/curl through PATH" >&2
+    cat "${tmp}/path.log" >&2
+    exit 1
+}
+
 echo "publish tests passed"

@@ -43,8 +43,10 @@ done
 [[ -n "${repo}" && -n "${release_id}" && -n "${tag}" && -n "${dist}" ]] || usage
 [[ "${release_id}" =~ ^[0-9]+$ ]] || { echo "publish: --release-id must be numeric" >&2; exit 1; }
 [[ -d "${dist}" ]] || { echo "publish: dist directory not found: ${dist}" >&2; exit 1; }
-[[ -x "${gh_bin}" ]] || { echo "publish: gh executable not found: ${gh_bin}" >&2; exit 1; }
-[[ -x "${curl_bin}" ]] || { echo "publish: curl executable not found: ${curl_bin}" >&2; exit 1; }
+# `command -v` resolves both a bare name through PATH and an explicit path; `[[ -x name ]]` would
+# only look for a file of that name in the current directory.
+gh_bin="$(command -v -- "${gh_bin}")" || { echo "publish: gh executable not found" >&2; exit 1; }
+curl_bin="$(command -v -- "${curl_bin}")" || { echo "publish: curl executable not found" >&2; exit 1; }
 
 manual="zerodeck-${tag}-linux-x86_64.tar.gz"
 managed="zerodeck-${tag}-linux-x86_64.managed.tar.gz"

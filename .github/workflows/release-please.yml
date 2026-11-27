@@ -21,10 +21,6 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
-
 defaults:
   run:
     shell: bash
@@ -260,18 +256,8 @@ jobs:
       - name: Verify the packaged daemon embedded identity
         env:
           TAG: ${{ steps.identity.outputs.tag }}
-          BUILD_ID: ${{ steps.identity.outputs.build_id }}
         run: |
-          set -euo pipefail
-          generation="$(mktemp -d)"
-          tar -xzf "dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz" -C "${generation}"
-          docker run --rm --platform linux/amd64 \
-            -v "${generation}:/generation:ro" \
-            -e UNPRIVILEGED_PATH=/homebrew -e PRIVILEGED_PATH=/homebrew \
-            -e PYTHONPATH= \
-            --entrypoint /generation/bin/zerodeckd "${IMAGE_REF}" \
-            --managed-generation /generation --check-config
-          echo "packaged daemon accepted its release.json build identity ${BUILD_ID}"
+          just verify-managed-image "${IMAGE_REF}" "dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
 
       - name: Attest both release archives
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4

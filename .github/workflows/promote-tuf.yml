@@ -276,7 +276,12 @@ jobs:
           fi
           python3 - <<'PY'
           import json
-          payload = {"event_type": "zerodeck-loader-release", "client_payload": json.load(open("promotion-request.json"))}
+          # repository_dispatch accepts at most 10 top-level client_payload properties, so the whole
+          # request travels under a single `request` key.
+          payload = {
+              "event_type": "zerodeck-loader-release",
+              "client_payload": {"request": json.load(open("promotion-request.json"))},
+          }
           json.dump(payload, open("dispatch.json", "w"))
           PY
           gh api --method POST "repos/${TUF_REPOSITORY}/dispatches" --input dispatch.json

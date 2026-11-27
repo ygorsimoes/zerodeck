@@ -90,10 +90,10 @@ eligible_pattern = r"^\s*(?:[-*]\s*)?Stable eligible:\s*PASS\s*$"
 if not re.search(eligible_pattern, text, re.MULTILINE):
     failures.append("the exact line `Stable eligible: PASS` is missing")
 
-if tag not in table_value("Release tag"):
+if table_value("Release tag") != tag:
     failures.append(f"`Release tag` does not record {tag}")
-identity = table_value("Loader version / build ID")
-if version not in identity or build_id not in identity:
+identity = [part.strip() for part in table_value("Loader version / build ID").split("/", 1)]
+if identity != [version, build_id]:
     failures.append(f"`Loader version / build ID` does not record {version} / {build_id}")
 digest = table_value("Managed asset SHA-256 (generation identity)")
 if sha256.lower() not in digest.lower():

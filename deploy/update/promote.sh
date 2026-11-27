@@ -78,7 +78,8 @@ done
     exit 1
 }
 [[ -f "${archive}" ]] || { echo "promote: archive not found: ${archive}" >&2; exit 1; }
-[[ -x "${gh_bin}" ]] || { echo "promote: gh executable not found: ${gh_bin}" >&2; exit 1; }
+# `command -v` resolves a bare name through PATH; `[[ -x name ]]` only checks the current directory.
+gh_bin="$(command -v -- "${gh_bin}")" || { echo "promote: gh executable not found" >&2; exit 1; }
 expected_sha="$(printf '%s' "${expected_sha}" | tr '[:upper:]' '[:lower:]')"
 expected_target="linux-x86_64/zerodeck-${version}.tar.gz"
 if [[ -n "${target}" && "${target}" != "${expected_target}" ]]; then

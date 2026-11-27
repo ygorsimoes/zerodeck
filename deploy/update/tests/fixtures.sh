@@ -104,6 +104,9 @@ fixture_fake_systemctl() {
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_SYSTEMCTL_LOG:-/dev/null}"
+state_dir="${FAKE_SYSTEMCTL_STATE:-}"
+enabled_file="${state_dir}/enabled"
+mkdir -p "${state_dir}" 2>/dev/null || true
 if [[ "${1:-}" == "is-active" ]]; then
     unit="${3:-}"
     case "${unit}" in
@@ -117,6 +120,31 @@ if [[ "${1:-}" == "is-active" ]]; then
             ;;
     esac
     exit 3
+fi
+if [[ "${1:-}" == "is-enabled" ]]; then
+    if [[ -f "${enabled_file}" ]] && grep -qx "${2:-}" "${enabled_file}"; then
+        echo enabled
+        exit 0
+    fi
+    echo disabled
+    exit 1
+fi
+if [[ "${1:-}" == "enable" ]]; then
+    shift
+    for unit in "$@"; do
+        grep -qx "${unit}" "${enabled_file}" 2>/dev/null || echo "${unit}" >>"${enabled_file}"
+    done
+    exit 0
+fi
+if [[ "${1:-}" == "disable" ]]; then
+    shift
+    for unit in "$@"; do
+        if [[ -f "${enabled_file}" ]]; then
+            grep -vx "${unit}" "${enabled_file}" >"${enabled_file}.tmp" || true
+            mv "${enabled_file}.tmp" "${enabled_file}"
+        fi
+    done
+    exit 0
 fi
 if [[ "${1:-}" == "start" ]]; then
     if [[ "${FAKE_START_FAIL:-0}" == "1" ]]; then

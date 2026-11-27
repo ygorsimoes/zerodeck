@@ -15,7 +15,10 @@ systemctl="${tmp}/fake-systemctl"
 fixture_fake_systemctl "${systemctl}"
 base_for() { echo "${1%/var/lib/zerodeck}"; }
 export FAKE_SYSTEMCTL_LOG="${tmp}/systemctl.log"
+export FAKE_SYSTEMCTL_STATE="${tmp}/systemctl-state"
+mkdir -p "${FAKE_SYSTEMCTL_STATE}"
 : >"${FAKE_SYSTEMCTL_LOG}"
+: >"${FAKE_SYSTEMCTL_STATE}/enabled"
 
 assets="${tmp}/assets"
 mkdir -p "${assets}"
@@ -152,6 +155,7 @@ printf '[Service]\nEnvironment=USER_OVERRIDE=1\n' >"${units}/zerodeck.service.d/
 printf '%s\n' "${old_generation}" >"${root}/current"
 printf '{"schema":1,"last_confirmed":"%s","rollback_target":null,"quarantined":[],"pending":null,"last_result":"old","last_error":null}\n' \
     "${old_generation}" >"${root}/state/update.json"
+printf 'zerodeck.service\n' >"${FAKE_SYSTEMCTL_STATE}/enabled"
 printf 'plugin data\n' >"${data_dir}/plugins/keep.py"
 controller_before="$(fixture_sha256 "${controller}/bin/zerodeckctl")"
 unit_before="$(fixture_sha256 "${units}/zerodeck.service")"
@@ -185,6 +189,9 @@ expect_failure failed-conversion run_bootstrap \
 }
 backup="$(find "${root}/backup" -mindepth 1 -maxdepth 1 -type d -print -quit)"
 [[ -n "${backup}" && -f "${backup}/MANIFEST" ]] || { echo "no recoverable backup was kept" >&2; exit 1; }
+grep -qx "zerodeck.service" "${FAKE_SYSTEMCTL_STATE}/enabled" || {
+    echo "failed conversion did not restore the previously enabled service" >&2; exit 1;
+}
 unset FAKE_ZERODECK_ACTIVE FAKE_START_FAIL
 
 # ── A clean install without --start installs but never enables or starts ─────────────────────

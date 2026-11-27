@@ -13,11 +13,12 @@ tag=""
 dist=""
 publish=0
 gh_bin="${GH_BIN:-gh}"
+curl_bin="${CURL_BIN:-curl}"
 
 usage() {
     cat >&2 <<'EOF'
 usage: publish-release.sh --repo <owner/repo> --release-id <id> --tag <tag> --dist <dir>
-                          [--publish] [--gh <path>]
+                          [--publish] [--gh <path>] [--curl <path>]
 
 The release must already exist as a draft (created by Release Please). A retry targets the same
 release ID; a published release is only ever verified, never rewritten. Do not use a tag for draft
@@ -34,6 +35,7 @@ while [[ $# -gt 0 ]]; do
         --dist) dist="${2:-}"; shift 2 ;;
         --publish) publish=1; shift ;;
         --gh) gh_bin="${2:-}"; shift 2 ;;
+        --curl) curl_bin="${2:-}"; shift 2 ;;
         --help|-h) usage ;;
         *) usage ;;
     esac
@@ -42,6 +44,7 @@ done
 [[ "${release_id}" =~ ^[0-9]+$ ]] || { echo "publish: --release-id must be numeric" >&2; exit 1; }
 [[ -d "${dist}" ]] || { echo "publish: dist directory not found: ${dist}" >&2; exit 1; }
 [[ -x "${gh_bin}" ]] || { echo "publish: gh executable not found: ${gh_bin}" >&2; exit 1; }
+[[ -x "${curl_bin}" ]] || { echo "publish: curl executable not found: ${curl_bin}" >&2; exit 1; }
 
 manual="zerodeck-${tag}-linux-x86_64.tar.gz"
 managed="zerodeck-${tag}-linux-x86_64.managed.tar.gz"
@@ -108,6 +111,8 @@ document = json.load(open(sys.argv[1], encoding="utf-8"))
 print("draft\t" + ("1" if document.get("draft") else "0"))
 print("tag\t" + str(document.get("tag_name", "")))
 print("id\t" + str(document.get("id", "")))
+print("upload_url\t" + str(document.get("upload_url", "")))
+print("immutable\t" + ("1" if document.get("immutable") else "0"))
 for asset in document.get("assets", []):
     print(f"asset\t{asset.get('name')}\t{asset.get('id')}\t{asset.get('size', '')}")
 PY
@@ -134,6 +139,23 @@ assert_draft_before_mutation() {
         echo "publish: release ${tag} is no longer a draft; refusing any asset mutation" >&2
         return 1
     fi
+}
+
+assert_immutable_releases_enabled() {
+    local policy
+    policy="$("${gh_bin}" api "repos/${repo}/immutable-releases" 2>/dev/null)" || {
+        echo "publish: cannot verify immutable releases; enable them and grant admin read access" >&2
+        echo "publish: refusing to publish a mutable release" >&2
+        return 1
+    }
+    python3 -c '
+import json, sys
+document = json.load(sys.stdin)
+raise SystemExit(0 if document.get("enabled") is True else 1)
+' <<<"${policy}" || {
+        echo "publish: immutable releases are not enabled for ${repo}; refusing to publish" >&2
+        return 1
+    }
 }
 
 asset_id() {
@@ -186,11 +208,21 @@ verify_all() {
 }
 
 upload_asset() {
-    local name="$1" file="$2" encoded
+    local name="$1" file="$2" encoded upload_url base token url
+    upload_url="$(awk -F'\t' '$1 == "upload_url" {print $2}' "${tmp}/release.meta")"
+    [[ "${upload_url}" == https://uploads.github.com/* ]] || {
+        echo "publish: release upload_url is not uploads.github.com: ${upload_url}" >&2
+        return 1
+    }
+    token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    [[ -n "${token}" ]] || { echo "publish: GH_TOKEN is required for asset upload" >&2; return 1; }
     encoded="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${name}")"
-    "${gh_bin}" api --method POST \
-        "repos/${repo}/releases/${release_id}/assets?name=${encoded}" \
-        -H "Content-Type: application/octet-stream" --input "${file}" >/dev/null
+    base="${upload_url%%\{*}"
+    url="${base}?name=${encoded}"
+    "${curl_bin}" --fail --silent --show-error --request POST \
+        --header "Authorization: Bearer ${token}" \
+        --header "Content-Type: application/octet-stream" \
+        --data-binary "@${file}" "${url}" >/dev/null
 }
 
 delete_asset() {
@@ -199,6 +231,7 @@ delete_asset() {
 }
 
 assert_expected_release
+assert_immutable_releases_enabled
 if [[ "$(awk -F'\t' '$1 == "draft" {print $2}' "${tmp}/release.meta")" == "0" ]]; then
     if assert_remote_asset_set && verify_all; then
         echo "publish: release ${tag} is already published and its assets match the local bytes"
@@ -235,11 +268,16 @@ echo "publish: draft ${tag} verified with exactly the expected assets"
 
 if [[ "${publish}" -eq 1 ]]; then
     assert_draft_before_mutation || exit 1
+    assert_immutable_releases_enabled || exit 1
     "${gh_bin}" api --method PATCH "repos/${repo}/releases/${release_id}" \
-        -f draft=false >/dev/null
+        -F draft=false >/dev/null
     fetch_release || exit 1
     [[ "$(awk -F'\t' '$1 == "draft" {print $2}' "${tmp}/release.meta")" == "0" ]] || {
         echo "publish: release ${tag} is still a draft after the publish request" >&2
+        exit 1
+    }
+    [[ "$(awk -F'\t' '$1 == "immutable" {print $2}' "${tmp}/release.meta")" == "1" ]] || {
+        echo "publish: published release is not immutable; repository immutable releases are not enforced" >&2
         exit 1
     }
     assert_remote_asset_set

@@ -50,7 +50,11 @@ same test release automation runs before upload.
    unpublished and can be retried by the same release ID. A failed retry never changes a published
    digest; once published, the script only verifies and refuses mismatches. Workflow concurrency
    plus GitHub immutable releases are required; a human publishing at the same instant is an
-   unavoidable external race.
+   unavoidable external race. `publish-release.sh` reads
+   `GET /repos/<owner>/<repo>/immutable-releases` (admin read) before any mutation, requires
+   `enabled: true`, and re-checks the published release's `immutable` field afterward. Configure
+   `RELEASE_PLEASE_TOKEN` with admin read (or grant the release token that permission); the script
+   fails clearly rather than publishing a mutable release.
 7. **Promote the already-published bytes, separately.** `.github/workflows/promote-tuf.yml` starts
    on `release: published`, downloads the exact release assets, verifies `sha256sum -c`, validates
    both archives, verifies GitHub build provenance for the managed archive, and writes a promotion
@@ -63,15 +67,16 @@ Re-run the release workflow for the same draft tag:
 
 ```bash
 gh workflow run release-please.yml -f tag=v0.1.0 \
-  -f sha=<the exact 40-character release commit> \
   -f release_id=<the numeric draft release ID> -f publish=true
 ```
 
 Release Please drafts do not create a git tag until publication. A manual retry should provide the
 numeric draft release ID; if it is omitted, the workflow finds the draft by `tag_name` in the
-releases list (never `releases/tags`). It must name the exact commit if the draft does not expose a
-40-character `target_commitish`. The workflow refuses if the release is already published. To verify
-a draft without publishing, pass `-f publish=false`. Retrying rebuilds the assets, but
+releases list (never `releases/tags`). The workflow builds exactly `GITHUB_SHA` and uses
+`github.sha`/`github.ref` as the provenance identity, so dispatch the retry from the exact release
+commit on `main`; it refuses if the Release Please/tag target differs. It cannot rebuild an
+arbitrary input commit. The workflow refuses if the release is already published. To verify a draft
+without publishing, pass `-f publish=false`. Retrying rebuilds the assets, but
 `publish-release.sh` only replaces assets while the release is still a draft; a published release
 is never rewritten.
 
@@ -258,8 +263,8 @@ Run the following in a fork or staging repository; never use production signing 
 - **Staging release:** create a draft, build from an exact commit, package by image digest, run the
   package test, upload/verify twice, publish once. Record the asset digests and attestation output.
 - **Retry:** inject an upload failure (the local `deploy/update/tests/publish.sh` does this), confirm
-  the draft remains unpublished, retry the same release ID, and confirm the published digest never
-  changes.
+  the draft remains unpublished, retry the same release ID from the exact release commit, and
+  confirm the published digest never changes.
 - **Expiry:** use short-lived staging metadata; confirm the external TUF client and
   `zerodeckctl update` fail closed after expiry while `rollback` still works offline from a retained
   generation.

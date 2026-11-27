@@ -9,10 +9,6 @@ on:
         description: Existing draft tag to retry (e.g. v0.1.0)
         required: false
         type: string
-      sha:
-        description: Exact 40-character commit for a retry when the draft has no git tag yet
-        required: false
-        type: string
       release_id:
         description: Optional numeric draft release ID for a retry
         required: false
@@ -81,7 +77,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.tag }}
-          INPUT_SHA: ${{ inputs.sha }}
           INPUT_RELEASE_ID: ${{ inputs.release_id }}
           OUTPUT_TAG: ${{ needs.release-please.outputs.tag_name }}
           OUTPUT_VERSION: ${{ needs.release-please.outputs.version }}
@@ -134,17 +129,21 @@ jobs:
           }
 
           target_commitish="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("target_commitish", ""))' <<<"${release_json}")"
-          if [[ -n "${INPUT_TAG}" && -z "${INPUT_SHA}" && ! "${target_commitish}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "manual retry for ${tag} needs -f sha=<40-character release commit>" >&2
-            exit 1
-          fi
-          sha="${INPUT_SHA:-${OUTPUT_SHA:-${GITHUB_SHA}}}"
+          # Build exactly the commit that triggered this workflow run. Its provenance source is
+          # github.sha/github.ref, so a retry cannot rebuild an arbitrary input commit.
+          sha="${GITHUB_SHA}"
           [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || {
-            echo "release ${tag} does not identify an exact commit; pass -f sha=<40-character commit>" >&2
+            echo "release ${tag} has no exact workflow source commit" >&2
             exit 1
           }
+          if [[ "${OUTPUT_SHA}" =~ ^[0-9a-f]{40}$ && "${OUTPUT_SHA}" != "${sha}" ]]; then
+            echo "Release Please commit ${OUTPUT_SHA} differs from the workflow source ${sha}" >&2
+            echo "dispatch the retry from the exact release commit" >&2
+            exit 1
+          fi
           if [[ "${target_commitish}" =~ ^[0-9a-f]{40}$ && "${target_commitish}" != "${sha}" ]]; then
-            echo "release target ${target_commitish} differs from the selected commit ${sha}" >&2
+            echo "release target ${target_commitish} differs from the workflow source ${sha}" >&2
+            echo "dispatch the retry from the exact release commit" >&2
             exit 1
           fi
           build_id="${tag}-${sha}"
@@ -283,7 +282,7 @@ jobs:
 
       - name: Upload, download and verify assets on the same draft
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_ID: ${{ steps.identity.outputs.release_id }}
         run: |
@@ -294,9 +293,10 @@ jobs:
 
       - name: Verify build provenance before publication
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.identity.outputs.tag }}
-          RELEASE_SHA: ${{ steps.identity.outputs.sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           for archive in \
@@ -305,15 +305,15 @@ jobs:
             gh attestation verify "${archive}" \
               --repo "${GITHUB_REPOSITORY}" \
               --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-please.yml" \
-              --source-digest "${RELEASE_SHA}" \
-              --source-ref "refs/heads/main" \
+              --source-digest "${SOURCE_SHA}" \
+              --source-ref "${SOURCE_REF}" \
               --deny-self-hosted-runners
           done
 
       - name: Publish the immutable release only after verification
         if: github.event_name == 'push' || inputs.publish
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.identity.outputs.tag }}
           RELEASE_ID: ${{ steps.identity.outputs.release_id }}
         run: |

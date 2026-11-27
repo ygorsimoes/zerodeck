@@ -565,6 +565,18 @@ for name in trusted-root.json update.env; do
         cp -a "${config_dir}/${name}" "${backup_dir}/config/${name}"
     fi
 done
+# Restore exact enablement, not merely unit files: `systemctl enable` owns the *.wants links.
+: >"${backup_dir}/enabled.tsv"
+for unit in "${units[@]}"; do
+    if state="$("${systemctl}" is-enabled "${unit}" 2>/dev/null)"; then
+        rc=0
+    else
+        rc=$?
+        state="${state:-disabled}"
+    fi
+    printf '%s\t%s\t%s\n' "${unit}" "${rc}" "${state}" >>"${backup_dir}/enabled.tsv"
+done
+chmod 0600 "${backup_dir}/enabled.tsv"
 {
     printf 'version=%s\n' "${identity_version}"
     printf 'build_id=%s\n' "${identity_build_id}"
@@ -628,7 +640,6 @@ rollback_install() {
     local reason="$1"
     set +e
     "${systemctl}" stop zerodeck.service >/dev/null 2>&1
-    "${systemctl}" disable zerodeck.service zerodeck-recovery.service >/dev/null 2>&1 || true
     local unit
     for unit in "${units[@]}"; do
         rm -f "${systemd_dir}/${unit}"
@@ -636,6 +647,20 @@ rollback_install() {
             cp -a "${backup_dir}/systemd/${unit}" "${systemd_dir}/${unit}"
         fi
     done
+    if [[ -f "${backup_dir}/enabled.tsv" ]]; then
+        while IFS=$'\t' read -r unit rc state; do
+            if [[ "${rc}" == "0" && "${state}" == "enabled" ]]; then
+                "${systemctl}" enable "${unit}" >/dev/null 2>&1 || \
+                    warn "could not restore enabled state for ${unit} (${state})"
+            else
+                "${systemctl}" disable "${unit}" >/dev/null 2>&1 || true
+            fi
+        done <"${backup_dir}/enabled.tsv"
+    else
+        for unit in "${units[@]}"; do
+            "${systemctl}" disable "${unit}" >/dev/null 2>&1 || true
+        done
+    fi
     if [[ -e "${backup_dir}/controller" ]]; then
         mkdir -p "$(dirname "${controller_bin}")"
         cp -a "${backup_dir}/controller" "${controller_bin}"

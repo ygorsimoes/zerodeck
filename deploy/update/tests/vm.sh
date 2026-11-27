@@ -567,30 +567,30 @@ JSON
 
 install_bootstrap() {
     local manual_digest="$1" managed_digest="$2" root_digest="$3" mode="$4"
+    local bootstrap_args=(
+        --package manual.tar.gz
+        --sha256 "${manual_digest}"
+        --generation generation.managed.tar.gz
+        --generation-sha256 "${managed_digest}"
+        --trusted-root trusted-root.json
+        --trusted-root-sha256 "${root_digest}"
+        --metadata-url "http://127.0.0.1:9/metadata/"
+        --targets-url "http://127.0.0.1:9/targets/"
+    )
+    if [[ "${mode}" == "convert" ]]; then
+        bootstrap_args+=(--convert-existing-zerodeck)
+    fi
+    bootstrap_args+=(--start)
     upload "${manual}" "${guest_dir}/manual.tar.gz"
     upload "${managed}" "${guest_dir}/generation.managed.tar.gz"
     upload "${work}/bootstrap.sh" "${guest_dir}/bootstrap.sh"
     upload "${work}/trusted-root.json" "${guest_dir}/trusted-root.json"
-    guest_root_script <<'SCRIPT' "${guest_dir}" "${manual_digest}" "${managed_digest}" \
-        "${root_digest}" "${mode}"
+    guest_root_script <<'SCRIPT' "${guest_dir}" "${bootstrap_args[@]}"
 set -euo pipefail
 dir="$1"
-manual_sha="$2"
-managed_sha="$3"
-root_sha="$4"
-mode="$5"
-convert=()
-if [[ "${mode}" == "convert" ]]; then
-    convert=(--convert-existing-zerodeck)
-fi
+shift
 cd "${dir}"
-bash ./bootstrap.sh \
-    --package manual.tar.gz --sha256 "${manual_sha}" \
-    --generation generation.managed.tar.gz --generation-sha256 "${managed_sha}" \
-    --trusted-root trusted-root.json --trusted-root-sha256 "${root_sha}" \
-    --metadata-url "http://127.0.0.1:9/metadata/" \
-    --targets-url "http://127.0.0.1:9/targets/" \
-    "${convert[@]}" --start
+bash ./bootstrap.sh "$@"
 SCRIPT
 }
 
@@ -1288,7 +1288,11 @@ scenario_reboot_during_recovery() {
     make_fixture_candidate "${managed}" "${crash}" "healthy"
     local crash_digest
     crash_digest="$(check_digest "${crash}" "" "reboot-recovery candidate")"
-    install_dropin zerodeck-recovery.service $'[Service]\nExecStartPre=/bin/sleep 60'
+    # systemd applies TimeoutStartSec to ExecStartPre as well as ExecStart. The packaged recovery
+    # unit has TimeoutStartSec=60, so a 60 s pre-delay would time out and recover-boot would never
+    # run. Override the timeout to 180 s and keep the observable window at 20 s.
+    install_dropin zerodeck-recovery.service \
+        $'[Service]\nTimeoutStartSec=180\nExecStartPre=/bin/sleep 20'
     prepare_pending_crash "${crash}" "${crash_digest}"
     hard_poweroff
     start_qemu
@@ -1650,17 +1654,24 @@ case "$*" in
     *" true") exit 0 ;;
     *"mktemp -d /var/tmp/zerodeck-vm."*) printf '/var/tmp/fake-guest-dir\n'; exit 0 ;;
     *"bash -s --"*)
-        if grep -q "bootstrap.sh" <<<"${script}"; then
-            generation="$(sed -n 's/.*--generation \([^ ]*\).*/\1/p' <<<"${script}" | head -n 1)"
+        if [[ "$*" == *"--package manual.tar.gz"* ]]; then
+            generation="$(sed -n 's/.*--generation \([^ ]*\).*/\1/p' <<<"$*" | head -n 1)"
             if [[ "${generation}" != *.managed.tar.gz ]]; then
                 printf 'fake bootstrap rejected generation=%s\n' "${generation}" >&2
                 exit 1
             fi
-            if [[ "${VM_SELFTEST_REQUIRE_CONVERT:-0}" == "1" ]]; then
-                if ! grep -q -- "--convert-existing-zerodeck" <<<"${script}"; then
-                    printf 'fake bootstrap did not receive --convert-existing-zerodeck\n' >&2
-                    exit 1
-                fi
+            actual_mode="clean"
+            if [[ "$*" == *"--convert-existing-zerodeck"* ]]; then
+                actual_mode="convert"
+            fi
+            if [[ -n "${VM_SELFTEST_EXPECT_MODE:-}" && "${actual_mode}" != "${VM_SELFTEST_EXPECT_MODE}" ]]; then
+                printf 'fake bootstrap mode=%s expected=%s\n' \
+                    "${actual_mode}" "${VM_SELFTEST_EXPECT_MODE}" >&2
+                exit 1
+            fi
+            printf '%s\n' "$*" >>"${VM_SELFTEST_LOG}.argv"
+            printf '%s\n' "${generation}" >>"${VM_SELFTEST_LOG}.generation"
+            if [[ "${actual_mode}" == "convert" ]]; then
                 printf 'convert-ok\n' >>"${VM_SELFTEST_LOG}.convert"
             fi
         fi
@@ -1712,11 +1723,22 @@ SCRIPT
         --scenario-timeout 5
     )
 
-    if grep -nE 'systemctl[[:space:]]+start[[:space:]]+--wait' \
-        "${SCRIPT_DIR}/vm.sh" "${REPO_ROOT}/deploy/update/bootstrap.sh"; then
-        echo "self-test: blocking --wait on service start is not allowed" >&2
+    if sed '/^# ── Self-test/,$d' "${SCRIPT_DIR}/vm.sh" \
+        | grep -nE '(systemctl|\$\{systemctl\}|\$SYSTEMCTL).*--wait' \
+        || grep -nE '(systemctl|\$\{systemctl\}|\$SYSTEMCTL).*--wait' \
+            "${REPO_ROOT}/deploy/update/bootstrap.sh"; then
+        echo "self-test: blocking --wait on a systemctl call is not allowed" >&2
         exit 1
     fi
+    for sample in \
+        'systemctl start --wait zerodeck.service' \
+        '"${systemctl}" start --wait zerodeck.service' \
+        'systemctl --wait start zerodeck.service'; do
+        if ! grep -qE '(systemctl|\$\{systemctl\}|\$SYSTEMCTL).*--wait' <<<"${sample}"; then
+            echo "self-test: --wait guard missed: ${sample}" >&2
+            exit 1
+        fi
+    done
 
     local image_before
     image_before="$(sha256_file "${tmp}/image.raw")"
@@ -1737,10 +1759,24 @@ SCRIPT
     # A fake guest returns a mismatching current digest; the harness must fail, kill QEMU, and remove
     # its temporary work directory while leaving the source image byte-identical.
     expect_status 1 fake-guest-failure \
-        env TMPDIR="${tmp}/tmp" bash "${SCRIPT_DIR}/vm.sh" "${common[@]}"
+        env TMPDIR="${tmp}/tmp" VM_SELFTEST_EXPECT_MODE=clean \
+        bash "${SCRIPT_DIR}/vm.sh" "${common[@]}"
     grep -q "fake current digest mismatch" "${tmp}/fake-guest-failure.log" || {
         echo "self-test: fake guest failed before the running-identity check" >&2
         cat "${tmp}/fake-guest-failure.log" >&2
+        exit 1
+    }
+    local managed_scp_line managed_scp_destination managed_scp_path generation
+    managed_scp_line="$(grep '\.managed\.tar\.gz' "${VM_SELFTEST_LOG}.scp" | tail -n 1 || true)"
+    [[ -n "${managed_scp_line}" ]] || {
+        echo "self-test: managed archive was not uploaded with a .managed.tar.gz name" >&2
+        exit 1
+    }
+    managed_scp_destination="${managed_scp_line##* }"
+    managed_scp_path="${managed_scp_destination#*:}"
+    generation="$(tail -n 1 "${VM_SELFTEST_LOG}.generation")"
+    [[ "$(basename "${managed_scp_path}")" == "${generation}" ]] || {
+        echo "self-test: scp destination basename does not match --generation" >&2
         exit 1
     }
     grep -q -- "-drive file=.*overlay.qcow2" "${VM_SELFTEST_LOG}.qemu" || {
@@ -1767,10 +1803,14 @@ SCRIPT
 
     rm -f "${VM_SELFTEST_LOG}.convert"
     expect_status 1 convert-argument \
-        env TMPDIR="${tmp}/tmp" VM_SELFTEST_REQUIRE_CONVERT=1 \
+        env TMPDIR="${tmp}/tmp" VM_SELFTEST_EXPECT_MODE=convert \
         bash "${SCRIPT_DIR}/vm.sh" "${common[@]}" --mode convert
     grep -qx "convert-ok" "${VM_SELFTEST_LOG}.convert" || {
         echo "self-test: convert mode did not pass --convert-existing-zerodeck" >&2
+        exit 1
+    }
+    tail -n 1 "${VM_SELFTEST_LOG}.argv" | grep -q -- "--convert-existing-zerodeck" || {
+        echo "self-test: convert argv was not propagated to the fake bootstrap" >&2
         exit 1
     }
     if compgen -G "${tmp}/tmp/zerodeck-vm.*" >/dev/null; then

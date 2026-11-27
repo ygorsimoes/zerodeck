@@ -111,6 +111,11 @@ of `current`, `last_confirmed`, absence of a pending transaction, and `zerodeck.
 | `reboot-during-recovery` | A guest reboot while `zerodeck-recovery.service` is running; the next boot reconciles disk state. |
 | `second-recovery` | Repeated boot/after-apply recovery passes do not change `current` or persisted state. |
 
+The reboot scenario gives `zerodeck-recovery.service` a 20 s `ExecStartPre` delay so the watcher can
+observe it `activating`, and overrides the packaged 60 s `TimeoutStartSec` to 180 s: systemd applies
+the start timeout to `ExecStartPre` as well as `ExecStart`, so a delay equal to the timeout would
+make `recover-boot` never run.
+
 The update scenarios use a local fixture authorization in `state/catalog.json` rather than a live
 TUF repository. TUF metadata selection, expiry, rotation and staging are covered by the Rust
 catalog/staging tests. The VM gate focuses on privileged systemd activation and crash recovery.

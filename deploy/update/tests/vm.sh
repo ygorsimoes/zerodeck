@@ -818,17 +818,28 @@ set -euo pipefail
 expected="$1"
 deadline=$((SECONDS + $2))
 while (( SECONDS < deadline )); do
-    if systemctl is-active --quiet zerodeck.service 2>/dev/null; then
+    if [[ "$(systemctl show -p ActiveState --value zerodeck.service 2>/dev/null || true)" == "active" ]]; then
+        pid="$(systemctl show -p MainPID --value zerodeck.service 2>/dev/null || true)"
         current="$(cat /var/lib/zerodeck/current 2>/dev/null || true)"
-        if [[ "${current}" == "${expected}" ]] && python3 - <<'PY' 2>/dev/null
+        if [[ "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 0 && "${current}" == "${expected}" ]] && python3 - <<'PY' 2>/dev/null
 import json
 import sys
+import urllib.request
 
 try:
     document = json.load(open("/var/lib/zerodeck/state/update.json", encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
     raise SystemExit(1)
-raise SystemExit(0 if document.get("pending") is None else 1)
+if document.get("pending") is not None:
+    raise SystemExit(1)
+with urllib.request.urlopen("http://127.0.0.1:1337/auth/token", timeout=5) as response:
+    token = response.read().decode("utf-8").strip()
+request = urllib.request.Request(
+    "http://127.0.0.1:1337/readyz", headers={"X-Decky-Auth": token}
+)
+with urllib.request.urlopen(request, timeout=5) as response:
+    ready = json.loads(response.read())
+raise SystemExit(0 if ready.get("python_host_ready") is True else 1)
 PY
         then
             echo "recovered to ${expected}"
@@ -872,6 +883,7 @@ print(json.dumps({
     "version": document.get("version"),
     "build_id": document.get("build_id"),
     "python_host_ready": document.get("python_host_ready"),
+    "invocation_id": document.get("invocation_id"),
 }))
 PY
 SCRIPT
@@ -955,18 +967,22 @@ SCRIPT
     esac
     last_invocation_id="${invocation}"
     ready="$(read_readyz)"
-    "${PYTHON}" - "${ready}" "${expected_version}" "${expected_build}" <<'PY'
+    "${PYTHON}" - "${ready}" "${expected_version}" "${expected_build}" "${invocation}" <<'PY'
 import json
 import sys
 
 ready = json.loads(sys.argv[1])
-version, build_id = sys.argv[2:4]
+version, build_id, invocation = sys.argv[2:5]
 if ready.get("version") != version or ready.get("build_id") != build_id:
     raise SystemExit(
         f"/readyz identity {ready!r} does not match generation {version}/{build_id}"
     )
 if ready.get("python_host_ready") is not True:
     raise SystemExit(f"/readyz reports python_host_ready={ready.get('python_host_ready')!r}")
+if ready.get("invocation_id") != invocation:
+    raise SystemExit(
+        f"/readyz invocation {ready.get('invocation_id')!r} != systemd InvocationID {invocation!r}"
+    )
 PY
     results+=("PASS ${label}: digest=${expected_digest} version=${expected_version} build=${expected_build}")
     log "PASS ${label}: ${output//$'\n'/; }"
@@ -1254,6 +1270,26 @@ prepare_pending_crash() {
     wait_for_apply_phase "verifying" "${scenario_timeout}"
 }
 
+assert_quarantined() {
+    local digest="$1" label="$2"
+    guest_root_script <<'SCRIPT' "${digest}" "${label}"
+set -euo pipefail
+digest="$1"
+label="$2"
+python3 - "/var/lib/zerodeck/state/update.json" "${digest}" "${label}" <<'PY'
+import json
+import sys
+
+path, digest, label = sys.argv[1:4]
+document = json.load(open(path, encoding="utf-8"))
+if digest not in document.get("quarantined", []):
+    raise SystemExit(f"{label}: started candidate was not quarantined")
+if not document.get("last_error"):
+    raise SystemExit(f"{label}: crash reason was not recorded")
+PY
+SCRIPT
+}
+
 scenario_hard_poweroff() {
     log "scenario: hard poweroff during apply"
     local crash="${work}/crash-hard.managed.tar.gz"
@@ -1266,6 +1302,7 @@ scenario_hard_poweroff() {
     wait_ssh
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck.service
+    assert_quarantined "${crash_digest}" "hard-poweroff-recovered"
     verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "hard-poweroff-recovered" yes
 }
 
@@ -1279,6 +1316,7 @@ scenario_sigkill_apply() {
     kill_apply_helper
     wait_for_recovered "${managed_digest}" "${scenario_timeout}"
     remove_dropin zerodeck.service
+    assert_quarantined "${crash_digest}" "sigkill-recovered"
     verify_guest "${managed_digest}" "${managed_version}" "${managed_build}" "sigkill-recovered" yes
 }
 
@@ -1785,6 +1823,10 @@ SCRIPT
     }
     grep -q -- "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:" "${VM_SELFTEST_LOG}.qemu" || {
         echo "self-test: QEMU did not receive the SSH/API forwards" >&2
+        exit 1
+    }
+    command -v pgrep >/dev/null 2>&1 || {
+        echo "self-test: pgrep is required to verify the fake QEMU is gone" >&2
         exit 1
     }
     if pgrep -f "${tmp}/bin/qemu-system-x86_64" >/dev/null 2>&1; then

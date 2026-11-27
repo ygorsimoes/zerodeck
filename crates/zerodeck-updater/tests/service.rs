@@ -52,6 +52,7 @@ impl MockState {
                 "version": "1.0.0",
                 "build_id": "build-new",
                 "python_host_ready": true,
+                "invocation_id": "invocation-2",
             }),
             frontend_status: 200,
             frontend_body: "console.log('managed frontend');\n",
@@ -211,6 +212,28 @@ impl Systemctl for MockSystemctl {
                 .clone())
         })
     }
+
+    fn is_active<'a>(&'a self, _unit: &'a str) -> SystemctlFuture<'a, bool> {
+        Box::pin(async move {
+            Ok(!self
+                .invocation
+                .lock()
+                .expect("mock invocation lock")
+                .is_empty())
+        })
+    }
+
+    fn main_pid<'a>(&'a self, _unit: &'a str) -> SystemctlFuture<'a, u32> {
+        Box::pin(async move {
+            Ok(u32::from(
+                !self
+                    .invocation
+                    .lock()
+                    .expect("mock invocation lock")
+                    .is_empty(),
+            ))
+        })
+    }
 }
 
 struct Harness {
@@ -293,6 +316,43 @@ async fn readiness_rejects_old_invocation_and_wrong_build() {
                 ..
             }
         ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_an_unrelated_endpoint_with_a_different_invocation() {
+    let mut state = MockState::healthy();
+    state.ready["invocation_id"] = json!("unrelated-process-invocation");
+    let harness = Harness::start(state).await;
+    harness.systemctl.set("invocation-2");
+
+    let err = harness
+        .verify()
+        .await
+        .expect_err("an endpoint that is not this systemd invocation must be rejected");
+    assert!(
+        matches!(
+            err,
+            UpdateError::ReadinessIdentityMismatch {
+                field: "invocation_id",
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_rejects_an_inactive_or_pidless_unit() {
+    let harness = Harness::start(MockState::healthy()).await;
+    harness.systemctl.set("");
+    let err = harness
+        .verify()
+        .await
+        .expect_err("an inactive unit must not pass readiness");
+    assert!(
+        matches!(err, UpdateError::ServiceNotRunning(ref unit) if unit == "zerodeck.service"),
         "{err}"
     );
 }

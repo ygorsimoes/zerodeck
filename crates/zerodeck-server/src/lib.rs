@@ -34,6 +34,7 @@ mod tests {
             version: "1.2.3".to_owned(),
             build_id: "build-abc".to_owned(),
             python_host_ready: true,
+            invocation_id: "invocation-test".to_owned(),
             frontend_dir: Some(secret_frontend.clone()),
             ..ServerConfig::default()
         })
@@ -77,6 +78,7 @@ mod tests {
                 "version": "1.2.3",
                 "build_id": "build-abc",
                 "python_host_ready": true,
+                "invocation_id": "invocation-test",
             })
         );
         assert!(!text.contains("frontend"), "{text}");

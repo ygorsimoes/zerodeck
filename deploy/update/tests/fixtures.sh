@@ -60,31 +60,104 @@ command=""
 generation=""
 check=0
 convert=0
+prepare=0
+confirm=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --root) root="$2"; shift 2 ;;
         bootstrap) command=bootstrap; shift ;;
         --generation) generation="$2"; shift 2 ;;
         --check) check=1; shift ;;
+        --prepare) prepare=1; shift ;;
+        --confirm) confirm=1; shift ;;
         --convert-existing-zerodeck) convert=1; shift ;;
         *) shift ;;
     esac
 done
 [[ "${command}" == bootstrap ]] || { echo "unsupported command" >&2; exit 2; }
-[[ -n "${root}" && -n "${generation}" ]] || { echo "missing root/generation" >&2; exit 2; }
+[[ -n "${root}" ]] || { echo "missing root" >&2; exit 2; }
 state="${root}/state/update.json"
+if [[ "${check}" -eq 1 ]]; then
+    [[ -n "${generation}" ]] || { echo "missing generation" >&2; exit 2; }
+    if [[ -f "${state}" ]] && grep -q '"pending"[[:space:]]*:[[:space:]]*{' "${state}"; then
+        echo "bootstrap refused: pending activation" >&2
+        exit 1
+    fi
+    echo "bootstrap check passed"
+    exit 0
+fi
+if [[ "${confirm}" -eq 1 ]]; then
+    python3 - "${state}" <<'PY2'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    document = json.load(open(path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"cannot confirm bootstrap: {error}")
+pending = document.get("pending")
+if not isinstance(pending, dict):
+    raise SystemExit("cannot confirm bootstrap without a prepared transaction")
+candidate = pending["candidate"]
+if document.get("current") is None:
+    document["current"] = candidate
+previous = pending.get("previous")
+document["last_confirmed"] = candidate
+if isinstance(previous, str) and previous and previous != candidate:
+    document["rollback_target"] = previous
+document["pending"] = None
+document["last_result"] = "bootstrapped"
+document["last_error"] = None
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+    handle.write("\n")
+PY2
+    exit 0
+fi
+[[ -n "${generation}" ]] || { echo "missing generation" >&2; exit 2; }
 if [[ -f "${state}" ]] && grep -q '"pending"[[:space:]]*:[[:space:]]*{' "${state}"; then
     echo "bootstrap refused: pending activation" >&2
     exit 1
-fi
-if [[ "${check}" -eq 1 ]]; then
-    echo "bootstrap check passed"
-    exit 0
 fi
 mkdir -p "${root}/state"
 previous=""
 if [[ -f "${root}/current" ]]; then
     previous="$(cat "${root}/current")"
+fi
+if [[ "${prepare}" -eq 1 ]]; then
+    python3 - "${state}" "${generation}" "${previous}" "${convert}" <<'PY2'
+import json
+import sys
+
+path, generation, previous, convert = sys.argv[1:5]
+document = {"schema": 1, "last_confirmed": None, "rollback_target": None,
+            "quarantined": [], "pending": None, "last_result": None, "last_error": None}
+try:
+    document = json.load(open(path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    pass
+if document.get("last_confirmed") and document.get("last_confirmed") != generation:
+    document["rollback_target"] = document["last_confirmed"]
+if convert == "1" and previous and previous != generation:
+    document["rollback_target"] = previous
+document["pending"] = {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "previous": previous or None,
+    "candidate": generation,
+    "phase": "switched",
+    "was_running": False,
+    "start_attempted": False,
+}
+document["last_result"] = None
+document["last_error"] = None
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(document, handle)
+    handle.write("\n")
+PY2
+    printf '%s\n' "${generation}" >"${root}/current"
+    echo "prepared"
+    exit 0
 fi
 if [[ "${convert}" -eq 1 && -n "${previous}" && "${previous}" != "${generation}" ]]; then
     printf '{"schema":1,"last_confirmed":"%s","rollback_target":"%s","quarantined":[],"pending":null,"last_result":"bootstrapped","last_error":null}\n' \
@@ -107,6 +180,24 @@ printf '%s\n' "$*" >>"${FAKE_SYSTEMCTL_LOG:-/dev/null}"
 state_dir="${FAKE_SYSTEMCTL_STATE:-}"
 enabled_file="${state_dir}/enabled"
 mkdir -p "${state_dir}" 2>/dev/null || true
+if [[ "${1:-}" == "show" ]]; then
+    property="${2:-}"
+    if [[ "${property}" == "-p" ]]; then
+        property="${3:-}"
+    fi
+    property="${property#--property=}"
+    case "${property}" in
+        InvocationID) echo "fixture-invocation" ;;
+        MainPID)
+            if [[ "${FAKE_ZERODECK_ACTIVE:-0}" == "1" ]]; then echo "1234"; else echo "0"; fi
+            ;;
+        ActiveState)
+            if [[ "${FAKE_ZERODECK_ACTIVE:-0}" == "1" ]]; then echo "active"; else echo "inactive"; fi
+            ;;
+        *) echo "" ;;
+    esac
+    exit 0
+fi
 if [[ "${1:-}" == "is-active" ]]; then
     unit="${3:-}"
     case "${unit}" in

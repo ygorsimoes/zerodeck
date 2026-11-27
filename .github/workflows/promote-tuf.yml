@@ -1,31 +1,31 @@
 name: Promote TUF authorization
 
-# Runs only after the immutable GitHub release exists. It verifies the already-published bytes and
-# their build provenance, then asks the external TUF-on-CI repository to sign and promote that exact
-# target. No container build, release artifact rebuild, or signing key lives in this workflow.
+# Manual, protected Stable gate. There is deliberately no `release: published` trigger: publishing
+# an immutable GitHub release never authorizes the Stable channel. A maintainer dispatches this
+# workflow from the default branch, the `production` environment requires reviewer approval, and
+# Stable additionally requires a committed `Stable eligible: PASS` hardware evidence record.
+# Scripts are always read from the default branch, never from tag-controlled code.
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Published release tag to promote (e.g. v0.1.0)
+        description: Published immutable release tag to promote (e.g. v0.1.0)
         required: true
         type: string
       channel:
-        description: Signed loader channel
+        description: Signed loader channel (Stable requires a PASS hardware record)
         required: true
-        default: stable
+        default: testing
         type: choice
         options:
-          - stable
           - testing
+          - stable
 
 permissions: {}
 
 concurrency:
-  group: tuf-promotion-${{ github.event.release.tag_name || inputs.tag }}
+  group: tuf-promotion-${{ inputs.tag }}
   cancel-in-progress: false
 
 defaults:
@@ -37,68 +37,95 @@ jobs:
     name: Verify published bytes and request TUF signing
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Configure this environment in repository settings with required reviewers and a protected
+    # default branch. Without the protected environment a manual dispatch is not an approval gate.
+    environment: production
     permissions:
       contents: read
       attestations: read
     steps:
-      - name: Checkout the released scripts
+      - name: Checkout the default-branch promotion scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: main
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Record the released source commit
+      - name: Record the reviewed promotion source
         id: source
         run: |
           set -euo pipefail
           echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
 
-      - name: Resolve promotion inputs
-        id: promotion
+      - name: Verify the exact immutable published release
+        id: release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
-          INPUT_CHANNEL: ${{ inputs.channel }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
-          MIN_UPDATER: ${{ vars.TUF_MIN_UPDATER || '0.1.0' }}
-          TUF_REPOSITORY: ${{ vars.TUF_ON_CI_REPOSITORY }}
-          TUF_TOKEN: ${{ secrets.TUF_PROMOTION_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
-          tag="${RELEASE_TAG}"
+          tag="${TAG}"
           [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] || {
             echo "not a release SemVer tag: ${tag}" >&2
             exit 1
           }
-          channel="${INPUT_CHANNEL:-}"
-          if [[ -z "${channel}" ]]; then
-            if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
-              channel=testing
-            else
-              channel=stable
-            fi
+          version="${tag#v}"
+          if [[ "${CHANNEL}" == "stable" && "${version}" == *-* ]]; then
+            echo "a prerelease cannot be promoted to Stable" >&2
+            exit 1
           fi
-          [[ "${channel}" == "stable" || "${channel}" == "testing" ]] || {
-            echo "invalid channel: ${channel}" >&2
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          python3 - "${release_json}" "${tag}" >"${RUNNER_TEMP}/release.meta" <<'PY'
+          import json
+          import sys
+
+          document = json.loads(sys.argv[1])
+          tag = sys.argv[2]
+          if document.get("tag_name") != tag:
+              raise SystemExit(f"release tag {document.get('tag_name')!r} != {tag!r}")
+          if document.get("draft") is not False:
+              raise SystemExit("refusing to promote a draft release")
+          if document.get("immutable") is not True:
+              raise SystemExit("refusing to promote a mutable release; immutable releases are not enforced")
+          expected = {
+              f"zerodeck-{tag}-linux-x86_64.tar.gz",
+              f"zerodeck-{tag}-linux-x86_64.managed.tar.gz",
+              "SHA256SUMS.txt",
+          }
+          actual = {asset.get("name") for asset in document.get("assets", [])}
+          if actual != expected:
+              raise SystemExit(f"release assets {sorted(actual)} != {sorted(expected)}")
+          print(f"version={tag[1:]}")
+          print(f"release_id={document['id']}")
+          print(f"target_commitish={document.get('target_commitish', '')}")
+          PY
+          # shellcheck disable=SC1090
+          source "${RUNNER_TEMP}/release.meta"
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq '.sha')"
+          [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "cannot resolve the release tag to an exact commit" >&2
             exit 1
           }
-          [[ -n "${TUF_REPOSITORY}" ]] || {
-            echo "TUF_ON_CI_REPOSITORY is not configured; refusing to pretend a promotion happened" >&2
+          if [[ "${target_commitish}" =~ ^[0-9a-f]{40}$ && "${target_commitish}" != "${sha}" ]]; then
+            echo "release target ${target_commitish} != tag commit ${sha}" >&2
             exit 1
-          }
-          [[ -n "${TUF_TOKEN}" ]] || {
-            echo "TUF_PROMOTION_TOKEN is not configured; no signing authority is available" >&2
+          fi
+          git merge-base --is-ancestor "${sha}" HEAD || {
+            echo "release commit ${sha} is not on the reviewed default branch" >&2
             exit 1
           }
           {
             echo "tag=${tag}"
-            echo "channel=${channel}"
-            echo "min_updater=${MIN_UPDATER}"
+            echo "version=${version}"
+            echo "sha=${sha}"
+            echo "channel=${CHANNEL}"
           } >>"${GITHUB_OUTPUT}"
 
       - name: Download the published release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.promotion.outputs.tag }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -112,7 +139,7 @@ jobs:
 
       - name: Validate the exact published archives
         env:
-          TAG: ${{ steps.promotion.outputs.tag }}
+          TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
           tag="${TAG}"
@@ -123,14 +150,35 @@ jobs:
             bash deploy/update/tests/release.sh --validate-only \
               "dist/zerodeck-${tag}-linux-x86_64.managed.tar.gz"
 
+      - name: Require Stable hardware evidence
+        if: inputs.channel == 'stable'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
+          digest="$(sha256sum "${archive}" | awk '{print $1}')"
+          build_id="$(python3 - "${archive}" <<'PY'
+          import json, sys, tarfile
+          with tarfile.open(sys.argv[1], "r:gz") as handle:
+              print(json.load(handle.extractfile("release.json"))["build_id"])
+          PY
+          )"
+          bash deploy/update/verify-stable-evidence.sh \
+            --tag "${TAG}" --version "${VERSION}" --build-id "${build_id}" \
+            --sha256 "${digest}" \
+            --evidence "deploy/update/evidence/${TAG}.md"
+
       - name: Verify provenance and render the promotion request
         id: request
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.promotion.outputs.tag }}
-          CHANNEL: ${{ steps.promotion.outputs.channel }}
-          MIN_UPDATER: ${{ steps.promotion.outputs.min_updater }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          MIN_UPDATER: ${{ vars.TUF_MIN_UPDATER || '0.1.0' }}
         run: |
           set -euo pipefail
           archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
@@ -143,38 +191,42 @@ jobs:
           )"
           bash deploy/update/promote.sh \
             --archive "${archive}" --sha256 "${digest}" \
-            --tag "${TAG}" --version "${TAG#v}" --channel "${CHANNEL}" \
+            --tag "${TAG}" --version "${VERSION}" --channel "${CHANNEL}" \
             --min-updater "${MIN_UPDATER}" --build-id "${build_id}" \
             --repository "${GITHUB_REPOSITORY}" \
-            --source-sha "${SOURCE_SHA}" \
+            --source-sha "${RELEASE_SHA}" \
             --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-please.yml" \
             --source-ref "refs/heads/main" | tee target-descriptor.txt
+          {
+            echo "digest=${digest}"
+            echo "build_id=${build_id}"
+          } >>"${GITHUB_OUTPUT}"
 
       - name: Write the external signing request
         env:
-          TAG: ${{ steps.promotion.outputs.tag }}
-          CHANNEL: ${{ steps.promotion.outputs.channel }}
-          MIN_UPDATER: ${{ steps.promotion.outputs.min_updater }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          MIN_UPDATER: ${{ vars.TUF_MIN_UPDATER || '0.1.0' }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
           TUF_REPOSITORY: ${{ vars.TUF_ON_CI_REPOSITORY }}
+          DIGEST: ${{ steps.request.outputs.digest }}
+          BUILD_ID: ${{ steps.request.outputs.build_id }}
+          PROMOTION_SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
+          [[ -n "${TUF_REPOSITORY}" ]] || {
+            echo "TUF_ON_CI_REPOSITORY is not configured; refusing to pretend a promotion happened" >&2
+            exit 1
+          }
           archive="dist/zerodeck-${TAG}-linux-x86_64.managed.tar.gz"
-          digest="$(sha256sum "${archive}" | awk '{print $1}')"
           size="$(wc -c <"${archive}" | tr -d ' ')"
-          version="${TAG#v}"
-          build_id="$(python3 - "${archive}" <<'PY'
-          import json, sys, tarfile
-          with tarfile.open(sys.argv[1], "r:gz") as archive:
-              print(json.load(archive.extractfile("release.json"))["build_id"])
-          PY
-          )"
-          python3 - "${TAG}" "${version}" "${build_id}" "${CHANNEL}" "${MIN_UPDATER}" \
-            "${digest}" "${size}" "${TUF_REPOSITORY}" "${SOURCE_SHA}" \
-            >promotion-request.json <<'PY'
+          python3 - "${TAG}" "${VERSION}" "${BUILD_ID}" "${CHANNEL}" "${MIN_UPDATER}" \
+            "${DIGEST}" "${size}" "${TUF_REPOSITORY}" "${RELEASE_SHA}" \
+            "${PROMOTION_SOURCE_SHA}" >promotion-request.json <<'PY'
           import json, os, sys
           (tag, version, build_id, channel, min_updater, digest, size, tuf_repository,
-           source_sha) = sys.argv[1:10]
+           release_sha, promotion_source_sha) = sys.argv[1:11]
           document = {
               "schema": 1,
               "tag": tag,
@@ -186,10 +238,16 @@ jobs:
               "sha256": digest,
               "length": int(size),
               "source_repository": os.environ["GITHUB_REPOSITORY"],
-              "source_sha": source_sha,
+              "source_sha": release_sha,
               "source_ref": "refs/heads/main",
               "signer_workflow": f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/release-please.yml",
               "source_release": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/releases/tag/{tag}",
+              "source_release_immutable": True,
+              "stable_evidence": (
+                  f"deploy/update/evidence/{tag}.md" if channel == "stable" else None
+              ),
+              "promotion_source_sha": promotion_source_sha,
+              "promotion_source_ref": "refs/heads/main",
               "tuf_repository": tuf_repository,
           }
           print(json.dumps(document, indent=2))
@@ -222,4 +280,4 @@ jobs:
           json.dump(payload, open("dispatch.json", "w"))
           PY
           gh api --method POST "repos/${TUF_REPOSITORY}/dispatches" --input dispatch.json
-          echo "promotion requested; the external TUF repository must sign and publish before Stable resolves to this version"
+          echo "promotion requested; the external TUF repository must sign and publish before the channel resolves to this version"

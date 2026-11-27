@@ -17,7 +17,7 @@ use tough::{
 };
 use url::Url;
 
-use crate::state::{CATALOG_STATE_SCHEMA, CatalogState, CatalogStateStore};
+use crate::state::{CATALOG_STATE_SCHEMA, CatalogState, CatalogStateStore, SelectionRecord};
 use crate::{GenerationId, UpdateError};
 
 /// Architecture directory used by the first supported native loader distribution.
@@ -49,6 +49,21 @@ impl Channel {
             "testing" => Some(Self::Testing),
             _ => None,
         }
+    }
+
+    /// The signed lowercase channel name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Testing => "testing",
+        }
+    }
+}
+
+impl std::fmt::Display for Channel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -252,11 +267,13 @@ impl Catalog {
         let authorization = previous.authorization.filter(|authorization| {
             repository_authorizes(&repository, &targets_base_url, authorization)
         });
+        let selection = previous.selection.filter(|_| authorization.is_some());
         let state = CatalogState {
             schema: CATALOG_STATE_SCHEMA,
             last_verified_at: Some(now),
             expires_at: Some(expires_at),
             authorization,
+            selection,
         };
         state_store.write(&state)?;
 
@@ -329,6 +346,18 @@ impl Catalog {
         if let Some(release) = &selected {
             let mut next = state;
             next.authorization = Some(release.clone());
+            next.selection = Some(SelectionRecord {
+                channel: policy.channel,
+                updater_version: policy.updater_version.clone(),
+                installed_version: policy
+                    .installed
+                    .as_ref()
+                    .map(|installed| installed.version.clone()),
+                installed_digest: policy
+                    .installed
+                    .as_ref()
+                    .map(|installed| installed.digest.clone()),
+            });
             self.state.write(&next)?;
         }
         Ok(selected)
@@ -351,6 +380,11 @@ impl Catalog {
     /// Returns the release selected by the freshest trusted metadata, without network access.
     pub fn persisted_authorization(&self) -> Result<Option<AuthorizedRelease>, UpdateError> {
         Ok(self.state.read()?.authorization)
+    }
+
+    /// Returns the persisted selection policy that produced the current authorization.
+    pub fn persisted_selection(&self) -> Result<Option<SelectionRecord>, UpdateError> {
+        Ok(self.state.read()?.selection)
     }
 
     /// Revalidates a staged release against the freshest local authorization without network access.

@@ -62,6 +62,9 @@ pub fn start_debug_watcher(manager: Arc<PluginManager>) -> Result<DebugWatcherHa
 }
 
 /// [`start_debug_watcher`] with an injected counter of mtime sweeps (observable by tests).
+///
+/// The only failing step is Linux-only inotify initialization; other hosts always return `Ok`.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
 fn start_debug_watcher_with_sweep_counter(
     manager: Arc<PluginManager>,
     sweeps: Arc<AtomicUsize>,

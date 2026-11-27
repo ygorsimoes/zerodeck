@@ -4,17 +4,21 @@
 //! verified an out-of-band package digest, installs an already extracted generation, and uses the
 //! same durable transaction markers as a managed activation so an interrupted bootstrap is
 //! reconciled by boot recovery instead of leaving an ambiguous `current` reference.
+//!
+//! A starting bootstrap is two-phase: [`prepare_bootstrap`] switches `current` and records a
+//! pending transaction, and [`confirm_bootstrap`] promotes it to `last_confirmed` only after the
+//! caller has started the daemon and verified its authenticated `/readyz` identity.
 
 use std::path::Path;
 
 use uuid::Uuid;
 
 use crate::{
-    ApplyRequestStore, GenerationId, GenerationStore, PendingTransaction, StateStore,
-    TransactionPhase, UpdateError, acquire_maintenance_exclusive,
+    ApplyRequestStore, BootRecoveryMarker, GenerationId, GenerationStore, PendingTransaction,
+    StateStore, TransactionPhase, UpdateError, acquire_maintenance_exclusive,
 };
 
-/// Result of a successful (or check-only) administrative bootstrap.
+/// Result of a successful (or check-only) administrative bootstrap step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapOutcome {
     /// Generation selected as the active reference.
@@ -25,16 +29,18 @@ pub struct BootstrapOutcome {
     pub rollback_target: Option<GenerationId>,
     /// Whether any state or active reference changed.
     pub changed: bool,
+    /// Whether the generation is confirmed (`last_confirmed`) rather than merely prepared.
+    pub confirmed: bool,
 }
 
-/// Installs or converts to `generation` under `root`.
+/// Installs or converts to `generation` under `root` without starting the daemon.
 ///
 /// The caller must already have verified the generation's archive against an out-of-band digest
 /// and extracted it under `<root>/generations/<digest>`. With `check`, this validates all refusal
 /// conditions without changing state and is used before replacing a controller binary. With
 /// `convert`, an existing healthy active generation is retained as the rollback target; without it,
 /// replacing an active generation is refused.
-pub fn bootstrap_generation(
+pub fn prepare_bootstrap(
     root: impl AsRef<Path>,
     generation: &str,
     convert: bool,
@@ -73,6 +79,7 @@ pub fn bootstrap_generation(
                 previous,
                 persisted.rollback_target,
                 false,
+                false,
             ));
         }
         let mut updated = persisted;
@@ -86,7 +93,14 @@ pub fn bootstrap_generation(
             updated.last_error = None;
             state.write(&updated)?;
         }
-        return Ok(outcome(generation, None, updated.rollback_target, changed));
+        BootRecoveryMarker::record(&store)?;
+        return Ok(outcome(
+            generation,
+            None,
+            updated.rollback_target,
+            changed,
+            true,
+        ));
     }
 
     if let Some(previous) = &previous {
@@ -111,10 +125,10 @@ pub fn bootstrap_generation(
     }
 
     if check {
-        return Ok(outcome(generation, previous, rollback_target, false));
+        return Ok(outcome(generation, previous, rollback_target, false, false));
     }
 
-    let mut transaction = PendingTransaction {
+    let transaction = PendingTransaction {
         id: Uuid::new_v4(),
         previous: previous.clone(),
         candidate: generation.clone(),
@@ -126,19 +140,99 @@ pub fn bootstrap_generation(
     state.write(&persisted)?;
 
     store.switch_to(&generation)?;
-    transaction.phase = TransactionPhase::Confirmed;
-    persisted.pending = Some(transaction);
+    persisted
+        .pending
+        .as_mut()
+        .expect("pending was written above")
+        .phase = TransactionPhase::Switched;
     state.write(&persisted)?;
+    BootRecoveryMarker::record(&store)?;
 
-    persisted.confirm();
-    if rollback_target.is_some() {
-        persisted.rollback_target.clone_from(&rollback_target);
+    Ok(outcome(generation, previous, rollback_target, true, false))
+}
+
+/// Promotes a prepared bootstrap to `last_confirmed` after the caller verified readiness.
+///
+/// For a bootstrap without `--start`, call this immediately: there is no running process to probe,
+/// and the operator explicitly chose not to start the service.
+pub fn confirm_bootstrap(root: impl AsRef<Path>) -> Result<BootstrapOutcome, UpdateError> {
+    let root = root.as_ref();
+    let store = GenerationStore::new(root)?;
+    let _guard = acquire_maintenance_exclusive(&store)?;
+    let state = StateStore::new(root.join("state/update.json"));
+    let mut persisted = state.read()?;
+
+    let Some(pending) = persisted.pending.clone() else {
+        let current = store.current_reference()?;
+        let confirmed = current
+            .as_ref()
+            .is_some_and(|current| persisted.last_confirmed.as_ref() == Some(current));
+        if !confirmed {
+            return Err(UpdateError::BootstrapRefused(
+                "no prepared bootstrap transaction exists and the active generation is not \
+                 confirmed"
+                    .to_owned(),
+            ));
+        }
+        BootRecoveryMarker::record(&store)?;
+        return Ok(outcome(
+            current.expect("confirmed current"),
+            None,
+            persisted.rollback_target,
+            false,
+            true,
+        ));
+    };
+
+    let current = store.current_reference()?;
+    if current.as_ref() != Some(&pending.candidate) {
+        return Err(UpdateError::StaleRequest {
+            expected: Some(pending.candidate),
+            found: current,
+        });
     }
-    persisted.last_result = Some(format!("bootstrapped generation {generation}"));
+    if pending.phase != TransactionPhase::Switched {
+        return Err(UpdateError::BootstrapRefused(format!(
+            "the prepared bootstrap is in phase {:?}, not a confirmable phase",
+            pending.phase
+        )));
+    }
+    let previous = pending.previous.clone();
+    persisted.confirm();
+    persisted.last_result = Some(format!("bootstrapped generation {}", pending.candidate));
     persisted.last_error = None;
     state.write(&persisted)?;
+    BootRecoveryMarker::record(&store)?;
+    store.gc(&persisted, std::slice::from_ref(&pending.candidate))?;
 
-    Ok(outcome(generation, previous, rollback_target, true))
+    Ok(outcome(
+        pending.candidate,
+        previous,
+        persisted.rollback_target,
+        true,
+        true,
+    ))
+}
+
+/// Prepares and immediately confirms `generation` without starting the daemon.
+///
+/// This preserves the historical single-call API for callers that do not start a service. A
+/// caller that starts the daemon must use [`prepare_bootstrap`], verify readiness, then call
+/// [`confirm_bootstrap`]; otherwise the generation is recorded as healthy before it ever ran.
+pub fn bootstrap_generation(
+    root: impl AsRef<Path>,
+    generation: &str,
+    convert: bool,
+    check: bool,
+) -> Result<BootstrapOutcome, UpdateError> {
+    let prepared = prepare_bootstrap(root.as_ref(), generation, convert, check)?;
+    if check {
+        return Ok(prepared);
+    }
+    let mut confirmed = confirm_bootstrap(root.as_ref())?;
+    confirmed.previous = prepared.previous;
+    confirmed.changed |= prepared.changed;
+    Ok(confirmed)
 }
 
 fn outcome(
@@ -146,12 +240,14 @@ fn outcome(
     previous: Option<GenerationId>,
     rollback_target: Option<GenerationId>,
     changed: bool,
+    confirmed: bool,
 ) -> BootstrapOutcome {
     BootstrapOutcome {
         generation,
         previous,
         rollback_target,
         changed,
+        confirmed,
     }
 }
 
@@ -167,6 +263,7 @@ mod tests {
             previous: None,
             rollback_target: None,
             changed: false,
+            confirmed: false,
         };
         assert!(format!("{outcome:?}").contains("BootstrapOutcome"));
     }

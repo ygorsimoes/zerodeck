@@ -149,4 +149,8 @@ before adopting a new archive compression format.
 - Operator: PENDING
 - Independent reviewer: PENDING
 - Date: PENDING
-- Stable eligible: **PENDING** (reason: hardware evidence not recorded)
+- Stable eligible: PENDING
+
+Reason: hardware evidence not recorded. Replace the exact line above with
+`Stable eligible: PASS` only after every value in this file is observed; the promotion workflow
+refuses any remaining `PENDING` value.

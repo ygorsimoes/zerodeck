@@ -18,7 +18,10 @@ pub use fs::atomic_write;
 pub use maintenance::MaintenanceLock;
 pub use ownership::{EntryMeta, OwnershipViolation, ViolationKind, check_entry};
 #[cfg(unix)]
-pub use ownership::{check_root_only_tree, entry_meta, non_root_writable_ancestors};
+pub use ownership::{
+    check_root_only_tree, check_secure_ancestors, ensure_root_owned_ancestors, entry_meta,
+    non_root_writable_ancestors,
+};
 pub use paths::PlatformPaths;
 pub use privilege::PrivilegeTarget;
 #[cfg(unix)]

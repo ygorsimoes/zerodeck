@@ -10,16 +10,18 @@ use clap::{Parser, Subcommand};
 use semver::Version;
 use url::Url;
 use zerodeck_updater::{
-    ACTIVATION_DEADLINE, APPLY_UNIT, ApplyRequestStore, AuthorizedRelease, Catalog, Channel,
-    DAEMON_UNIT, GenerationId, GenerationStore, RecoveryMode, SelectionPolicy, StateStore,
-    SystemdService, UpdateError, UpgradeOutcome, acquire_maintenance_exclusive, apply_pending,
-    bootstrap_generation, enqueue_rollback, enqueue_upgrade, recover, recover_before_boot,
-    stage_release,
+    ACTIVATION_DEADLINE, APPLY_UNIT, ApplyRequestStore, AuthorizedRelease, BootRecoveryMarker,
+    Catalog, Channel, DAEMON_UNIT, GenerationId, GenerationStore, RecoveryMode, SelectionPolicy,
+    StateStore, SystemdService, UpdateError, UpgradeOutcome, acquire_maintenance_exclusive,
+    apply_pending, bootstrap_generation, confirm_bootstrap, enqueue_rollback, enqueue_upgrade,
+    enqueue_upgrade_with_channel, prepare_bootstrap, recover, recover_before_boot, stage_release,
 };
 
 const DEFAULT_ROOT: &str = "/var/lib/zerodeck";
 const DEFAULT_READY_URL: &str = "http://127.0.0.1:1337";
 const APPLY_WAIT: Duration = Duration::from_secs(ACTIVATION_DEADLINE.as_secs() + 120);
+const APPLY_LOCK_WAIT: Duration = Duration::from_secs(30);
+const APPLY_LOCK_POLL: Duration = Duration::from_millis(200);
 /// Distinct exit status for a staged candidate that needs an explicit `--start`.
 const EXIT_REQUIRES_START: i32 = 75;
 
@@ -66,6 +68,14 @@ enum Command {
         /// Explicitly start a stopped managed service (required for a first install).
         #[arg(long)]
         start: bool,
+        /// Channel the operator selected for the staged candidate. Testing requires this explicit
+        /// opt-in; the default refuses a Testing authorization.
+        #[arg(
+            long,
+            default_value = "stable",
+            value_parser = clap::builder::PossibleValuesParser::new(["stable", "testing"])
+        )]
+        channel: String,
     },
     /// Print the redacted installed, staged, pending, and last-result summary.
     Status,
@@ -74,7 +84,7 @@ enum Command {
     /// Administrative first install or conversion to an already extracted verified generation.
     Bootstrap {
         /// Generation digest extracted under the update root's `generations/` directory.
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         generation: String,
         /// Retain an existing active generation as the rollback target.
         #[arg(long)]
@@ -82,6 +92,12 @@ enum Command {
         /// Validate refusal conditions and print the plan without changing state.
         #[arg(long)]
         check: bool,
+        /// Switch to the generation and record a pending transaction without confirming it.
+        #[arg(long, conflicts_with_all = ["check", "confirm"])]
+        prepare: bool,
+        /// Promote a previously prepared generation to `last_confirmed` after readiness.
+        #[arg(long, conflicts_with_all = ["check", "prepare"])]
+        confirm: bool,
     },
     /// Remove a digest from the failed-trial quarantine after it was reviewed.
     Unquarantine {
@@ -91,6 +107,12 @@ enum Command {
     /// Internal: consume the single apply request (runs in `zerodeck-apply.service`).
     #[command(hide = true)]
     Apply,
+    /// Reconcile an interrupted activation, or discard a stale unconsumed apply request.
+    Recover {
+        /// Remove the apply request when no activation transaction is pending.
+        #[arg(long)]
+        discard_request: bool,
+    },
     /// Internal: reconcile disk state after the apply unit exits.
     #[command(hide = true)]
     RecoverAfterApply,
@@ -125,14 +147,24 @@ async fn run(cli: Cli) -> Result<(), UpdateError> {
             channel,
             check_only,
         } => run_update(&cli.root, &channel, check_only).await,
-        Command::Upgrade { start } => run_upgrade(&cli.root, start).await,
+        Command::Upgrade { start, channel } => run_upgrade(&cli.root, start, &channel).await,
         Command::Status => run_status(&cli.root),
         Command::Rollback => run_rollback(&cli.root).await,
         Command::Bootstrap {
             generation,
             convert_existing_zerodeck,
             check,
-        } => run_bootstrap(&cli.root, &generation, convert_existing_zerodeck, check),
+            prepare,
+            confirm,
+        } => run_bootstrap(
+            &cli.root,
+            &generation,
+            convert_existing_zerodeck,
+            check,
+            prepare,
+            confirm,
+        ),
+        Command::Recover { discard_request } => run_recover(&cli.root, discard_request).await,
         Command::Unquarantine { digest } => run_unquarantine(&cli.root, &digest),
         Command::Apply => run_apply(&cli.root).await,
         Command::RecoverAfterApply => {
@@ -163,7 +195,9 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     })?;
     let store = GenerationStore::new(root)?;
     let state = state_store(root);
-    let _guard = zerodeck_updater::acquire_maintenance_shared(&store)?;
+    // `Catalog::load` updates the persisted verification floor even for `--check-only`; take the
+    // exclusive guard so two updates cannot interleave their catalog-state writes.
+    let _guard = acquire_maintenance_exclusive(&store)?;
 
     let installed = installed_release(&store);
     let metadata_url = environment_url("ZERODECK_UPDATE_METADATA_URL")?;
@@ -214,9 +248,16 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
     Ok(())
 }
 
-async fn run_upgrade(root: &Path, start: bool) -> Result<(), UpdateError> {
+async fn run_upgrade(root: &Path, start: bool, channel: &str) -> Result<(), UpdateError> {
+    let channel =
+        Channel::parse(channel).ok_or_else(|| UpdateError::InvalidChannel(channel.to_owned()))?;
     let (store, state, service) = open_runtime(root)?;
-    match enqueue_upgrade(&store, &state, &service, start).await? {
+    let outcome = if channel == Channel::Stable {
+        enqueue_upgrade(&store, &state, &service, start).await?
+    } else {
+        enqueue_upgrade_with_channel(&store, &state, &service, start, channel).await?
+    };
+    match outcome {
         UpgradeOutcome::RequiresStart { candidate } => {
             println!(
                 "zerodeckctl: candidate {candidate} is staged but the managed service is stopped; \
@@ -236,13 +277,25 @@ async fn run_rollback(root: &Path) -> Result<(), UpdateError> {
     start_apply_and_report(&state, &request.generation).await
 }
 
+#[allow(
+    clippy::fn_params_excessive_bools,
+    reason = "clap subcommand flags map directly to the operation mode"
+)]
 fn run_bootstrap(
     root: &Path,
     generation: &str,
     convert: bool,
     check: bool,
+    prepare: bool,
+    confirm: bool,
 ) -> Result<(), UpdateError> {
-    let outcome = bootstrap_generation(root, generation, convert, check)?;
+    let outcome = if confirm {
+        confirm_bootstrap(root)?
+    } else if prepare {
+        prepare_bootstrap(root, generation, convert, check)?
+    } else {
+        bootstrap_generation(root, generation, convert, check)?
+    };
     if check {
         println!(
             "zerodeckctl: bootstrap check passed for {} (previous: {}, rollback: {})",
@@ -250,6 +303,14 @@ fn run_bootstrap(
             outcome
                 .previous
                 .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            outcome
+                .rollback_target
+                .map_or_else(|| "none".to_owned(), |value| value.to_string())
+        );
+    } else if prepare && !outcome.confirmed {
+        println!(
+            "zerodeckctl: prepared {} (pending confirmation; rollback: {})",
+            outcome.generation,
             outcome
                 .rollback_target
                 .map_or_else(|| "none".to_owned(), |value| value.to_string())
@@ -268,6 +329,26 @@ fn run_bootstrap(
             outcome.generation
         );
     }
+    Ok(())
+}
+
+async fn run_recover(root: &Path, discard_request: bool) -> Result<(), UpdateError> {
+    if discard_request {
+        // Discarding a request is disk-only and must not depend on a readiness URL.
+        let store = GenerationStore::new(root)?;
+        let state = state_store(root);
+        let _guard = acquire_maintenance_exclusive(&store)?;
+        let persisted = state.read()?;
+        if persisted.pending.is_some() {
+            return Err(UpdateError::DuplicateTransaction);
+        }
+        ApplyRequestStore::for_state(&state).remove()?;
+        println!("zerodeckctl: removed the stale apply request");
+        return Ok(());
+    }
+    let (store, state, service) = open_runtime(root)?;
+    recover(&store, &state, &service, RecoveryMode::AfterApply).await?;
+    print!("{}", summary_line(&state.read()?));
     Ok(())
 }
 
@@ -362,7 +443,20 @@ fn run_status(root: &Path) -> Result<(), UpdateError> {
 async fn run_apply(root: &Path) -> Result<(), UpdateError> {
     let (store, state, service) = open_runtime(root)?;
     let catalog = Catalog::open_offline(root)?;
-    apply_pending(&store, &state, &catalog, &service).await?;
+    // The apply unit can race a boot-recovery pass that still holds the exclusive guard. Retry
+    // within the unit's start timeout instead of failing and leaving the request queued forever.
+    let deadline = Instant::now() + APPLY_LOCK_WAIT;
+    loop {
+        match apply_pending(&store, &state, &catalog, &service).await {
+            Err(UpdateError::Busy) if Instant::now() < deadline => {
+                tokio::time::sleep(APPLY_LOCK_POLL).await;
+            }
+            result => {
+                result?;
+                break;
+            }
+        }
+    }
     println!("{}", summary_line(&state.read()?));
     Ok(())
 }
@@ -419,6 +513,9 @@ async fn start_apply_and_report(
 
 fn exec_current(root: &Path) -> Result<(), UpdateError> {
     let store = GenerationStore::new(root)?;
+    // Ordering alone does not stop systemd from starting the daemon after a failed or skipped
+    // boot recovery. Refuse to exec unless disk reconciliation completed for this kernel boot.
+    BootRecoveryMarker::verify(&store)?;
     let generation = store.current()?.ok_or(UpdateError::NoActiveGeneration)?;
     let layout = store.verify_generation(&generation)?;
     let mut command = std::process::Command::new(layout.binary());

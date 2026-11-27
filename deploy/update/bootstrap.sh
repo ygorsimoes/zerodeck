@@ -19,7 +19,9 @@ DEFAULT_ROOT="/var/lib/zerodeck"
 DEFAULT_CONTROLLER_ROOT="/usr/local/lib/zerodeck"
 DEFAULT_SYSTEMD_DIR="/etc/systemd/system"
 DEFAULT_CONFIG_DIR="/etc/zerodeck"
+DEFAULT_BIN_LINK="/usr/local/bin/zerodeckctl"
 DEFAULT_DATA_DIR="/home/deck/homebrew"
+DEFAULT_READY_URL="http://127.0.0.1:1337"
 
 package=""
 package_sha=""
@@ -33,7 +35,9 @@ root="${DEFAULT_ROOT}"
 controller_root="${DEFAULT_CONTROLLER_ROOT}"
 systemd_dir="${DEFAULT_SYSTEMD_DIR}"
 config_dir="${DEFAULT_CONFIG_DIR}"
+bin_link="${DEFAULT_BIN_LINK}"
 data_dir="${DEFAULT_DATA_DIR}"
+ready_url="${DEFAULT_READY_URL}"
 systemctl="systemctl"
 convert=0
 import_decky=""
@@ -47,9 +51,10 @@ usage: ${PROGRAM} --package <manual.tar.gz> --sha256 <hex>
                   --trusted-root <root.json> --trusted-root-sha256 <hex>
                   --metadata-url URL --targets-url URL
                   [--convert-existing-zerodeck] [--import-inactive-decky PATH]
-                  [--start] [--dry-run]
+                  [--start] [--dry-run] [--ready-url URL]
                   [--root DIR] [--controller-root DIR] [--systemd-dir DIR]
-                  [--config-dir DIR] [--data-dir DIR] [--systemctl PATH]
+                  [--config-dir DIR] [--bin-link PATH] [--data-dir DIR]
+                  [--systemctl PATH]
 
 The package and generation hashes must come from outside the downloaded files (release notes,
 signed metadata, or another trusted channel). The TUF root is installed as the trust anchor; this
@@ -85,7 +90,9 @@ while [[ $# -gt 0 ]]; do
         --controller-root) need_value "$@"; controller_root="$2"; shift 2 ;;
         --systemd-dir) need_value "$@"; systemd_dir="$2"; shift 2 ;;
         --config-dir) need_value "$@"; config_dir="$2"; shift 2 ;;
+        --bin-link) need_value "$@"; bin_link="$2"; shift 2 ;;
         --data-dir) need_value "$@"; data_dir="$2"; shift 2 ;;
+        --ready-url) need_value "$@"; ready_url="$2"; shift 2 ;;
         --systemctl) need_value "$@"; systemctl="$2"; shift 2 ;;
         --convert-existing-zerodeck) convert=1; shift ;;
         --import-inactive-decky) need_value "$@"; import_decky="$2"; shift 2 ;;
@@ -115,6 +122,7 @@ fi
 if [[ -n "${targets_url}" && ! "${targets_url}" =~ ^https?:// ]]; then
     die "--targets-url must be an http(s) URL"
 fi
+[[ "${ready_url}" =~ ^https?://[^/]+ ]] || die "--ready-url must be an http(s) URL"
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then
@@ -139,22 +147,150 @@ check_digest() {
 }
 
 # Destructive installation paths require root. Tests and operators may redirect every path below a
-# temporary prefix; that never touches a system location, so it needs no privilege.
-custom_paths=0
-[[ "${root}" != "${DEFAULT_ROOT}" ]] && custom_paths=1
-[[ "${controller_root}" != "${DEFAULT_CONTROLLER_ROOT}" ]] && custom_paths=1
-[[ "${systemd_dir}" != "${DEFAULT_SYSTEMD_DIR}" ]] && custom_paths=1
-[[ "${config_dir}" != "${DEFAULT_CONFIG_DIR}" ]] && custom_paths=1
-if [[ "$(id -u)" -ne 0 && "${custom_paths}" -eq 0 ]]; then
-    die "bootstrap must run as root (or redirect every install path with --root/--controller-root/--systemd-dir/--config-dir)"
+# temporary prefix; that never touches a system location, so it needs no privilege. Every default
+# path must be overridden together: a partial override must not let an unprivileged caller write a
+# remaining system path.
+if [[ "$(id -u)" -ne 0 ]]; then
+    [[ "${root}" != "${DEFAULT_ROOT}" ]] || \
+        die "bootstrap must run as root or redirect every install path with --root"
+    [[ "${controller_root}" != "${DEFAULT_CONTROLLER_ROOT}" ]] || \
+        die "bootstrap must run as root or redirect every install path with --controller-root"
+    [[ "${systemd_dir}" != "${DEFAULT_SYSTEMD_DIR}" ]] || \
+        die "bootstrap must run as root or redirect every install path with --systemd-dir"
+    [[ "${config_dir}" != "${DEFAULT_CONFIG_DIR}" ]] || \
+        die "bootstrap must run as root or redirect every install path with --config-dir"
+    [[ "${bin_link}" != "${DEFAULT_BIN_LINK}" ]] || \
+        die "bootstrap must run as root or redirect every install path with --bin-link"
 fi
 
-# ── Verify before extraction or execution ──────────────────────────────────────────────────────
-check_digest "${package}" "${package_sha}" "manual package"
-check_digest "${generation}" "${generation_sha}" "managed generation"
-check_digest "${trusted_root}" "${trusted_root_sha}" "trusted root"
+ensure_private_dir() {
+    local path="$1" mode="$2"
+    mkdir -p "${path}"
+    chmod "${mode}" "${path}"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown root:root "${path}"
+    fi
+}
 
-python3 - "${trusted_root}" <<'PY'
+ensure_owned_tree() {
+    local path="$1"
+    [[ "$(id -u)" -eq 0 ]] || return 0
+    local owner mode
+    owner="$(python3 - "${path}" <<'PY'
+import os, sys
+print(os.stat(sys.argv[1]).st_uid)
+PY
+)"
+    [[ "${owner}" == "0" ]] || die "${path} must be owned by root, found uid ${owner}"
+    mode="$(python3 - "${path}" <<'PY'
+import os, sys
+print(os.stat(sys.argv[1]).st_mode & 0o777)
+PY
+)"
+    if (( (mode & 8#022) != 0 )); then
+        die "${path} must not be group/other writable (mode ${mode})"
+    fi
+}
+
+ensure_safe_ancestors() {
+    local path="$1"
+    [[ "$(id -u)" -eq 0 ]] || return 0
+    python3 - "${path}" <<'PY'
+import os
+import sys
+
+path = os.path.abspath(sys.argv[1])
+current = os.path.sep
+for part in [part for part in path.split(os.path.sep) if part]:
+    current = os.path.join(current, part)
+    try:
+        metadata = os.lstat(current)
+    except FileNotFoundError:
+        break
+    if os.path.islink(current):
+        raise SystemExit(f"install path ancestor is a symlink: {current}")
+    if metadata.st_uid != 0:
+        raise SystemExit(f"install path ancestor is not root-owned: {current}")
+    if metadata.st_mode & 0o022:
+        raise SystemExit(f"install path ancestor is group/other writable: {current}")
+PY
+}
+
+ensure_install_path() {
+    local path="$1"
+    [[ -L "${path}" ]] && die "install path must not be a symlink: ${path}"
+    ensure_safe_ancestors "${path}"
+    if [[ -e "${path}" ]]; then
+        ensure_owned_tree "${path}"
+    fi
+}
+
+verify_root_owned_tree() {
+    local path="$1"
+    [[ "$(id -u)" -eq 0 ]] || return 0
+    python3 - "${path}" <<'PY'
+import os, sys
+root = sys.argv[1]
+for base, dirs, files in os.walk(root):
+    for name in [base, *[os.path.join(base, entry) for entry in dirs + files]]:
+        metadata = os.lstat(name)
+        if os.path.islink(name):
+            raise SystemExit(f"existing generation contains a symlink: {name}")
+        if metadata.st_uid != 0:
+            raise SystemExit(f"existing generation path is not root-owned: {name}")
+        if metadata.st_mode & 0o022:
+            raise SystemExit(f"existing generation path is group/other writable: {name}")
+PY
+}
+
+ensure_install_path "${root}"
+ensure_install_path "${controller_root}"
+ensure_install_path "${systemd_dir}"
+ensure_install_path "${config_dir}"
+ensure_safe_ancestors "$(dirname "${bin_link}")"
+for path in generations state tuf staging backup import; do
+    [[ -L "${root}/${path}" ]] && die "update root child must not be a symlink: ${root}/${path}"
+done
+if [[ "${dry_run}" -eq 0 ]]; then
+    ensure_private_dir "${root}" 0755
+    ensure_private_dir "${root}/generations" 0755
+    ensure_private_dir "${root}/state" 0700
+    ensure_private_dir "${root}/tuf" 0700
+    ensure_private_dir "${root}/staging" 0700
+    ensure_private_dir "${root}/backup" 0700
+    ensure_owned_tree "${root}"
+    work="${root}/.bootstrap-$$"
+else
+    # A dry run must not create or chmod any system path.
+    work="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-bootstrap-dry-run.XXXXXX")"
+fi
+umask 077
+mkdir -p "${work}"
+cleanup() {
+    rm -rf "${work}"
+}
+trap cleanup EXIT
+
+# ── Copy first, verify the copies, and never re-open a caller-controlled path ─────────────────
+# Hashing the original path and then extracting it lets an attacker replace the file between the
+# two opens. The root-only work directory is owned by this process for its lifetime; every later
+# read (trusted-root parse, extraction, install) uses these copies.
+inputs="${work}/inputs"
+mkdir -p "${inputs}"
+cp -- "${package}" "${inputs}/package.tar.gz"
+cp -- "${generation}" "${inputs}/generation.tar.gz"
+cp -- "${trusted_root}" "${inputs}/root.json"
+for input in package.tar.gz generation.tar.gz root.json; do
+    [[ -f "${inputs}/${input}" && ! -L "${inputs}/${input}" ]] || \
+        die "verified input copy is not a regular file: ${inputs}/${input}"
+done
+: >"${work}/.inputs-copied"
+
+check_digest "${inputs}/package.tar.gz" "${package_sha}" "manual package"
+check_digest "${inputs}/generation.tar.gz" "${generation_sha}" "managed generation"
+check_digest "${inputs}/root.json" "${trusted_root_sha}" "trusted root"
+
+python3 - "${inputs}/root.json" <<'PY'
 import json
 import sys
 import time
@@ -190,88 +326,49 @@ signatures = document.get("signatures")
 if not isinstance(signatures, list) or not signatures:
     raise SystemExit("trusted root is unsigned")
 PY
+: >"${work}/.inputs-verified"
 
-ensure_private_dir() {
-    local path="$1" mode="$2"
-    mkdir -p "${path}"
-    chmod "${mode}" "${path}"
-    if [[ "$(id -u)" -eq 0 ]]; then
-        chown root:root "${path}"
-    fi
-}
+sync_tree() {
+    python3 - "$1" <<'PY'
+import os
+import sys
 
-ensure_owned_tree() {
-    local path="$1"
-    [[ "$(id -u)" -eq 0 ]] || return 0
-    local owner mode
-    owner="$(python3 - "${path}" <<'PY'
-import os, sys
-print(os.stat(sys.argv[1]).st_uid)
-PY
-)"
-    [[ "${owner}" == "0" ]] || die "${path} must be owned by root, found uid ${owner}"
-    mode="$(python3 - "${path}" <<'PY'
-import os, sys
-print(os.stat(sys.argv[1]).st_mode & 0o777)
-PY
-)"
-    if (( (mode & 8#022) != 0 )); then
-        die "${path} must not be group/other writable (mode ${mode})"
-    fi
-}
-
-ensure_install_path() {
-    local path="$1"
-    [[ -L "${path}" ]] && die "install path must not be a symlink: ${path}"
-    if [[ -e "${path}" ]]; then
-        ensure_owned_tree "${path}"
-    fi
-}
-
-verify_root_owned_tree() {
-    local path="$1"
-    [[ "$(id -u)" -eq 0 ]] || return 0
-    python3 - "${path}" <<'PY'
-import os, sys
 root = sys.argv[1]
-for base, dirs, files in os.walk(root):
-    for name in [base, *[os.path.join(base, entry) for entry in dirs + files]]:
-        metadata = os.lstat(name)
-        if os.path.islink(name):
-            raise SystemExit(f"existing generation contains a symlink: {name}")
-        if metadata.st_uid != 0:
-            raise SystemExit(f"existing generation path is not root-owned: {name}")
-        if metadata.st_mode & 0o022:
-            raise SystemExit(f"existing generation path is group/other writable: {name}")
+for base, directories, files in os.walk(root, topdown=False):
+    for name in files:
+        with open(os.path.join(base, name), "rb") as handle:
+            os.fsync(handle.fileno())
+    for name in directories:
+        path = os.path.join(base, name)
+        try:
+            descriptor = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+descriptor = os.open(root, os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
 PY
 }
 
-ensure_install_path "${root}"
-ensure_install_path "${controller_root}"
-ensure_install_path "${systemd_dir}"
-ensure_install_path "${config_dir}"
-for path in generations state tuf staging backup import; do
-    [[ -L "${root}/${path}" ]] && die "update root child must not be a symlink: ${root}/${path}"
-done
-if [[ "${dry_run}" -eq 0 ]]; then
-    ensure_private_dir "${root}" 0755
-    ensure_private_dir "${root}/generations" 0755
-    ensure_private_dir "${root}/state" 0700
-    ensure_private_dir "${root}/tuf" 0700
-    ensure_private_dir "${root}/staging" 0700
-    ensure_private_dir "${root}/backup" 0700
-    ensure_owned_tree "${root}"
-    work="${root}/.bootstrap-$$"
-else
-    # A dry run must not create or chmod any system path.
-    work="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-bootstrap-dry-run.XXXXXX")"
-fi
-umask 077
-mkdir -p "${work}"
-cleanup() {
-    rm -rf "${work}"
+sync_dir() {
+    python3 - "$1" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+descriptor = os.open(path, os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
 }
-trap cleanup EXIT
 
 extract_archive() {
     local archive="$1" destination="$2" label="$3"
@@ -322,8 +419,8 @@ finally:
 PY
 }
 
-extract_archive "${package}" "${work}/manual" "manual package"
-extract_archive "${generation}" "${work}/managed" "managed generation"
+extract_archive "${inputs}/package.tar.gz" "${work}/manual" "manual package"
+extract_archive "${inputs}/generation.tar.gz" "${work}/managed" "managed generation"
 
 
 if ! python3 - "${work}/manual" "${work}/managed" >"${work}/identity" <<'PY'
@@ -468,6 +565,7 @@ fi
 
 for path in \
     "${controller_bin}" \
+    "${bin_link}" \
     "${root}/current" \
     "${root}/state/update.json" \
     "${root}/state/apply.json" \
@@ -525,7 +623,12 @@ else
     find "${staged_generation}" -type d -exec chmod 0755 {} +
     find "${staged_generation}" -type f -exec chmod 0644 {} +
     chmod 0755 "${staged_generation}/bin/zerodeckd"
+    # Persist the complete generation tree before `current` can reference it; a power loss after
+    # the switch must never leave an empty or partially written generation.
+    sync_tree "${staged_generation}"
+    sync_dir "${root}/generations"
     mv "${staged_generation}" "${generation_dir}"
+    sync_dir "${root}/generations"
 fi
 
 temp_controller="${manual_root}/bin/zerodeckctl"
@@ -546,6 +649,9 @@ backup_dir="${root}/backup/bootstrap-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "${backup_dir}/systemd" "${backup_dir}/config" "${backup_dir}/root"
 chmod 0700 "${backup_dir}"
 [[ -e "${controller_bin}" ]] && cp -a "${controller_bin}" "${backup_dir}/controller"
+if [[ -e "${bin_link}" || -L "${bin_link}" ]]; then
+    cp -a "${bin_link}" "${backup_dir}/bin-link"
+fi
 for unit in "${units[@]}"; do
     if [[ -e "${systemd_dir}/${unit}" ]]; then
         cp -a "${systemd_dir}/${unit}" "${backup_dir}/systemd/${unit}"
@@ -601,11 +707,30 @@ install_controller() {
     fi
 }
 
+install_bin_link() {
+    local directory staged
+    directory="$(dirname "${bin_link}")"
+    mkdir -p "${directory}"
+    chmod 0755 "${directory}"
+    if [[ -e "${bin_link}" && ! -L "${bin_link}" ]]; then
+        die "refusing to replace a non-symlink controller path: ${bin_link}"
+    fi
+    if [[ -L "${bin_link}" && "$(readlink "${bin_link}")" == "${controller_bin}" ]]; then
+        return 0
+    fi
+    staged="${directory}/.zerodeckctl.$$"
+    ln -s "${controller_bin}" "${staged}"
+    mv -f "${staged}" "${bin_link}"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown -h root:root "${bin_link}"
+    fi
+}
+
 install_config() {
     mkdir -p "${config_dir}"
     chmod 0755 "${config_dir}"
     local staged="${config_dir}/.trusted-root.$$"
-    install -m 0644 "${trusted_root}" "${staged}"
+    install -m 0644 "${inputs}/root.json" "${staged}"
     mv "${staged}" "${config_dir}/trusted-root.json"
     local env_staged="${config_dir}/.update.env.$$"
     {
@@ -667,6 +792,10 @@ rollback_install() {
     else
         rm -f "${controller_bin}"
     fi
+    rm -f "${bin_link}"
+    if [[ -e "${backup_dir}/bin-link" || -L "${backup_dir}/bin-link" ]]; then
+        cp -a "${backup_dir}/bin-link" "${bin_link}"
+    fi
     local name
     for name in trusted-root.json update.env; do
         rm -f "${config_dir}/${name}"
@@ -701,9 +830,16 @@ if ! install_config; then
     rollback_install "trusted root or update environment installation failed"
     exit 1
 fi
-if ! "${controller_bin}" --root "${root}" bootstrap --generation "${digest}" \
+if ! install_bin_link; then
+    rollback_install "controller PATH link installation failed"
+    exit 1
+fi
+# Phase 1: switch `current` and record a pending transaction. The generation is not marked
+# `last_confirmed` until the daemon has actually served the matching authenticated `/readyz`
+# identity (or until a no-start bootstrap explicitly confirms it below).
+if ! "${controller_bin}" --root "${root}" bootstrap --generation "${digest}" --prepare \
         $( [[ "${convert}" -eq 1 ]] && echo --convert-existing-zerodeck ); then
-    rollback_install "controller bootstrap failed"
+    rollback_install "controller bootstrap prepare failed"
     exit 1
 fi
 chmod 0600 "${root}/state/update.json" 2>/dev/null || true
@@ -717,6 +853,57 @@ if ! "${systemctl}" daemon-reload; then
     rollback_install "systemctl daemon-reload failed"
     exit 1
 fi
+
+confirm_bootstrap() {
+    if ! "${controller_bin}" --root "${root}" bootstrap --confirm; then
+        rollback_install "controller bootstrap confirmation failed"
+        exit 1
+    fi
+}
+
+wait_for_ready() {
+    local invocation
+    invocation="$("${systemctl}" show -p InvocationID --value zerodeck.service 2>/dev/null || true)"
+    [[ -n "${invocation}" ]] || die "zerodeck.service has no InvocationID after start"
+    python3 - "${ready_url}" "${identity_version}" "${identity_build_id}" "${invocation}" <<'PY'
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+base, version, build_id, invocation = sys.argv[1:5]
+base = base.rstrip("/")
+deadline = time.monotonic() + 60
+last = "no readiness response"
+while time.monotonic() < deadline:
+    try:
+        with urllib.request.urlopen(f"{base}/auth/token", timeout=5) as response:
+            token = response.read().decode("utf-8").strip()
+        request = urllib.request.Request(
+            f"{base}/readyz", headers={"X-Decky-Auth": token}
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            document = json.loads(response.read())
+        if document.get("version") != version:
+            last = f"/readyz version {document.get('version')!r} != {version!r}"
+        elif document.get("build_id") != build_id:
+            last = f"/readyz build_id {document.get('build_id')!r} != {build_id!r}"
+        elif document.get("python_host_ready") is not True:
+            last = "/readyz reports python_host_ready is not true"
+        elif document.get("invocation_id") != invocation:
+            last = (
+                f"/readyz invocation_id {document.get('invocation_id')!r} "
+                f"!= systemd InvocationID {invocation!r}"
+            )
+        else:
+            raise SystemExit(0)
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        last = str(error)
+    time.sleep(0.2)
+raise SystemExit(f"zerodeck.service did not become ready: {last}")
+PY
+}
 
 if [[ -n "${import_decky}" ]]; then
     imported_at="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -769,17 +956,28 @@ if [[ "${start}" -eq 1 ]]; then
         exit 1
     fi
     active=0
-    for (( attempt = 0; attempt < 15; attempt++ )); do
-        if "${systemctl}" is-active --quiet zerodeck.service; then
+    for (( attempt = 0; attempt < 30; attempt++ )); do
+        state="$("${systemctl}" show -p ActiveState --value zerodeck.service 2>/dev/null || true)"
+        pid="$("${systemctl}" show -p MainPID --value zerodeck.service 2>/dev/null || true)"
+        if [[ "${state}" == "active" && "${pid}" =~ ^[0-9]+$ && "${pid}" -gt 0 ]]; then
             active=1
             break
         fi
         sleep 1
     done
     if [[ "${active}" -eq 0 ]]; then
-        rollback_install "zerodeck.service did not become active"
+        rollback_install "zerodeck.service did not become active with a main process"
         exit 1
     fi
+    if ! wait_for_ready; then
+        rollback_install "zerodeck.service did not serve the expected authenticated readiness identity"
+        exit 1
+    fi
+    confirm_bootstrap
+else
+    # The operator explicitly chose not to start the service. There is no process to probe, so
+    # record the generation as confirmed and keep the units disabled/stopped.
+    confirm_bootstrap
 fi
 
 echo "${PROGRAM}: installed generation ${digest} (version ${identity_version}, build ${identity_build_id})"

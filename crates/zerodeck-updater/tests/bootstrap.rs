@@ -140,8 +140,8 @@ fn bootstrap_refuses_a_pending_activation_before_touching_state() {
 fn bootstrap_replacement_requires_conversion_and_retains_the_previous_generation() {
     let dir = TestDir::new("convert");
     let previous = generation(&dir.0, 'a');
-    let candidate = generation(&dir.0, 'b');
     bootstrap_generation(&dir.0, previous.as_str(), false, false).expect("first install");
+    let candidate = generation(&dir.0, 'b');
 
     let error = bootstrap_generation(&dir.0, candidate.as_str(), false, false)
         .expect_err("replacement requires explicit conversion");
@@ -206,8 +206,8 @@ fn bootstrap_refuses_an_unconsumed_apply_request() {
 fn bootstrap_refuses_conversion_when_the_previous_generation_is_corrupt() {
     let dir = TestDir::new("corrupt-previous");
     let previous = generation(&dir.0, 'a');
-    let candidate = generation(&dir.0, 'b');
     bootstrap_generation(&dir.0, previous.as_str(), false, false).expect("first install");
+    let candidate = generation(&dir.0, 'b');
     fs::remove_dir_all(dir.0.join("generations").join(previous.as_str())).expect("remove previous");
 
     let error = bootstrap_generation(&dir.0, candidate.as_str(), true, false)
@@ -237,11 +237,62 @@ fn bootstrap_refuses_conversion_when_the_previous_generation_is_corrupt() {
 }
 
 #[test]
+fn bootstrap_prepare_defers_confirmation_until_after_readiness() {
+    let dir = TestDir::new("two-phase");
+    let generation = generation(&dir.0, 'a');
+
+    let prepared = zerodeck_updater::prepare_bootstrap(&dir.0, generation.as_str(), false, false)
+        .expect("prepare the generation");
+    assert!(prepared.changed);
+    assert!(!prepared.confirmed);
+    let store = GenerationStore::new(&dir.0).expect("open store");
+    assert_eq!(
+        store.current_reference().expect("read current"),
+        Some(generation.clone())
+    );
+    let state = state_store(&dir.0).read().expect("read state");
+    assert!(
+        state.last_confirmed.is_none(),
+        "prepare must not confirm early"
+    );
+    assert_eq!(
+        state.pending.as_ref().map(|pending| pending.phase),
+        Some(TransactionPhase::Switched)
+    );
+
+    let confirmed = zerodeck_updater::confirm_bootstrap(&dir.0).expect("confirm after readiness");
+    assert!(confirmed.changed);
+    assert!(confirmed.confirmed);
+    let state = state_store(&dir.0).read().expect("read state");
+    assert_eq!(state.last_confirmed, Some(generation));
+    assert!(state.pending.is_none());
+}
+
+#[test]
+fn bootstrap_confirm_refuses_an_arbitrary_unconfirmed_current() {
+    let dir = TestDir::new("unconfirmed-current");
+    let generation = generation(&dir.0, 'a');
+    let store = GenerationStore::new(&dir.0).expect("open store");
+    store.switch_to(&generation).expect("switch current");
+
+    let error = zerodeck_updater::confirm_bootstrap(&dir.0)
+        .expect_err("an unconfirmed current must not be promoted by assertion");
+    assert!(matches!(error, UpdateError::BootstrapRefused(_)), "{error}");
+    assert!(
+        state_store(&dir.0)
+            .read()
+            .expect("read state")
+            .last_confirmed
+            .is_none()
+    );
+}
+
+#[test]
 fn bootstrap_outcome_reports_the_retained_rollback_target() {
     let dir = TestDir::new("outcome");
     let previous = generation(&dir.0, 'a');
-    let candidate = generation(&dir.0, 'b');
     bootstrap_generation(&dir.0, previous.as_str(), false, false).expect("first install");
+    let candidate = generation(&dir.0, 'b');
     let outcome: BootstrapOutcome =
         bootstrap_generation(&dir.0, candidate.as_str(), true, false).expect("convert");
     assert_eq!(outcome.rollback_target, Some(previous));

@@ -233,8 +233,14 @@ delete_asset() {
 assert_expected_release
 assert_immutable_releases_enabled
 if [[ "$(awk -F'\t' '$1 == "draft" {print $2}' "${tmp}/release.meta")" == "0" ]]; then
+    # A published release is only safe to accept when GitHub reports it immutable. Re-check the
+    # field on the already-published verification path too, not just immediately after publishing.
+    if [[ "$(awk -F'\t' '$1 == "immutable" {print $2}' "${tmp}/release.meta")" != "1" ]]; then
+        echo "publish: published release ${tag} is not immutable; refusing to treat it as release bytes" >&2
+        exit 1
+    fi
     if assert_remote_asset_set && verify_all; then
-        echo "publish: release ${tag} is already published and its assets match the local bytes"
+        echo "publish: release ${tag} is already published and its immutable assets match the local bytes"
         exit 0
     fi
     echo "publish: refusing to modify the published release ${tag}; its assets do not match" >&2

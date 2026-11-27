@@ -208,21 +208,23 @@ must not be able to grant themselves root.
 ## On Steam Deck
 
 > [!NOTE]
-> 🚧 **Coming in [Phase 4](#roadmap).** This is how it will work. None of it is available yet.
+> 🚧 **Implemented, hardware qualification PENDING.** The managed installer and updater are in the
+> tree and covered by unit, fault-injection, packaging and VM-harness tests, but no real Steam Deck
+> or SteamOS run is recorded yet. Stable promotion is blocked until that evidence exists.
 
 - **Install:** a verified `bootstrap.sh` (out-of-band SHA-256 and TUF root) installs `zerodeckd` as
   a managed systemd service that uses your existing `~/homebrew/plugins`.
 - **Update:** `zerodeckctl update` verifies TUF metadata and stages a release; `zerodeckctl upgrade`
   activates it explicitly, with offline rollback to the retained generation.
-- **Uninstall/recovery:** the controller and confirmed generations remain independent of your
-  plugins and settings; an interrupted activation restores the previous generation or leaves a
-  recoverable stopped state.
+- **Recovery:** an interrupted activation restores the previous generation or leaves a recoverable
+  stopped state; `zerodeckctl recover` reconciles a request left by an interrupted helper.
 - **Release gate:** a disposable systemd VM (QEMU, no KVM required) exercises update, rollback and
   crash recovery via
   `just test-updater-vm <image> <ssh-key> <ssh-user> <manual> <managed> [<candidate>]`; exact
   Steam/SteamOS/build, filesystem, offline, SteamOS-update and resource evidence is recorded in
   [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md). Deck evidence is **PENDING**,
-  so Stable stays blocked until that checklist is filled from observed hardware.
+  so Stable stays blocked until that checklist is filled from observed hardware and promoted
+  manually through the protected `production` environment with `Stable eligible: PASS`.
 
 Want it sooner? [Help build it](#contributing).
 

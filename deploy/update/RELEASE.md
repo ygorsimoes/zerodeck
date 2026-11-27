@@ -55,11 +55,22 @@ same test release automation runs before upload.
    `enabled: true`, and re-checks the published release's `immutable` field afterward. Configure
    `RELEASE_PLEASE_TOKEN` with admin read (or grant the release token that permission); the script
    fails clearly rather than publishing a mutable release.
-7. **Promote the already-published bytes, separately.** `.github/workflows/promote-tuf.yml` starts
-   on `release: published`, downloads the exact release assets, verifies `sha256sum -c`, validates
-   both archives, verifies GitHub build provenance for the managed archive, and writes a promotion
-   request. It then dispatches that request to the external TUF-on-CI repository. The release build
-   job contains no TUF signing key and never rebuilds during promotion.
+7. **Promote the already-published bytes, manually and separately.** There is deliberately no
+   `release: published` trigger. Publishing a GitHub release never authorizes Stable. A maintainer
+   dispatches `.github/workflows/promote-tuf.yml` from `main`; the job uses the protected
+   `production` environment (required reviewers), checks out the default branch (never the tag's
+   scripts), requires the release to be published **and** immutable, verifies that the asset set is
+   exactly the two archives plus `SHA256SUMS.txt`, downloads and re-verifies them, validates both
+   archives, verifies GitHub build provenance for the managed archive, and writes a promotion
+   request. Only then does it dispatch that request to the external TUF-on-CI repository. The
+   release build job contains no TUF signing key and never rebuilds during promotion.
+
+   For `channel=stable`, the job additionally runs
+   `deploy/update/verify-stable-evidence.sh` against the reviewed default-branch record
+   `deploy/update/evidence/<tag>.md`. That record must contain no `PENDING` values, the exact release
+   tag/version/build ID/managed SHA-256, an operator, an independent reviewer, a date, and the exact
+   line `Stable eligible: PASS`. Absent or incomplete evidence fails the job closed; the previous
+   Stable target remains authorized. Stable is never promoted automatically.
 
 ### Manual retry
 
@@ -126,9 +137,21 @@ bytes whose published digest and provenance have already been verified.
 
 The request workflow needs these repository settings:
 
+- environment `production` with required reviewers and a protected `main` branch;
 - variable `TUF_ON_CI_REPOSITORY` = `owner/tuf-repository`;
 - variable `TUF_MIN_UPDATER` (optional, default `0.1.0`);
 - secret `TUF_PROMOTION_TOKEN` with permission to dispatch workflows/events in that repository.
+
+Promote manually after the immutable release and, for Stable, after the hardware evidence record is
+merged to `main`:
+
+```bash
+# Testing: no hardware evidence required.
+gh workflow run promote-tuf.yml -f tag=v0.1.0 -f channel=testing
+
+# Stable: requires the production environment approval and deploy/update/evidence/v0.1.0.md.
+gh workflow run promote-tuf.yml -f tag=v0.1.0 -f channel=stable
+```
 
 If either the repository or token is absent, the workflow fails instead of claiming success. There
 is deliberately **no local metadata acceptance** in this repository: `promote.sh` verifies the exact
@@ -181,8 +204,13 @@ sudo ./bootstrap.sh \
   --start
 ```
 
-Before extracting anything, the helper verifies all three SHA-256 digests and parses the root. It
-then validates both archives and refuses if:
+The helper first copies the package, generation and trusted root into a root-only work directory
+and verifies those copies. No caller-controlled path is re-opened for extraction or execution, so a
+file swapped after a hash check cannot be installed. Before extracting anything it also verifies all
+three SHA-256 digests and parses the root. It installs a root-owned
+`/usr/local/bin/zerodeckctl` symlink (override with `--bin-link`) and refuses if an install path or
+any of its ancestors is a symlink, non-root-owned, or group/other-writable. It then validates both
+archives and refuses if:
 
 - `decky.service` or `plugin_loader.service` is active (Decky files are never stopped or rewritten);
 - a ZeroDeck install exists and `--convert-existing-zerodeck` was not supplied;
@@ -193,10 +221,19 @@ then validates both archives and refuses if:
   a path/mode is unsafe.
 
 The helper installs the verified generation under `/var/lib/zerodeck/generations/<sha256>`, the
-controller at `/usr/local/lib/zerodeck/bin/zerodeckctl`, units in `/etc/systemd/system`, the
-trusted root and update endpoints in `/etc/zerodeck/`, and initializes `state/update.json` through
-`zerodeckctl bootstrap`. It does not create or modify `/home/deck/homebrew` during a clean install.
-Without `--start` it installs units but neither enables nor starts anything.
+controller at `/usr/local/lib/zerodeck/bin/zerodeckctl`, the PATH link at
+`/usr/local/bin/zerodeckctl`, units in `/etc/systemd/system`, the trusted root and update endpoints
+in `/etc/zerodeck/`, and prepares `state/update.json` through `zerodeckctl bootstrap --prepare`. It
+fsyncs the complete generation tree before switching `current`. It does not create or modify
+`/home/deck/homebrew` during a clean install. Without `--start` it installs units but neither
+enables nor starts anything, and immediately runs `bootstrap --confirm` because no process exists
+to probe.
+
+With `--start`, the helper waits for `ActiveState=active` and a non-zero `MainPID`, then polls the
+authenticated `/readyz` endpoint (`--ready-url`, default `http://127.0.0.1:1337`) until the
+version, build ID, `python_host_ready` and systemd `INVOCATION_ID` all match. Only then does it run
+`bootstrap --confirm`. A start, readiness or confirmation failure restores the backup, removes or
+restores the controller link, and restarts the previous unit when it was running.
 
 ### Conversion of an existing ZeroDeck install
 
@@ -241,6 +278,11 @@ data root is left untouched, so the unprivileged plugin process never receives a
 
 ## Updater upgrades
 
+After a confirmation, recovery or explicit rollback completes under the exclusive lock, the
+controller collects generations that are not `current`, `last_confirmed`, `rollback_target`, a
+pending candidate, or a currently authorized staged candidate. The active reference is read from
+disk, so stale state cannot cause deletion of the running generation.
+
 `min_updater` in the signed target prevents an old controller from activating a newer generation.
 To replace the controller itself, use the verified bootstrap helper with
 `--convert-existing-zerodeck`; it refuses during a pending activation or when the persisted state
@@ -251,10 +293,23 @@ pending. An offline rollback uses the retained generation and does not consult T
 sudo zerodeckctl update --check-only
 sudo zerodeckctl update
 sudo zerodeckctl upgrade            # stopped service: add --start for an explicit first start
+sudo zerodeckctl upgrade --channel testing   # explicit Testing opt-in
 sudo zerodeckctl status
 sudo zerodeckctl rollback           # offline, retained confirmed generation
+sudo zerodeckctl recover            # reconcile an interrupted activation
+sudo zerodeckctl recover --discard-request  # clear a stale request when nothing is pending
 sudo zerodeckctl unquarantine <generation-digest>  # only after review
 ```
+
+A terminal pre-intent apply failure (stale request, quarantined candidate, missing generation,
+authorization expired/superseded, stopped service without `--start`, or a malformed request)
+removes its own request so later upgrades are not wedged. Transient failures such as a held
+maintenance lock are retried by the apply unit with bounded backoff. If a request remains after an
+interrupted helper, run `sudo systemctl start zerodeck-apply.service` to retry it, or
+`sudo zerodeckctl recover --discard-request` after confirming no apply is running. The updater
+rechecks the persisted selection channel, the signed release channel, the installed version and
+`min_updater` under the exclusive lock; Stable refuses a Testing selection, a downgrade, a reused
+version with a different digest, or a release that requires a newer controller.
 
 ## Drills and staging evidence
 
@@ -278,6 +333,10 @@ Run the following in a fork or staging repository; never use production signing 
   **PENDING**. Do not mark Stable eligible from a VM run alone.
 - **Staging release:** create a draft, build from an exact commit, package by image digest, run the
   package test, upload/verify twice, publish once. Record the asset digests and attestation output.
+- **Stable gate:** dispatch `promote-tuf.yml` with `channel=stable` from `main`. Confirm the
+  `production` environment requested approval, that the job rejected a missing/PENDING evidence
+  record, and that it accepted only the reviewed `deploy/update/evidence/<tag>.md` with
+  `Stable eligible: PASS`. A `channel=testing` dispatch must not require hardware evidence.
 - **Retry:** inject an upload failure (the local `deploy/update/tests/publish.sh` does this), confirm
   the draft remains unpublished, retry the same release ID from the exact release commit, and
   confirm the published digest never changes.

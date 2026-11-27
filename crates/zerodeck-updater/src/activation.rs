@@ -2,13 +2,14 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
+use semver::Version;
 use uuid::Uuid;
 use zerodeck_platform::MaintenanceLock;
 
 use crate::{
-    ACTIVATION_DEADLINE, ApplyKind, ApplyRequest, ApplyRequestStore, Catalog, GenerationId,
-    GenerationLayout, GenerationStore, PendingTransaction, ReleaseIdentity, StateStore,
-    SystemdService, TransactionPhase, UpdateError, UpdateState, verify_ready,
+    ACTIVATION_DEADLINE, ApplyKind, ApplyRequest, ApplyRequestStore, BootRecoveryMarker, Catalog,
+    Channel, GenerationId, GenerationLayout, GenerationStore, PendingTransaction, ReleaseIdentity,
+    StateStore, SystemdService, TransactionPhase, UpdateError, UpdateState, verify_ready,
 };
 
 /// Managed daemon unit controlled by systemd.
@@ -17,6 +18,8 @@ pub const DAEMON_UNIT: &str = "zerodeck.service";
 pub const APPLY_UNIT: &str = "zerodeck-apply.service";
 
 const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// Boot recovery must finish well inside `zerodeck-recovery.service`'s 60 s start timeout.
+const BOOT_LOCK_WAIT: Duration = Duration::from_secs(45);
 const LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// Durable boundaries a fault test can stop the process at.
@@ -106,10 +109,14 @@ fn try_lock(path: std::path::PathBuf, shared: bool) -> Result<MaintenanceLock, U
     }
 }
 
-async fn lock_for_recovery(store: &GenerationStore) -> Result<MaintenanceLock, UpdateError> {
+async fn lock_for_recovery(
+    store: &GenerationStore,
+    wait: Duration,
+) -> Result<MaintenanceLock, UpdateError> {
     // `ExecStopPost` runs after the apply process exits, but a concurrently exiting process may
-    // still hold the descriptor. Wait rather than steal or skip disk reconciliation.
-    let deadline = Instant::now() + LOCK_WAIT;
+    // still hold the descriptor. Boot recovery can race a long `update` that holds a shared guard.
+    // Wait within the unit's start timeout rather than steal or skip disk reconciliation.
+    let deadline = Instant::now() + wait;
     loop {
         match MaintenanceLock::try_exclusive(&store.lock_path()) {
             Ok(guard) => return Ok(guard),
@@ -129,7 +136,7 @@ async fn lock_for_recovery(store: &GenerationStore) -> Result<MaintenanceLock, U
     }
 }
 
-/// Validates a staged release and writes the single apply request for an upgrade.
+/// Validates a staged Stable release and writes the single apply request for an upgrade.
 ///
 /// No catalog or artifact network access occurs: only the persisted trusted authorization is
 /// consulted. A stopped managed service keeps the candidate staged and reports that `--start`
@@ -139,6 +146,21 @@ pub async fn enqueue_upgrade(
     state: &StateStore,
     service: &SystemdService,
     start: bool,
+) -> Result<UpgradeOutcome, UpdateError> {
+    enqueue_upgrade_with_channel(store, state, service, start, Channel::Stable).await
+}
+
+/// Validates a staged release for the explicitly requested channel.
+///
+/// Testing authorization is never accepted by the Stable entry point. The persisted selection and
+/// the signed release must both match `channel`, and the candidate is rechecked against the live
+/// installed generation and the running updater version under the exclusive lock.
+pub async fn enqueue_upgrade_with_channel(
+    store: &GenerationStore,
+    state: &StateStore,
+    service: &SystemdService,
+    start: bool,
+    channel: Channel,
 ) -> Result<UpgradeOutcome, UpdateError> {
     // Slot mutation is exclusive: two shared holders must never pass the check-then-write
     // sequence and replace each other's request.
@@ -156,6 +178,34 @@ pub async fn enqueue_upgrade(
     let release = catalog
         .persisted_authorization()?
         .ok_or(UpdateError::NoStagedRelease)?;
+    let selection = catalog
+        .persisted_selection()?
+        .ok_or(UpdateError::NoStagedRelease)?;
+    if selection.channel != channel {
+        return Err(UpdateError::SelectionChannelMismatch {
+            selected: selection.channel.as_str(),
+            requested: channel.as_str(),
+        });
+    }
+    if release.channel != selection.channel {
+        return Err(UpdateError::ChannelMismatch {
+            selected: selection.channel.as_str(),
+            release: release.channel.as_str(),
+        });
+    }
+    let updater_version = running_updater_version();
+    if release.min_updater > updater_version {
+        return Err(UpdateError::UpdaterTooOld {
+            required: release.min_updater.clone(),
+            current: updater_version,
+        });
+    }
+    if selection.updater_version > updater_version {
+        return Err(UpdateError::UpdaterTooOld {
+            required: selection.updater_version,
+            current: updater_version,
+        });
+    }
     if persisted.quarantined.contains(&release.digest) {
         return Err(UpdateError::Quarantined(release.digest));
     }
@@ -170,6 +220,22 @@ pub async fn enqueue_upgrade(
     }
 
     let current = store.current_reference()?;
+    if let Some(current) = &current {
+        let installed = store.verify_generation(current)?;
+        if release.version < *installed.release().version() {
+            return Err(UpdateError::DowngradeRejected {
+                installed: installed.release().version().clone(),
+                candidate: release.version.clone(),
+            });
+        }
+        if release.version == *installed.release().version() && current != &release.digest {
+            return Err(UpdateError::VersionConflict {
+                version: release.version.clone(),
+                installed: current.clone(),
+                candidate: release.digest.clone(),
+            });
+        }
+    }
     if current.as_ref() == Some(&release.digest) {
         return Err(UpdateError::AlreadyActive(release.digest));
     }
@@ -185,6 +251,10 @@ pub async fn enqueue_upgrade(
     Ok(UpgradeOutcome::Requested {
         request: Box::new(request),
     })
+}
+
+fn running_updater_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("workspace version is SemVer")
 }
 
 /// Writes the single apply request that restores the retained rollback target offline.
@@ -244,25 +314,119 @@ pub async fn apply_pending_with(
     faults.checkpoint(ActivationCheckpoint::AfterLock)?;
 
     let requests = ApplyRequestStore::for_state(state);
-    let request = requests.read()?;
+    let request = match requests.read() {
+        Ok(request) => request,
+        Err(error) => {
+            // A malformed request would otherwise wedge every later upgrade behind
+            // `RequestPending`. The exclusive lock proves this helper owns the slot.
+            if matches!(error, UpdateError::InvalidApplyRequest(_)) {
+                requests.remove()?;
+            }
+            return Err(error);
+        }
+    };
     request.validate()?;
 
     let mut persisted = state.read()?;
+    let prepared = match prepare_apply(store, catalog, service, &request, &persisted).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if discard_terminal_pre_intent_request(&error) {
+                remove_owned_request(&requests, request.id)?;
+            }
+            return Err(error);
+        }
+    };
+
+    if prepared.offline_rollback {
+        return offline_rollback(
+            store,
+            state,
+            &requests,
+            &request,
+            &mut persisted,
+            prepared.previous_id,
+            faults,
+        );
+    }
+
+    faults.checkpoint(ActivationCheckpoint::BeforeIntent)?;
+    let transaction = PendingTransaction {
+        id: request.id,
+        previous: prepared.previous_id,
+        candidate: request.generation.clone(),
+        phase: TransactionPhase::Prepared,
+        was_running: prepared.was_running,
+        start_attempted: false,
+    };
+    persisted.pending = Some(transaction.clone());
+    persisted.last_result = None;
+    persisted.last_error = None;
+    state.write(&persisted)?;
+    faults.checkpoint(ActivationCheckpoint::AfterIntent)?;
+
+    let trial = run_trial(
+        store,
+        state,
+        service,
+        &transaction,
+        &prepared.candidate_identity,
+        prepared.was_running,
+        faults,
+    )
+    .await;
+    match trial {
+        Ok(()) => finish_success(store, state, &requests, &transaction),
+        Err(trial_error) => {
+            if matches!(trial_error.error, UpdateError::SimulatedCrash(_)) {
+                return Err(trial_error.error);
+            }
+            reconcile_failure(
+                store,
+                state,
+                service,
+                &requests,
+                &transaction,
+                prepared.previous.as_ref(),
+                trial_error.start_attempted,
+                trial_error.error,
+                faults,
+            )
+            .await
+        }
+    }
+}
+
+struct PreparedApply {
+    previous: Option<GenerationLayout>,
+    previous_id: Option<GenerationId>,
+    candidate_identity: ReleaseIdentity,
+    was_running: bool,
+    offline_rollback: bool,
+}
+
+async fn prepare_apply(
+    store: &GenerationStore,
+    catalog: &Catalog,
+    service: &SystemdService,
+    request: &ApplyRequest,
+    persisted: &UpdateState,
+) -> Result<PreparedApply, UpdateError> {
     if persisted.pending.is_some() {
         return Err(UpdateError::DuplicateTransaction);
     }
     if persisted.quarantined.contains(&request.generation) {
-        return Err(UpdateError::Quarantined(request.generation));
+        return Err(UpdateError::Quarantined(request.generation.clone()));
     }
     let active = store.current_reference()?;
     if active != request.expected_active {
         return Err(UpdateError::StaleRequest {
-            expected: request.expected_active,
+            expected: request.expected_active.clone(),
             found: active,
         });
     }
     if active.as_ref() == Some(&request.generation) {
-        return Err(UpdateError::AlreadyActive(request.generation));
+        return Err(UpdateError::AlreadyActive(request.generation.clone()));
     }
 
     let candidate = store.verify_generation(&request.generation)?;
@@ -301,67 +465,41 @@ pub async fn apply_pending_with(
     }
 
     let previous = active
+        .as_ref()
         .filter(|generation| !persisted.quarantined.contains(generation))
-        .and_then(|generation| store.verify_generation(&generation).ok());
+        .and_then(|generation| store.verify_generation(generation).ok());
     let previous_id = previous.as_ref().map(generation_from_layout).transpose()?;
 
-    if !was_running && !request.start_service {
-        return offline_rollback(
-            store,
-            state,
-            &requests,
-            &request,
-            &mut persisted,
-            previous_id,
-            faults,
-        );
-    }
-
-    faults.checkpoint(ActivationCheckpoint::BeforeIntent)?;
-    let transaction = PendingTransaction {
-        id: request.id,
-        previous: previous_id,
-        candidate: request.generation.clone(),
-        phase: TransactionPhase::Prepared,
+    Ok(PreparedApply {
+        previous,
+        previous_id,
+        candidate_identity,
         was_running,
-        start_attempted: false,
-    };
-    persisted.pending = Some(transaction.clone());
-    persisted.last_result = None;
-    persisted.last_error = None;
-    state.write(&persisted)?;
-    faults.checkpoint(ActivationCheckpoint::AfterIntent)?;
+        offline_rollback: !was_running && !request.start_service,
+    })
+}
 
-    let trial = run_trial(
-        store,
-        state,
-        service,
-        &transaction,
-        &candidate_identity,
-        was_running,
-        faults,
+/// Pre-intent failures that can never make progress with the same request must not hold the single
+/// apply-request slot forever. Transient environment failures keep the request for a retry.
+fn discard_terminal_pre_intent_request(error: &UpdateError) -> bool {
+    matches!(
+        error,
+        UpdateError::Quarantined(_)
+            | UpdateError::StaleRequest { .. }
+            | UpdateError::AlreadyActive(_)
+            | UpdateError::RequestKindMismatch
+            | UpdateError::MissingGeneration(_)
+            | UpdateError::CorruptGeneration(_)
+            | UpdateError::InvalidApplyRequest(_)
+            | UpdateError::ReleaseNotAuthorized { .. }
+            | UpdateError::ReleaseSuperseded { .. }
+            | UpdateError::AuthorizationExpired { .. }
+            | UpdateError::ClockRollback { .. }
+            | UpdateError::CatalogNotVerified
+            | UpdateError::CatalogNotLoaded
+            | UpdateError::NoStagedRelease
+            | UpdateError::StartRequired
     )
-    .await;
-    match trial {
-        Ok(()) => finish_success(store, state, &requests, &transaction),
-        Err(trial_error) => {
-            if matches!(trial_error.error, UpdateError::SimulatedCrash(_)) {
-                return Err(trial_error.error);
-            }
-            reconcile_failure(
-                store,
-                state,
-                service,
-                &requests,
-                &transaction,
-                previous.as_ref(),
-                trial_error.start_attempted,
-                trial_error.error,
-                faults,
-            )
-            .await
-        }
-    }
 }
 
 fn offline_rollback(
@@ -409,6 +547,7 @@ fn offline_rollback(
     ));
     confirmed.last_error = None;
     state.write(&confirmed)?;
+    store.gc(&confirmed, &staged_generations(store))?;
     Ok(())
 }
 
@@ -428,6 +567,11 @@ async fn run_trial(
 ) -> Result<(), TrialError> {
     let mut start_attempted = false;
     let outcome = async {
+        // Capture the pre-activation systemd invocation before stopping. Capturing it after the
+        // switch compared the new invocation with an already-empty baseline, so an old process
+        // answering `/readyz` could pass. `ready_once` now also requires an active unit, a main
+        // PID, and a matching `INVOCATION_ID`.
+        service.begin_activation().await?;
         if was_running {
             service.stop().await?;
         }
@@ -438,7 +582,6 @@ async fn run_trial(
         write_phase(state, transaction.id, TransactionPhase::Switched)?;
         faults.checkpoint(ActivationCheckpoint::AfterSwitch)?;
 
-        service.begin_activation().await?;
         write_start_attempted(state, transaction.id)?;
         start_attempted = true;
         service.start().await?;
@@ -479,7 +622,18 @@ fn finish_success(
     confirmed.last_result = Some(format!("confirmed {}", transaction.candidate));
     confirmed.last_error = None;
     state.write(&confirmed)?;
+    // Housekeeping runs under the exclusive guard the caller already holds. `gc` itself keeps
+    // `current`, the confirmed and rollback generations, and any authorized staged candidate.
+    store.gc(&confirmed, &staged_generations(store))?;
     Ok(())
+}
+
+fn staged_generations(store: &GenerationStore) -> Vec<GenerationId> {
+    Catalog::open_offline(store.root())
+        .and_then(|catalog| catalog.persisted_authorization())
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |release| vec![release.digest])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -624,14 +778,20 @@ pub async fn recover_before_boot(
     store: &GenerationStore,
     state: &StateStore,
 ) -> Result<(), UpdateError> {
-    recover_inner(
+    let result = recover_inner(
         store,
         state,
         None,
         RecoveryMode::BeforeBootStart,
         &NoActivationFault,
     )
-    .await
+    .await;
+    // A fully reconciled disk state — including the deliberate "no good generation" stop — lets
+    // the launcher start. Any other error leaves the marker absent so `exec-current` fails closed.
+    if matches!(result, Ok(()) | Err(UpdateError::NoGoodGeneration)) {
+        BootRecoveryMarker::record(store)?;
+    }
+    result
 }
 
 /// Fault-injectable recovery entry point used by tests.
@@ -655,8 +815,8 @@ async fn recover_inner(
     faults: &dyn ActivationFault,
 ) -> Result<(), UpdateError> {
     let _guard = match mode {
-        RecoveryMode::BeforeBootStart => acquire_maintenance_exclusive(store)?,
-        RecoveryMode::AfterApply => lock_for_recovery(store).await?,
+        RecoveryMode::BeforeBootStart => lock_for_recovery(store, BOOT_LOCK_WAIT).await?,
+        RecoveryMode::AfterApply => lock_for_recovery(store, LOCK_WAIT).await?,
     };
     let requests = ApplyRequestStore::for_state(state);
     let mut persisted = state.read()?;
@@ -679,6 +839,7 @@ async fn recover_inner(
         persisted.last_result = Some(format!("confirmed {}", pending.candidate));
         persisted.last_error = None;
         state.write(&persisted)?;
+        store.gc(&persisted, &staged_generations(store))?;
         return Ok(());
     }
 
@@ -703,11 +864,20 @@ async fn recover_inner(
             persisted.last_result = Some(format!(
                 "recovered {previous_id} before boot (service not started)"
             ));
-            persisted.last_error = None;
+            if pending.start_attempted {
+                persisted.quarantine(pending.candidate.clone());
+                persisted.last_error = Some(format!(
+                    "interrupted activation; candidate {} was started and is quarantined",
+                    pending.candidate
+                ));
+            } else {
+                persisted.last_error = None;
+            }
             state.write(&persisted)?;
             remove_owned_request(&requests, pending.id)?;
             persisted.pending = None;
             state.write(&persisted)?;
+            store.gc(&persisted, &staged_generations(store))?;
             Ok(())
         }
         (RecoveryMode::BeforeBootStart, None) => {
@@ -759,11 +929,20 @@ async fn recover_inner(
             }
 
             persisted.last_result = Some(format!("recovered {previous_id}"));
-            persisted.last_error = None;
+            if pending.start_attempted {
+                persisted.quarantine(pending.candidate.clone());
+                persisted.last_error = Some(format!(
+                    "interrupted activation; candidate {} was started and is quarantined",
+                    pending.candidate
+                ));
+            } else {
+                persisted.last_error = None;
+            }
             state.write(&persisted)?;
             remove_owned_request(&requests, pending.id)?;
             persisted.pending = None;
             state.write(&persisted)?;
+            store.gc(&persisted, &staged_generations(store))?;
             Ok(())
         }
         (RecoveryMode::AfterApply, None) => {

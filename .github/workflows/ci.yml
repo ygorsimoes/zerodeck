@@ -151,13 +151,39 @@ jobs:
           just dist ci-${{ github.run_number }}
           just test-release-package "dist/zerodeck-ci-${{ github.run_number }}-linux-x86_64.tar.gz"
           just test-release-package "dist/zerodeck-ci-${{ github.run_number }}-linux-x86_64.managed.tar.gz"
-          generation="$(mktemp -d)"
-          tar -xzf "dist/zerodeck-ci-${{ github.run_number }}-linux-x86_64.managed.tar.gz" -C "${generation}"
-          docker run --rm -v "${generation}:/generation:ro" \
-            -e UNPRIVILEGED_PATH=/homebrew -e PRIVILEGED_PATH=/homebrew -e PYTHONPATH= \
-            --entrypoint /generation/bin/zerodeckd zerodeck:runtime \
-            --managed-generation /generation --check-config
+          just verify-managed-image zerodeck:runtime \
+            "dist/zerodeck-ci-${{ github.run_number }}-linux-x86_64.managed.tar.gz"
           echo "packaged daemon accepted the embedded build identity ${ZERODECK_BUILD_ID}"
+
+  # Non-required VM gate. The harness self-test always runs; the real systemd image run is optional
+  # and exits 77 (treated as a documented skip, never a pass) when repository variables do not
+  # provide an image/SSH key/archives. Configure the variables to exercise the real gate.
+  updater-vm:
+    name: updater-vm
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ZERODECK_VM_IMAGE: ${{ vars.ZERODECK_VM_IMAGE }}
+      ZERODECK_VM_SSH_KEY: ${{ vars.ZERODECK_VM_SSH_KEY }}
+      ZERODECK_VM_MANUAL: ${{ vars.ZERODECK_VM_MANUAL }}
+      ZERODECK_VM_MANAGED: ${{ vars.ZERODECK_VM_MANAGED }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2
+        with:
+          tool: just@1.59.0
+      - name: Harness self-test (fake qemu/ssh)
+        run: just test-updater-vm-selftest
+      - name: Real VM gate (77 is an explicit skip)
+        run: |
+          just _test-updater-vm-ci \
+            "${ZERODECK_VM_IMAGE:-/nonexistent/vm-image}" \
+            "${ZERODECK_VM_SSH_KEY:-/nonexistent/vm-key}" \
+            deck \
+            "${ZERODECK_VM_MANUAL:-/nonexistent/manual.tar.gz}" \
+            "${ZERODECK_VM_MANAGED:-/nonexistent/managed.tar.gz}"
 
   # Root-only tests (`privileged_*`: privilege drop, parent-death signal) in the compose
   # `privileged-test` container (not a required check).

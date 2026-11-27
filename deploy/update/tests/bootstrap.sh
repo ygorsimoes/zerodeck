@@ -56,6 +56,7 @@ run_bootstrap() {
         --controller-root "${base}/usr/local/lib/zerodeck" \
         --systemd-dir "${base}/etc/systemd/system" \
         --config-dir "${base}/etc/zerodeck" \
+        --bin-link "${base}/usr/local/bin/zerodeckctl" \
         --data-dir "${base}/home/deck/homebrew" \
         --systemctl "${systemctl}" \
         --metadata-url "https://updates.example.test/metadata/" \
@@ -271,6 +272,156 @@ expect_failure running-no-start run_bootstrap \
     "${trusted_root}" "${root_sha}" --convert-existing-zerodeck
 [[ "$(fixture_sha256 "${controller}/bin/zerodeckctl")" == "${controller_before}" ]] || {
     echo "running service was silently replaced" >&2; exit 1;
+}
+
+# ── A partial custom-path override is refused before any writes ───────────────────────────────
+read -r root controller units config < <(new_install partial-paths)
+expect_failure partial-paths bash "${repo_root}/deploy/update/bootstrap.sh" \
+    --package "${manual}" --sha256 "${manual_sha}" \
+    --generation "${managed}" --generation-sha256 "${managed_sha}" \
+    --trusted-root "${trusted_root}" --trusted-root-sha256 "${root_sha}" \
+    --root "${root}" \
+    --systemctl "${systemctl}" \
+    --metadata-url "https://updates.example.test/metadata/" \
+    --targets-url "https://updates.example.test/targets/"
+[[ ! -e "${root}" ]] || { echo "partial paths created the update root" >&2; exit 1; }
+
+# ── --start waits for the authenticated readiness identity and then confirms ───────────────────
+start_ready_script="${tmp}/ready-server.py"
+cat >"${start_ready_script}" <<'PY'
+import http.server
+import json
+import sys
+import threading
+
+version, build_id = sys.argv[1:3]
+port_file = sys.argv[3]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/auth/token":
+            body = b"fixture-ready-token"
+        elif self.path == "/readyz":
+            if self.headers.get("X-Decky-Auth") != "fixture-ready-token":
+                self.send_response(403)
+                self.end_headers()
+                return
+            body = json.dumps({
+                "version": version,
+                "build_id": build_id,
+                "python_host_ready": True,
+                "invocation_id": "fixture-invocation",
+            }).encode()
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+ready_port_file="${tmp}/ready-port"
+python3 "${start_ready_script}" "${version}" "${build_id}" "${ready_port_file}" &
+ready_pid=$!
+for _ in {1..100}; do
+    [[ -s "${ready_port_file}" ]] && break
+    sleep 0.05
+done
+[[ -s "${ready_port_file}" ]] || { kill "${ready_pid}" 2>/dev/null || true; echo "readiness fixture did not start" >&2; exit 1; }
+ready_port="$(cat "${ready_port_file}")"
+read -r root controller units config < <(new_install start-success)
+base="$(base_for "${root}")"
+FAKE_ZERODECK_ACTIVE=1
+export FAKE_ZERODECK_ACTIVE
+run_bootstrap "${base}" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" --start \
+    --ready-url "http://127.0.0.1:${ready_port}" >"${tmp}/start-success.log"
+unset FAKE_ZERODECK_ACTIVE
+kill "${ready_pid}" 2>/dev/null || true
+wait "${ready_pid}" 2>/dev/null || true
+[[ -L "${base}/usr/local/bin/zerodeckctl" ]] || {
+    echo "--start did not install the root-owned controller PATH link" >&2; exit 1;
+}
+[[ "$(readlink "${base}/usr/local/bin/zerodeckctl")" == "${controller}/bin/zerodeckctl" ]] || {
+    echo "controller PATH link points at the wrong target" >&2; exit 1;
+}
+python3 - "${root}/state/update.json" "${managed_sha}" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+assert document["last_confirmed"] == sys.argv[2], document
+assert document["pending"] is None, document
+PY
+grep -q "zerodeck.service started" "${tmp}/start-success.log" || {
+    echo "--start did not report a started service" >&2; exit 1;
+}
+
+# ── Inputs are copied and verified before use: swapping the source cannot change the install ────
+# Add a large member so the extraction window is observable, then replace the caller's files as
+# soon as the verified copies are complete. The installation must still come from the copies.
+fixture_blob="${tmp}/large-blob"
+python3 - "${fixture_blob}" <<'PY'
+import os, sys
+with open(sys.argv[1], "wb") as handle:
+    handle.write(os.urandom(16 * 1024 * 1024))
+PY
+swap_assets="${tmp}/swap-assets"
+mkdir -p "${swap_assets}"
+fixture_release_assets "${swap_assets}" "${version}" "${build_id}" 1 >/dev/null
+for archive in "${swap_assets}/zerodeck-v${version}-linux-x86_64.tar.gz" \
+    "${swap_assets}/zerodeck-v${version}-linux-x86_64.managed.tar.gz"; do
+    unpack="${archive}.unpack"
+    mkdir -p "${unpack}"
+    tar -xzf "${archive}" -C "${unpack}"
+    if [[ "${archive}" == *.managed.tar.gz ]]; then
+        cp "${fixture_blob}" "${unpack}/python/blob.bin"
+        tar -C "${unpack}" -czf "${archive}" bin python frontend release.json
+    else
+        cp "${fixture_blob}" "${unpack}/zerodeck-v${version}-linux-x86_64/python/blob.bin"
+        tar -C "${unpack}" -czf "${archive}" "zerodeck-v${version}-linux-x86_64"
+    fi
+    rm -rf "${unpack}"
+done
+swap_manual="${swap_assets}/zerodeck-v${version}-linux-x86_64.tar.gz"
+swap_managed="${swap_assets}/zerodeck-v${version}-linux-x86_64.managed.tar.gz"
+swap_manual_sha="$(fixture_sha256 "${swap_manual}")"
+swap_managed_sha="$(fixture_sha256 "${swap_managed}")"
+read -r root controller units config < <(new_install swap-after-verify)
+base="$(base_for "${root}")"
+run_bootstrap "${base}" "${swap_manual}" "${swap_manual_sha}" "${swap_managed}" \
+    "${swap_managed_sha}" "${trusted_root}" "${root_sha}" >"${tmp}/swap.log" 2>&1 &
+swap_pid=$!
+marker=""
+for _ in {1..2000}; do
+    marker="$(find "${root}" -maxdepth 2 -name '.inputs-verified' -print -quit 2>/dev/null || true)"
+    [[ -n "${marker}" ]] && break
+    sleep 0.005
+done
+if [[ -z "${marker}" ]]; then
+    wait "${swap_pid}" || true
+    echo "bootstrap did not reach the verified-copy marker" >&2
+    cat "${tmp}/swap.log" >&2
+    exit 1
+fi
+printf 'swapped after verification\n' >"${swap_manual}"
+printf 'swapped after verification\n' >"${swap_managed}"
+printf 'not json\n' >"${swap_assets}/trusted-root.json"
+printf 'not json\n' >"${trusted_root}"
+if ! wait "${swap_pid}"; then
+    echo "bootstrap failed after the source was swapped; it re-opened the untrusted path" >&2
+    cat "${tmp}/swap.log" >&2
+    exit 1
+fi
+[[ -f "${root}/generations/${swap_managed_sha}/python/blob.bin" ]] || {
+    echo "install did not use the verified generation copy" >&2; exit 1;
 }
 
 echo "bootstrap tests passed"

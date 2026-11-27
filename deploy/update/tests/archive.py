@@ -368,6 +368,36 @@ def mutate(source: Path, destination: Path, kind: str, mode: str) -> None:
                 members,
                 replacement={name: json.dumps(document, sort_keys=True).encode() + b"\n"},
             )
+        elif kind == "link":
+            prefix = "" if mode == "managed" else next(iter({name.split("/", 1)[0] for name in members})) + "/"
+            copy_members(handle, output, members)
+            info = tarfile.TarInfo(f"{prefix}evil-link")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "/etc/passwd"
+            output.addfile(info)
+        elif kind == "device":
+            prefix = "" if mode == "managed" else next(iter({name.split("/", 1)[0] for name in members})) + "/"
+            copy_members(handle, output, members)
+            info = tarfile.TarInfo(f"{prefix}evil-device")
+            info.type = tarfile.CHRTYPE
+            info.devmajor = 1
+            info.devminor = 3
+            output.addfile(info)
+        elif kind == "duplicate":
+            prefix = "" if mode == "managed" else next(iter({name.split("/", 1)[0] for name in members})) + "/"
+            copy_members(handle, output, members)
+            info = tarfile.TarInfo(f"{prefix}release.json")
+            data = b'{"schema":1,"build_id":"duplicate","version":"0.1.0"}\n'
+            info.size = len(data)
+            info.mode = 0o644
+            output.addfile(info, __import__("io").BytesIO(data))
+        elif kind == "parent":
+            prefix = "" if mode == "managed" else next(iter({name.split("/", 1)[0] for name in members})) + "/"
+            copy_members(handle, output, members)
+            info = tarfile.TarInfo(f"{prefix}../escape")
+            info.size = 0
+            info.mode = 0o644
+            output.addfile(info, __import__("io").BytesIO(b""))
         else:
             fail(f"unknown mutation: {kind}")
     handle.close()

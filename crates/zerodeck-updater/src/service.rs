@@ -51,6 +51,16 @@ pub trait Systemctl: std::fmt::Debug + Send + Sync {
         })
     }
 
+    /// Returns the unit's main PID, or `0` when the unit has no running main process.
+    fn main_pid<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, u32> {
+        Box::pin(async move {
+            Err(UpdateError::SystemctlUnsupported {
+                unit: unit.to_owned(),
+                operation: "main-pid",
+            })
+        })
+    }
+
     /// Stops the unit and waits for it to become inactive.
     fn stop<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, ()> {
         Box::pin(async move {
@@ -107,6 +117,30 @@ impl Systemctl for TokioSystemctl {
                 Some(3 | 4) => Ok(false),
                 _ => Err(systemctl_status_error(unit, "is-active", &output)),
             }
+        })
+    }
+
+    fn main_pid<'a>(&'a self, unit: &'a str) -> SystemctlFuture<'a, u32> {
+        Box::pin(async move {
+            let output = run_systemctl(
+                unit,
+                "main-pid",
+                &["show", "--property=MainPID", "--value"],
+                SYSTEMCTL_TIMEOUT,
+            )
+            .await?;
+            if !output.status.success() {
+                return Err(systemctl_status_error(unit, "main-pid", &output));
+            }
+            let value = String::from_utf8_lossy(&output.stdout);
+            value
+                .trim()
+                .parse::<u32>()
+                .map_err(|error| UpdateError::Systemctl {
+                    unit: unit.to_owned(),
+                    operation: "main-pid",
+                    reason: format!("invalid MainPID `{}`: {error}", value.trim()),
+                })
         })
     }
 
@@ -283,6 +317,12 @@ impl SystemdService {
         let baseline = self
             .baseline()?
             .ok_or_else(|| UpdateError::InvocationBaselineMissing(self.unit.clone()))?;
+        if !self.systemctl.is_active(&self.unit).await? {
+            return Err(UpdateError::ServiceNotRunning(self.unit.clone()));
+        }
+        if self.systemctl.main_pid(&self.unit).await? == 0 {
+            return Err(UpdateError::ServiceNotRunning(self.unit.clone()));
+        }
         let invocation = self.systemctl.invocation_id(&self.unit).await?;
         if invocation.is_empty() {
             return Err(UpdateError::ServiceNotRunning(self.unit.clone()));
@@ -293,6 +333,13 @@ impl SystemdService {
 
         let token = self.auth_token().await?;
         let ready = self.ready_report(&token).await?;
+        if ready.invocation_id != invocation {
+            return Err(UpdateError::ReadinessIdentityMismatch {
+                field: "invocation_id",
+                expected: invocation,
+                found: ready.invocation_id,
+            });
+        }
 
         let version = Version::parse(&ready.version).map_err(|error| {
             UpdateError::InvalidReadyResponse(format!(
@@ -557,6 +604,8 @@ struct ReadyResponse {
     version: String,
     build_id: String,
     python_host_ready: bool,
+    #[serde(default)]
+    invocation_id: String,
 }
 
 /// Verifies that `service` restarted into `expected` and is ready before `deadline`.

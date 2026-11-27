@@ -107,6 +107,14 @@ impl ManagedGeneration {
     pub fn resolve(root: &Path, overrides: &PathOverrides) -> Result<Self> {
         let canonical_root = fs::canonicalize(root)
             .with_context(|| format!("resolve managed generation `{}`", root.display()))?;
+        // Root daemon: reject a generation reachable through a user-writable or symlinked
+        // ancestor. Unprivileged development/test resolution is unchanged.
+        zerodeck_platform::ensure_root_owned_ancestors(&canonical_root).map_err(|violation| {
+            anyhow::anyhow!(
+                "managed generation `{}` is unsafe to run as root: {violation}",
+                canonical_root.display()
+            )
+        })?;
         let metadata = fs::metadata(&canonical_root).with_context(|| {
             format!("inspect managed generation `{}`", canonical_root.display())
         })?;
@@ -369,13 +377,11 @@ mod tests {
 
         let resolution =
             ManagedGeneration::resolve(&root, &PathOverrides::default()).expect("resolve");
-        assert_eq!(
-            resolution.root(),
-            root.canonicalize().expect("canonical generation")
-        );
-        assert_eq!(resolution.binary(), root.join("bin/zerodeckd"));
+        let canonical = root.canonicalize().expect("canonical generation");
+        assert_eq!(resolution.root(), canonical);
+        assert_eq!(resolution.binary(), canonical.join("bin/zerodeckd"));
         assert!(resolution.python_host_path().ends_with("/python"));
-        assert_eq!(resolution.frontend_dir(), root.join("frontend"));
+        assert_eq!(resolution.frontend_dir(), canonical.join("frontend"));
         assert_eq!(resolution.release_version(), env!("CARGO_PKG_VERSION"));
     }
 

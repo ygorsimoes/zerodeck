@@ -162,18 +162,29 @@ impl GenerationStore {
             path: requested.to_path_buf(),
             source,
         })?;
+        // A root daemon reads release files from here. Never accept a root reachable through a
+        // user-writable or symlinked ancestor; unprivileged development runs are exempt.
+        #[cfg(unix)]
+        zerodeck_platform::ensure_root_owned_ancestors(&root)
+            .map_err(|violation| UpdateError::UnsafeRoot(violation.to_string()))?;
 
-        let generations = root.join(GENERATIONS_DIR);
+        let generations_path = root.join(GENERATIONS_DIR);
         if create {
-            fs::create_dir_all(&generations).map_err(|source| UpdateError::Io {
-                path: generations.clone(),
+            fs::create_dir_all(&generations_path).map_err(|source| UpdateError::Io {
+                path: generations_path.clone(),
                 source,
             })?;
         }
-        let generations = fs::canonicalize(&generations).map_err(|source| UpdateError::Io {
-            path: generations,
-            source,
-        })?;
+        // `status` opens an existing root without creating anything. A missing generations
+        // directory is an empty store, not a reason to fail the read-only summary.
+        let generations = if !create && !generations_path.exists() {
+            generations_path
+        } else {
+            fs::canonicalize(&generations_path).map_err(|source| UpdateError::Io {
+                path: generations_path.clone(),
+                source,
+            })?
+        };
         if !generations.starts_with(&root) {
             return Err(UpdateError::PathEscape {
                 path: generations,
@@ -383,8 +394,13 @@ impl GenerationStore {
         })
     }
 
-    /// Deletes generations that are neither confirmed, a rollback target, nor pending.
-    pub fn gc(&self, state: &UpdateState) -> Result<(), UpdateError> {
+    /// Deletes generations that are not confirmed, a rollback target, pending, active, or staged.
+    ///
+    /// Persisted state can lag the active reference after an interrupted switch, so `current` is
+    /// read from disk instead of inferred from `last_confirmed`. `staged` carries an authorized
+    /// candidate that has not been activated yet. Callers must hold the exclusive maintenance
+    /// guard so a concurrent stage cannot race this collection.
+    pub fn gc(&self, state: &UpdateState, staged: &[GenerationId]) -> Result<(), UpdateError> {
         let mut keep = BTreeSet::new();
         if let Some(generation) = &state.last_confirmed {
             keep.insert(generation.clone());
@@ -398,6 +414,10 @@ impl GenerationStore {
             }
             keep.insert(pending.candidate.clone());
         }
+        if let Some(current) = self.current_reference()? {
+            keep.insert(current);
+        }
+        keep.extend(staged.iter().cloned());
 
         let entries = fs::read_dir(&self.generations).map_err(|source| UpdateError::Io {
             path: self.generations.clone(),
@@ -688,7 +708,7 @@ mod tests {
             ..UpdateState::new()
         };
 
-        store.gc(&state).expect("collect stale generations");
+        store.gc(&state, &[]).expect("collect stale generations");
 
         for generation in [&confirmed, &rollback, &pending_previous, &pending_candidate] {
             assert!(
@@ -696,6 +716,39 @@ mod tests {
                 "protected generation {generation} must survive"
             );
         }
+        assert!(!store.generation_dir(&orphan).exists());
+    }
+
+    #[test]
+    fn gc_keeps_the_active_reference_and_staged_candidates() {
+        let dir = TestDir::new("gc-current");
+        let store = GenerationStore::new(&dir.0).expect("open generation store");
+        let confirmed = generation_id('a');
+        let current = generation_id('b');
+        let staged = generation_id('c');
+        let orphan = generation_id('d');
+        for generation in [&confirmed, &current, &staged, &orphan] {
+            fs::create_dir(store.generation_dir(generation)).expect("create generation");
+        }
+        store.switch_to(&current).expect("activate current");
+
+        let state = UpdateState {
+            last_confirmed: Some(confirmed.clone()),
+            ..UpdateState::new()
+        };
+        store
+            .gc(&state, std::slice::from_ref(&staged))
+            .expect("collect stale generations");
+
+        assert!(store.generation_dir(&confirmed).is_dir());
+        assert!(
+            store.generation_dir(&current).is_dir(),
+            "the on-disk active reference must survive a stale state document"
+        );
+        assert!(
+            store.generation_dir(&staged).is_dir(),
+            "an authorized staged candidate must survive"
+        );
         assert!(!store.generation_dir(&orphan).exists());
     }
 }

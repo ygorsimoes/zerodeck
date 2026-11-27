@@ -210,6 +210,28 @@ dist-managed tag image="zerodeck:runtime":
 test-release-package archive:
     just _test-release-package "{{ archive }}"
 
+# Fail closed unless a completed hardware evidence record authorizes this Stable release
+[group('runtime')]
+verify-stable-evidence tag build_id sha256:
+    bash deploy/update/verify-stable-evidence.sh \
+        --tag "{{ tag }}" --version "$(printf '%s' '{{ tag }}' | sed 's/^v//')" \
+        --build-id "{{ build_id }}" --sha256 "{{ sha256 }}" \
+        --evidence "deploy/update/evidence/{{ tag }}.md"
+
+# Unpack a managed archive and require the packaged daemon to accept its embedded identity and
+# importable Python worker host
+[group('runtime')]
+verify-managed-image image archive:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    generation="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-managed.XXXXXX")"
+    trap 'rm -rf "${generation}"' EXIT
+    tar -xzf "{{ archive }}" -C "${generation}"
+    docker run --rm --platform linux/amd64 -v "${generation}:/generation:ro" \
+        -e UNPRIVILEGED_PATH=/homebrew -e PRIVILEGED_PATH=/homebrew -e PYTHONPATH= \
+        --entrypoint /generation/bin/zerodeckd "{{ image }}" \
+        --managed-generation /generation --check-config
+
 [private]
 _dist mode tag image:
     bash deploy/update/package-release.sh "{{ mode }}" "{{ tag }}" "{{ image }}" dist
@@ -260,7 +282,25 @@ _release-scripts:
     bash deploy/update/tests/bootstrap.sh
     bash deploy/update/tests/publish.sh
     bash deploy/update/tests/promotion.sh
+    bash deploy/update/tests/stable-gate.sh
     just _test-updater-vm-selftest
+
+# VM gate for CI: exit 0 when the environment cannot provide qemu/image (77), fail otherwise.
+[private]
+_test-updater-vm-ci image ssh_key ssh_user manual managed:
+    #!/usr/bin/env bash
+    set +e
+    just _test-updater-vm "{{ image }}" "{{ ssh_key }}" "{{ ssh_user }}" "{{ manual }}" "{{ managed }}"
+    status=$?
+    set -e
+    if [[ "${status}" -eq 0 ]]; then
+        exit 0
+    fi
+    if [[ "${status}" -eq 77 ]]; then
+        echo "updater-vm: skipped (77): no qemu/image on this runner"
+        exit 0
+    fi
+    exit "${status}"
 
 [private]
 _test-updater-vm image ssh_key ssh_user manual managed candidate:

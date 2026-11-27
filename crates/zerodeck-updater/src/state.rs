@@ -2,11 +2,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zerodeck_platform::atomic_write;
 
-use crate::{AuthorizedRelease, GenerationId, UpdateError};
+use crate::{AuthorizedRelease, Channel, GenerationId, UpdateError};
 
 /// Current on-disk [`UpdateState`] schema version.
 pub const UPDATE_STATE_SCHEMA: u32 = 1;
@@ -199,6 +200,28 @@ pub struct CatalogState {
     /// The release selected from the freshest trusted metadata, if any.
     #[serde(default)]
     pub authorization: Option<AuthorizedRelease>,
+    /// The selection inputs that produced `authorization`.
+    #[serde(default)]
+    pub selection: Option<SelectionRecord>,
+}
+
+/// Persisted selection policy for the currently authorized release.
+///
+/// `enqueue_upgrade` rechecks the signed channel, the running updater version, and the installed
+/// generation against this record. A Stable client therefore cannot silently activate a Testing
+/// selection, a downgrade, or a release that requires a newer controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionRecord {
+    /// Channel the operator explicitly selected for this authorization.
+    pub channel: Channel,
+    /// Updater version that made the selection.
+    pub updater_version: Version,
+    /// Installed version observed at selection time.
+    #[serde(default)]
+    pub installed_version: Option<Version>,
+    /// Installed generation digest observed at selection time.
+    #[serde(default)]
+    pub installed_digest: Option<GenerationId>,
 }
 
 impl CatalogState {
@@ -210,6 +233,7 @@ impl CatalogState {
             last_verified_at: None,
             expires_at: None,
             authorization: None,
+            selection: None,
         }
     }
 }

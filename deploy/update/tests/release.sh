@@ -76,8 +76,8 @@ fi
 negative_dir="${tmp}/negative"
 mkdir -p "${negative_dir}"
 case "${mode}" in
-    managed) mutations=(missing-release missing-component mixed-wrapper build-id-mismatch) ;;
-    manual) mutations=(missing-release missing-controller missing-component build-id-mismatch) ;;
+    managed) mutations=(missing-release missing-component mixed-wrapper build-id-mismatch link device duplicate parent) ;;
+    manual) mutations=(missing-release missing-controller missing-component build-id-mismatch link device duplicate parent) ;;
 esac
 
 for mutation in "${mutations[@]}"; do

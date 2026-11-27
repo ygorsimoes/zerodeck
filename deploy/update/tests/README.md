@@ -148,7 +148,10 @@ byte-identical afterwards. It is part of `just check`/`just ci` through `_releas
 
 ## Steam Deck checklist
 
-The VM gate is necessary but not sufficient for Stable. The exact Steam/SteamOS/build identity,
+The VM gate is necessary but not sufficient for Stable. `deploy/update/tests/stable-gate.sh`
+(part of `just check`) proves the promotion gate rejects a PENDING, mismatched or unsigned-off
+evidence record and accepts only an exact, complete `Stable eligible: PASS` record. The exact
+Steam/SteamOS/build identity,
 filesystems, invocation identity, on-device update and offline rollback, SteamOS-update survival
 with a read-only root, unchanged plugin inventory for a loader-only upgrade, peak RSS, bytes,
 temporary disk and stop-to-ready/stop-to-recovered timings must be recorded from observed hardware

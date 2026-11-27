@@ -398,6 +398,9 @@ async fn run_daemon(
         version,
         build_id,
         python_host_ready: python_host_missing.is_none(),
+        // systemd sets this for every service process and the updater compares it with the unit's
+        // current `InvocationID` before accepting `/readyz` as the freshly started daemon.
+        invocation_id: std::env::var("INVOCATION_ID").unwrap_or_default(),
         ..ServerConfig::default()
     };
     let http_client = OutboundHttpPolicy::production()
@@ -513,6 +516,12 @@ async fn main() -> Result<()> {
     if cli.check_config {
         let addrs = resolve(&cli.host, cli.port).await?;
         check_bind_policy(&addrs, cli.allow_non_loopback)?;
+        // A managed generation is only installable if its bundled worker host imports. Check the
+        // same resolved path the daemon will hand to every plugin worker.
+        let (python_host, _frontend, _version, _build_id) = resolve_loader_paths(managed.as_ref());
+        if let Some(reason) = probe_python_host(&python_host).await {
+            bail!("configuration check failed: {reason}");
+        }
         return Ok(());
     }
 

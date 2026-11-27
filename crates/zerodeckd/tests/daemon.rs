@@ -1137,6 +1137,7 @@ async fn managed_daemon_uses_one_generation() {
                 "version": env!("CARGO_PKG_VERSION"),
                 "build_id": embedded_build_id(),
                 "python_host_ready": true,
+                "invocation_id": "",
             })
         );
         assert!(!body.contains("generations"), "{body}");

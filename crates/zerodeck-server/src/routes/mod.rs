@@ -137,6 +137,7 @@ async fn handle_readyz(State(state): State<AppState>) -> Json<Value> {
         "version": &config.version,
         "build_id": &config.build_id,
         "python_host_ready": config.python_host_ready,
+        "invocation_id": &config.invocation_id,
     }))
 }
 

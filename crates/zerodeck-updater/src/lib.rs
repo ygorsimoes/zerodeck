@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod activation;
+mod boot;
 mod bootstrap;
 mod catalog;
 mod generation;
@@ -22,9 +23,11 @@ use zerodeck_platform::PlatformError;
 pub use activation::{
     APPLY_UNIT, ActivationCheckpoint, ActivationFault, DAEMON_UNIT, RecoveryMode, UpgradeOutcome,
     acquire_maintenance_exclusive, acquire_maintenance_shared, apply_pending, apply_pending_with,
-    enqueue_rollback, enqueue_upgrade, recover, recover_before_boot, recover_with,
+    enqueue_rollback, enqueue_upgrade, enqueue_upgrade_with_channel, recover, recover_before_boot,
+    recover_with,
 };
-pub use bootstrap::{BootstrapOutcome, bootstrap_generation};
+pub use boot::BootRecoveryMarker;
+pub use bootstrap::{BootstrapOutcome, bootstrap_generation, confirm_bootstrap, prepare_bootstrap};
 pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
 pub use generation::{GenerationId, GenerationLayout, GenerationRelease, GenerationStore};
 pub use request::{APPLY_REQUEST_SCHEMA, ApplyKind, ApplyRequest, ApplyRequestStore};
@@ -34,8 +37,8 @@ pub use service::{
 };
 pub use stage::{StageFault, StageLimits, stage_release, stage_release_with};
 pub use state::{
-    CATALOG_STATE_SCHEMA, CatalogState, CatalogStateStore, PendingTransaction, StateStore,
-    TransactionPhase, UPDATE_STATE_SCHEMA, UpdateState,
+    CATALOG_STATE_SCHEMA, CatalogState, CatalogStateStore, PendingTransaction, SelectionRecord,
+    StateStore, TransactionPhase, UPDATE_STATE_SCHEMA, UpdateState,
 };
 
 /// Errors returned by durable update state and generation operations.
@@ -56,6 +59,46 @@ pub enum UpdateError {
     /// A path escapes the owned update root.
     #[error("path `{path}` escapes the owned update root `{root}`")]
     PathEscape { path: PathBuf, root: PathBuf },
+
+    /// The update root is reachable through a user-writable or symlinked ancestor.
+    #[error("unsafe update root: {0}")]
+    UnsafeRoot(String),
+
+    /// The selected release does not belong to the channel that was persisted for it.
+    #[error(
+        "release channel `{release}` does not match the persisted selection channel `{selected}`"
+    )]
+    ChannelMismatch {
+        selected: &'static str,
+        release: &'static str,
+    },
+
+    /// The requested channel is not the channel under which the candidate was selected.
+    #[error(
+        "the staged release was selected for `{selected}` but this request is for `{requested}`; \
+         rerun `update --channel {requested}` to select it explicitly"
+    )]
+    SelectionChannelMismatch {
+        selected: &'static str,
+        requested: &'static str,
+    },
+
+    /// The candidate would downgrade the active generation.
+    #[error("candidate {candidate} is older than the installed generation {installed}")]
+    DowngradeRejected {
+        installed: Version,
+        candidate: Version,
+    },
+
+    /// The running updater is older than the signed or selected minimum.
+    #[error("updater {current} is older than the required {required}")]
+    UpdaterTooOld { required: Version, current: Version },
+
+    /// Boot recovery has not completed for the current boot.
+    #[error(
+        "boot recovery has not completed for this boot; run `zerodeckctl recover-boot` before starting the daemon"
+    )]
+    BootRecoveryRequired,
 
     /// An atomic filesystem operation failed.
     #[error(transparent)]

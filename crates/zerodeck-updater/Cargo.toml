@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+ed25519-dalek.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
@@ -29,7 +30,6 @@ tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
-tough.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["serde"] }
 zerodeck-core.workspace = true
@@ -37,5 +37,4 @@ zerodeck-platform.workspace = true
 zerodeck-protocol.workspace = true
 
 [dev-dependencies]
-aws-lc-rs = "1.19.0"
 axum.workspace = true

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -168,6 +169,9 @@ pub struct CatalogState {
     /// The selection inputs that produced `authorization`.
     #[serde(default)]
     pub selection: Option<SelectionRecord>,
+    /// Highest verified channel `sequence` per channel; an older document is a replay.
+    #[serde(default)]
+    pub channel_sequences: BTreeMap<String, u64>,
 }
 
 /// Persisted selection policy for the currently authorized release.
@@ -199,6 +203,7 @@ impl CatalogState {
             expires_at: None,
             authorization: None,
             selection: None,
+            channel_sequences: BTreeMap::new(),
         }
     }
 }

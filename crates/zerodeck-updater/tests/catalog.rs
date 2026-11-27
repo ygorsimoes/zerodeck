@@ -1,34 +1,19 @@
-//! Signed TUF catalog selection, expiry, clock-floor and root-rotation tests.
+//! Signed release-channel verification, replay/expiry/clock protection and selection tests.
 
 use std::collections::HashMap;
 use std::fs;
-use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::Ed25519KeyPair;
+use ed25519_dalek::{Signer, SigningKey};
 use semver::Version;
-use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use tough::editor::signed::SignedRole;
-use tough::key_source::{KeySource, LocalKeySource};
-use tough::schema::decoded::{Decoded, Hex};
-use tough::schema::key::Key;
-use tough::schema::{
-    Hashes, KeyHolder, Metafile, Role, RoleKeys, RoleType, Root, Signature, Snapshot, Target,
-    Targets, Timestamp,
-};
-use tough::sign::Sign;
-use tough::{FilesystemTransport, TargetName};
 use url::Url;
-use zerodeck_updater::{Catalog, Channel, GenerationId, SelectionPolicy, UpdateError};
-
-const FAR_FUTURE: &str = "9999-01-01T00:00:00Z";
-const EXPIRED: &str = "2020-01-01T00:00:00Z";
-const AFTER_EXPIRY: u64 = 253_500_000_000;
+use zerodeck_updater::{
+    Catalog, CatalogState, CatalogStateStore, Channel, ChannelSource, GenerationId,
+    SelectionPolicy, UpdateError,
+};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -52,763 +37,403 @@ impl Drop for TestDir {
     }
 }
 
-struct TestKey {
-    path: PathBuf,
-    key: Key,
-    id: Decoded<Hex>,
-}
+/// Serves channel files from memory, keyed by URL.
+#[derive(Default)]
+struct MemorySource(HashMap<String, Vec<u8>>);
 
-impl TestKey {
-    fn generate(dir: &Path, name: &str) -> Self {
-        let document = Ed25519KeyPair::generate_pkcs8v1(&SystemRandom::new())
-            .expect("generate ed25519 test key");
-        let path = dir.join(name);
-        fs::write(&path, document.as_ref()).expect("write test key");
-        let pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).expect("parse generated test key");
-        let key = pair.tuf_key();
-        let id = key.key_id().expect("compute test key id");
-        Self { path, key, id }
-    }
-
-    fn source(&self) -> Box<dyn KeySource> {
-        Box::new(LocalKeySource {
-            path: self.path.clone(),
-        })
+impl ChannelSource for MemorySource {
+    async fn fetch(&self, url: &Url) -> Result<Vec<u8>, UpdateError> {
+        self.0
+            .get(url.as_str())
+            .cloned()
+            .ok_or_else(|| UpdateError::ChannelFetch {
+                url: url.to_string(),
+                reason: "not found".to_owned(),
+            })
     }
 }
 
-fn role_keys(keys: &[&TestKey], threshold: u64) -> RoleKeys {
-    RoleKeys {
-        keyids: keys.iter().map(|key| key.id.clone()).collect(),
-        threshold: NonZeroU64::new(threshold).expect("nonzero threshold"),
-        _extra: HashMap::new(),
-    }
+const CHANNELS: &str = "https://channels.example.test/";
+const RELEASES: &str = "https://releases.example.test/";
+
+fn signing_key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
 }
 
-fn root_metadata(
-    version: u64,
-    expires: &str,
-    keys: &[&TestKey],
-    root_keys: &[&TestKey],
-    metadata_keys: &[&TestKey],
-) -> Root {
-    let mut key_map = HashMap::new();
-    for key in keys {
-        key_map.insert(key.id.clone(), key.key.clone());
-    }
-    let mut roles = HashMap::new();
-    let root_threshold = u64::try_from(root_keys.len()).expect("root key count");
-    roles.insert(RoleType::Root, role_keys(root_keys, root_threshold));
-    for role in [RoleType::Snapshot, RoleType::Targets, RoleType::Timestamp] {
-        roles.insert(role, role_keys(metadata_keys, 1));
-    }
-    Root {
-        spec_version: "1.0.0".to_owned(),
-        consistent_snapshot: false,
-        version: NonZeroU64::new(version).expect("nonzero root version"),
-        expires: expires.parse().expect("parse root expiry"),
-        keys: key_map,
-        roles,
-        _extra: HashMap::new(),
-    }
+fn keys_document(keys: &[&SigningKey]) -> Vec<u8> {
+    let keys: Vec<String> = keys
+        .iter()
+        .map(|key| hex::encode(key.verifying_key().to_bytes()))
+        .collect();
+    serde_json::to_vec(&json!({ "keys": keys })).expect("serialize keys")
 }
 
-async fn sign_role<T>(role: T, root: &Root, keys: &[&TestKey]) -> SignedRole<T>
-where
-    T: Role + Serialize,
-{
-    let sources: Vec<Box<dyn KeySource>> = keys.iter().map(|key| key.source()).collect();
-    SignedRole::new(
-        role,
-        &KeyHolder::Root(root.clone()),
-        &sources,
-        &SystemRandom::new(),
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
+}
+
+fn digest(fill: char) -> String {
+    std::iter::repeat_n(fill, 64).collect()
+}
+
+fn document(channel: &str, version: &str, sequence: u64, fill: char) -> Value {
+    json!({
+        "schema": 1,
+        "channel": channel,
+        "sequence": sequence,
+        "expires": now() + 86_400,
+        "version": version,
+        "digest": digest(fill),
+        "size": 1234,
+        "build_id": format!("build-{version}"),
+        "min_updater": "0.1.0",
+        "target": format!("v{version}/zerodeck-v{version}-linux-x86_64.managed.tar.gz"),
+    })
+}
+
+fn publish(source: &mut MemorySource, channel: &str, document: &Value, key: &SigningKey) {
+    let bytes = serde_json::to_vec_pretty(document).expect("serialize document");
+    let signature = hex::encode(key.sign(&bytes).to_bytes());
+    source
+        .0
+        .insert(format!("{CHANNELS}{channel}.json"), bytes);
+    source
+        .0
+        .insert(format!("{CHANNELS}{channel}.json.sig"), signature.into_bytes());
+}
+
+async fn load(
+    root: &TestDir,
+    source: &MemorySource,
+    keys: &[u8],
+    channel: Channel,
+) -> Result<Catalog, UpdateError> {
+    Catalog::load_with_source(
+        &root.0,
+        Url::parse(CHANNELS).expect("channels url"),
+        Url::parse(RELEASES).expect("releases url"),
+        keys,
+        channel,
+        source,
     )
     .await
-    .expect("sign test metadata")
 }
 
-#[derive(Clone)]
-struct TargetSpec {
-    arch: &'static str,
-    version: Version,
-    channel: &'static str,
-    build_id: String,
-    min_updater: Version,
-    bytes: Vec<u8>,
+fn policy() -> SelectionPolicy {
+    SelectionPolicy::new(Version::parse("0.1.0").expect("updater version"))
 }
 
-impl TargetSpec {
-    fn new(
-        arch: &'static str,
-        version: &str,
-        channel: &'static str,
-        build_id: &str,
-        min_updater: &str,
-        seed: &str,
-    ) -> Self {
-        Self {
-            arch,
-            version: Version::parse(version).expect("parse target version"),
-            channel,
-            build_id: build_id.to_owned(),
-            min_updater: Version::parse(min_updater).expect("parse minimum updater version"),
-            bytes: format!("archive:{arch}:{version}:{build_id}:{seed}").into_bytes(),
-        }
-    }
-
-    fn digest(&self) -> GenerationId {
-        GenerationId::new(hex::encode(Sha256::digest(&self.bytes))).expect("valid target digest")
-    }
-
-    fn name(&self) -> String {
-        format!("{}/zerodeck-{}.tar.gz", self.arch, self.version)
-    }
-
-    fn target(&self) -> (TargetName, Target) {
-        let custom = HashMap::from([
-            ("channel".to_owned(), json!(self.channel)),
-            (
-                "version".to_owned(),
-                Value::String(self.version.to_string()),
-            ),
-            ("build_id".to_owned(), json!(self.build_id)),
-            (
-                "min_updater".to_owned(),
-                Value::String(self.min_updater.to_string()),
-            ),
-        ]);
-        let target = Target {
-            length: u64::try_from(self.bytes.len()).expect("target length"),
-            hashes: Hashes {
-                sha256: Sha256::digest(&self.bytes).to_vec().into(),
-                _extra: HashMap::new(),
-            },
-            custom,
-            _extra: HashMap::new(),
-        };
-        (
-            TargetName::new(self.name()).expect("valid target name"),
-            target,
-        )
-    }
-}
-
-struct PublishSpec<'a> {
-    root_version: u64,
-    metadata_version: u64,
-    expires: &'a str,
-    targets: Vec<TargetSpec>,
-}
-
-struct Fixture {
-    _dir: TestDir,
-    metadata: PathBuf,
-    targets: PathBuf,
-    old_key: TestKey,
-    new_key: TestKey,
-    trusted_root: Vec<u8>,
-}
-
-impl Fixture {
-    async fn new() -> Self {
-        let dir = TestDir::new("fixture");
-        let key_dir = dir.0.join("keys");
-        fs::create_dir(&key_dir).expect("create key dir");
-        let old_key = TestKey::generate(&key_dir, "old.der");
-        let new_key = TestKey::generate(&key_dir, "new.der");
-        let metadata = dir.0.join("metadata");
-        let targets = dir.0.join("targets");
-        fs::create_dir(&metadata).expect("create metadata dir");
-        fs::create_dir(&targets).expect("create targets dir");
-
-        let root = root_metadata(1, FAR_FUTURE, &[&old_key], &[&old_key], &[&old_key]);
-        let signed_root = sign_role(root.clone(), &root, &[&old_key]).await;
-        signed_root
-            .write(&metadata, false)
-            .await
-            .expect("write trusted root");
-        let trusted_root = fs::read(metadata.join("1.root.json")).expect("read trusted root");
-
-        Self {
-            _dir: dir,
-            metadata,
-            targets,
-            old_key,
-            new_key,
-            trusted_root,
-        }
-    }
-
-    fn metadata_url(&self) -> Url {
-        Url::from_directory_path(&self.metadata).expect("metadata base url")
-    }
-
-    fn targets_url(&self) -> Url {
-        Url::from_directory_path(&self.targets).expect("targets base url")
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn publish(&self, spec: &PublishSpec<'_>) {
-        let (root, root_signers, metadata_signers) = if spec.root_version == 1 {
-            (
-                root_metadata(
-                    1,
-                    FAR_FUTURE,
-                    &[&self.old_key],
-                    &[&self.old_key],
-                    &[&self.old_key],
-                ),
-                vec![&self.old_key],
-                vec![&self.old_key],
-            )
-        } else {
-            (
-                root_metadata(
-                    2,
-                    FAR_FUTURE,
-                    &[&self.new_key],
-                    &[&self.new_key],
-                    &[&self.new_key],
-                ),
-                vec![&self.new_key],
-                vec![&self.new_key],
-            )
-        };
-
-        let mut signed_root = sign_role(root.clone(), &root, &root_signers).await;
-        if spec.root_version != 1 {
-            let old_pair =
-                Ed25519KeyPair::from_pkcs8(&fs::read(&self.old_key.path).expect("read old key"))
-                    .expect("parse old key");
-            let canonical = root.canonical_form().expect("canonical root form");
-            let signature = old_pair.sign(&canonical);
-            signed_root = signed_root
-                .add_old_signatures(vec![Signature {
-                    keyid: self.old_key.id.clone(),
-                    sig: signature.as_ref().to_vec().into(),
-                }])
-                .expect("cross-sign rotated root with the previous key");
-        }
-        signed_root
-            .write(&self.metadata, false)
-            .await
-            .expect("write root metadata");
-
-        let mut targets = HashMap::new();
-        for target in &spec.targets {
-            let (name, target) = target.target();
-            targets.insert(name, target);
-        }
-        let metadata_version =
-            NonZeroU64::new(spec.metadata_version).expect("nonzero metadata version");
-        let targets_role = Targets {
-            spec_version: "1.0.0".to_owned(),
-            version: metadata_version,
-            expires: spec.expires.parse().expect("parse targets expiry"),
-            targets,
-            delegations: None,
-            _extra: HashMap::new(),
-        };
-        let signed_targets = sign_role(targets_role, &root, &metadata_signers).await;
-
-        let snapshot_role = Snapshot {
-            spec_version: "1.0.0".to_owned(),
-            version: metadata_version,
-            expires: spec.expires.parse().expect("parse snapshot expiry"),
-            meta: HashMap::from([(
-                "targets.json".to_owned(),
-                Metafile {
-                    length: Some(*signed_targets.length()),
-                    hashes: Some(Hashes {
-                        sha256: signed_targets.sha256().to_vec().into(),
-                        _extra: HashMap::new(),
-                    }),
-                    version: metadata_version,
-                    _extra: HashMap::new(),
-                },
-            )]),
-            _extra: HashMap::new(),
-        };
-        let signed_snapshot = sign_role(snapshot_role, &root, &metadata_signers).await;
-
-        let timestamp_role = Timestamp {
-            spec_version: "1.0.0".to_owned(),
-            version: metadata_version,
-            expires: spec.expires.parse().expect("parse timestamp expiry"),
-            meta: HashMap::from([(
-                "snapshot.json".to_owned(),
-                Metafile {
-                    length: Some(*signed_snapshot.length()),
-                    hashes: Some(Hashes {
-                        sha256: signed_snapshot.sha256().to_vec().into(),
-                        _extra: HashMap::new(),
-                    }),
-                    version: metadata_version,
-                    _extra: HashMap::new(),
-                },
-            )]),
-            _extra: HashMap::new(),
-        };
-        let signed_timestamp = sign_role(timestamp_role, &root, &metadata_signers).await;
-
-        signed_targets
-            .write(&self.metadata, false)
-            .await
-            .expect("write targets metadata");
-        signed_snapshot
-            .write(&self.metadata, false)
-            .await
-            .expect("write snapshot metadata");
-        signed_timestamp
-            .write(&self.metadata, false)
-            .await
-            .expect("write timestamp metadata");
-    }
-}
-
-async fn load_catalog(fixture: &Fixture, update_root: &Path) -> Catalog {
-    Catalog::load_with_transport(
-        update_root,
-        fixture.metadata_url(),
-        fixture.targets_url(),
-        &fixture.trusted_root,
-        FilesystemTransport,
-    )
-    .await
-    .expect("load signed catalog")
-}
-
-fn after_epoch(seconds: u64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(seconds)
-}
-
-fn generation_id(fill: char) -> GenerationId {
-    GenerationId::new(fill.to_string().repeat(64)).expect("valid generation id")
+fn generation(fill: char) -> GenerationId {
+    GenerationId::new(digest(fill)).expect("valid digest")
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn catalog_rejects_wrong_arch_floor_version_reuse_and_expiry() {
-    let fixture = Fixture::new().await;
-    let update_root = TestDir::new("update-root");
+async fn a_signed_channel_authorizes_exactly_its_release() {
+    let key = signing_key(1);
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    let root = TestDir::new("ok");
 
-    let stable_012 = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.2",
-        "stable",
-        "build-0.1.2",
-        "0.1.0",
-        "stable-012",
-    );
-    let stable_013_floor = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.3",
-        "stable",
-        "build-0.1.3",
-        "9.0.0",
-        "stable-013-floor",
-    );
-    let prerelease_014 = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.4-beta.1",
-        "stable",
-        "build-0.1.4-beta.1",
-        "0.1.0",
-        "stable-014-beta",
-    );
-    let testing_020 = TargetSpec::new(
-        "linux-x86_64",
-        "0.2.0",
-        "testing",
-        "build-0.2.0",
-        "0.1.0",
-        "testing-020",
-    );
-    let wrong_arch_900 = TargetSpec::new(
-        "linux-aarch64",
-        "9.0.0",
-        "stable",
-        "build-9.0.0",
-        "0.1.0",
-        "wrong-arch",
-    );
+    let catalog = load(&root, &source, &keys_document(&[&key]), Channel::Stable)
+        .await
+        .expect("load signed channel");
+    let release = catalog
+        .candidate(&policy())
+        .expect("select")
+        .expect("a release is available");
 
-    fixture
-        .publish(&PublishSpec {
-            root_version: 1,
-            metadata_version: 1,
-            expires: FAR_FUTURE,
-            targets: vec![
-                stable_012.clone(),
-                stable_013_floor,
-                prerelease_014,
-                testing_020,
-                wrong_arch_900,
-            ],
-        })
-        .await;
-    let catalog = load_catalog(&fixture, &update_root.0).await;
-
-    let updater = Version::parse("1.0.0").expect("parse updater version");
-    let installed = Version::parse("0.1.1").expect("parse installed version");
-    let policy =
-        SelectionPolicy::new(updater.clone()).with_installed(installed.clone(), generation_id('c'));
-    let before_expiry = SystemTime::now() + Duration::from_secs(3600);
-
-    let candidate = catalog
-        .candidate(&policy)
-        .expect("select stable candidate")
-        .expect("a stable candidate is eligible");
-    assert_eq!(candidate.channel, Channel::Stable);
+    assert_eq!(release.version, Version::parse("0.2.0").unwrap());
+    assert_eq!(release.digest, generation('a'));
+    assert_eq!(release.size, 1234);
     assert_eq!(
-        candidate.version,
-        Version::parse("0.1.2").expect("parse expected version")
+        release.url.expect("download url").as_str(),
+        "https://releases.example.test/v0.2.0/zerodeck-v0.2.0-linux-x86_64.managed.tar.gz"
     );
-    assert_eq!(candidate.digest, stable_012.digest());
     assert_eq!(
-        candidate.size,
-        u64::try_from(stable_012.bytes.len()).expect("archive size")
-    );
-    assert_eq!(candidate.build_id, "build-0.1.2");
-    assert_eq!(
-        candidate.min_updater,
-        Version::parse("0.1.0").expect("parse minimum updater")
-    );
-    assert_eq!(candidate.target, stable_012.name());
-
-    catalog
-        .authorize_staged(&candidate, before_expiry)
-        .expect("a staged release remains authorized before expiry");
-    let err = catalog
-        .authorize_staged(&candidate, after_epoch(AFTER_EXPIRY))
-        .expect_err("expired authorization must fail closed");
-    assert!(
-        matches!(err, UpdateError::AuthorizationExpired { .. }),
-        "unexpected expiry error: {err:?}"
-    );
-
-    let earlier = SystemTime::now()
-        .checked_sub(Duration::from_secs(3600))
-        .expect("one hour before now");
-    let err = catalog
-        .authorize_staged(&candidate, earlier)
-        .expect_err("a clock before the persisted floor must fail closed");
-    assert!(
-        matches!(err, UpdateError::ClockRollback { .. }),
-        "unexpected clock error: {err:?}"
-    );
-
-    let offline = Catalog::open_offline(&update_root.0).expect("open persisted authorization");
-    offline
-        .authorize_staged(&candidate, before_expiry)
-        .expect("an offline apply uses the persisted authorization");
-    assert!(
-        matches!(
-            offline.candidate(&policy),
-            Err(UpdateError::CatalogNotLoaded)
-        ),
-        "offline authorization must not select without trusted metadata"
-    );
-
-    let reuse = SelectionPolicy::new(updater.clone()).with_installed(
-        Version::parse("0.1.2").expect("parse reused version"),
-        generation_id('d'),
-    );
-    let err = catalog
-        .candidate(&reuse)
-        .expect_err("a reused version with another digest must conflict");
-    assert!(
-        matches!(err, UpdateError::VersionConflict { .. }),
-        "unexpected conflict error: {err:?}"
-    );
-
-    let new_floor = SelectionPolicy::new(Version::parse("0.0.1").expect("parse old updater"))
-        .with_installed(installed.clone(), generation_id('c'));
-    assert!(
         catalog
-            .candidate(&new_floor)
-            .expect("floor check must not fail")
-            .is_none(),
-        "a target below the updater floor must not be eligible"
-    );
-
-    let newer_install = SelectionPolicy::new(updater.clone()).with_installed(
-        Version::parse("2.0.0").expect("parse newer install"),
-        generation_id('e'),
-    );
-    assert!(
-        catalog
-            .candidate(&newer_install)
-            .expect("installed comparison must not fail")
-            .is_none(),
-        "the catalog must never auto-select below the installed version"
-    );
-
-    let testing_only = Fixture::new().await;
-    let testing_root = TestDir::new("testing-root");
-    let testing_target = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.2",
-        "testing",
-        "build-testing-0.1.2",
-        "0.1.0",
-        "testing-only",
-    );
-    testing_only
-        .publish(&PublishSpec {
-            root_version: 1,
-            metadata_version: 1,
-            expires: FAR_FUTURE,
-            targets: vec![testing_target],
-        })
-        .await;
-    let testing_catalog = load_catalog(&testing_only, &testing_root.0).await;
-    let stable_policy = SelectionPolicy::new(updater.clone());
-    assert!(
-        testing_catalog
-            .candidate(&stable_policy)
-            .expect("stable selection must not fail")
-            .is_none(),
-        "a Stable policy must not select a Testing-only catalog"
-    );
-    let testing_policy = SelectionPolicy::new(updater.clone()).with_channel(Channel::Testing);
-    let testing_candidate = testing_catalog
-        .candidate(&testing_policy)
-        .expect("testing selection must not fail")
-        .expect("an explicit Testing policy selects the target");
-    assert_eq!(testing_candidate.channel, Channel::Testing);
-
-    let expired_fixture = Fixture::new().await;
-    let expired_root = TestDir::new("expired-root");
-    expired_fixture
-        .publish(&PublishSpec {
-            root_version: 1,
-            metadata_version: 1,
-            expires: EXPIRED,
-            targets: vec![TargetSpec::new(
-                "linux-x86_64",
-                "0.1.2",
-                "stable",
-                "build-expired",
-                "0.1.0",
-                "expired",
-            )],
-        })
-        .await;
-    let err = Catalog::load_with_transport(
-        &expired_root.0,
-        expired_fixture.metadata_url(),
-        expired_fixture.targets_url(),
-        &expired_fixture.trusted_root,
-        FilesystemTransport,
-    )
-    .await
-    .expect_err("expired metadata must not be trusted");
-    assert!(
-        matches!(err, UpdateError::Catalog(_)),
-        "unexpected expired-metadata error: {err:?}"
-    );
-
-    let v1_timestamp =
-        fs::read(fixture.metadata.join("timestamp.json")).expect("read v1 timestamp");
-    fixture
-        .publish(&PublishSpec {
-            root_version: 2,
-            metadata_version: 2,
-            expires: FAR_FUTURE,
-            targets: vec![
-                stable_012.clone(),
-                TargetSpec::new(
-                    "linux-x86_64",
-                    "0.1.3",
-                    "stable",
-                    "build-0.1.3",
-                    "0.1.0",
-                    "stable-013",
-                ),
-            ],
-        })
-        .await;
-    let rotated = load_catalog(&fixture, &update_root.0).await;
-    rotated
-        .authorize_staged(&candidate, before_expiry)
-        .expect("an unchanged target stays authorized across a root rotation");
-
-    let newer = rotated
-        .candidate(&policy)
-        .expect("select rotated candidate")
-        .expect("the rotated catalog offers a newer stable release");
-    assert_eq!(
-        newer.version,
-        Version::parse("0.1.3").expect("parse newer version")
-    );
-    let err = rotated
-        .authorize_staged(&candidate, before_expiry)
-        .expect_err("a newly selected release supersedes the staged authorization");
-    assert!(
-        matches!(err, UpdateError::ReleaseSuperseded { .. }),
-        "unexpected supersession error: {err:?}"
-    );
-    rotated
-        .authorize_staged(&newer, before_expiry)
-        .expect("the newest release is authorized");
-
-    let v2_timestamp =
-        fs::read(fixture.metadata.join("timestamp.json")).expect("read v2 timestamp");
-    fs::write(fixture.metadata.join("timestamp.json"), &v1_timestamp)
-        .expect("replay old timestamp");
-    Catalog::load_with_transport(
-        &update_root.0,
-        fixture.metadata_url(),
-        fixture.targets_url(),
-        &fixture.trusted_root,
-        FilesystemTransport,
-    )
-    .await
-    .expect_err("a replayed older timestamp must not reset trusted metadata");
-
-    fs::write(fixture.metadata.join("timestamp.json"), &v2_timestamp)
-        .expect("restore newest timestamp");
-    let restored = load_catalog(&fixture, &update_root.0).await;
-    let restored_candidate = restored
-        .candidate(&policy)
-        .expect("select after restoring metadata")
-        .expect("the newest release stays eligible");
-    assert_eq!(
-        restored_candidate.version,
-        Version::parse("0.1.3").expect("parse restored version")
+            .persisted_authorization()
+            .expect("read state")
+            .map(|persisted| persisted.digest),
+        Some(generation('a')),
+        "the selected release is persisted for the offline apply"
     );
 }
 
 #[tokio::test]
-async fn preview_candidate_does_not_supersede_a_staged_authorization() {
-    let fixture = Fixture::new().await;
-    let update_root = TestDir::new("preview-root");
-    let stable_012 = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.2",
-        "stable",
-        "build-0.1.2",
-        "0.1.0",
-        "preview-012",
-    );
-    let stable_013 = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.3",
-        "stable",
-        "build-0.1.3",
-        "0.1.0",
-        "preview-013",
-    );
-    fixture
-        .publish(&PublishSpec {
-            root_version: 1,
-            metadata_version: 1,
-            expires: FAR_FUTURE,
-            targets: vec![stable_012.clone()],
-        })
-        .await;
-    let catalog = load_catalog(&fixture, &update_root.0).await;
-    let policy = SelectionPolicy::new(Version::parse("1.0.0").expect("updater version"))
-        .with_installed(
-            Version::parse("0.1.1").expect("installed version"),
-            generation_id('c'),
-        );
-    let staged = catalog
-        .candidate(&policy)
-        .expect("select staged release")
-        .expect("0.1.2 is eligible");
-    assert_eq!(staged.digest, stable_012.digest());
-    let before_expiry = SystemTime::now() + Duration::from_secs(3600);
+async fn any_pinned_key_may_sign() {
+    let old = signing_key(1);
+    let new = signing_key(2);
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &new);
+    let root = TestDir::new("two-keys");
 
-    fixture
-        .publish(&PublishSpec {
-            root_version: 1,
-            metadata_version: 2,
-            expires: FAR_FUTURE,
-            targets: vec![stable_012.clone(), stable_013.clone()],
-        })
-        .await;
-    let reloaded = load_catalog(&fixture, &update_root.0).await;
-    let preview = reloaded
-        .preview_candidate(&policy)
-        .expect("preview newer release")
-        .expect("0.1.3 is eligible");
-    assert_eq!(preview.digest, stable_013.digest());
+    load(&root, &source, &keys_document(&[&old, &new]), Channel::Stable)
+        .await
+        .expect("the second pinned key verifies the document");
+}
 
-    let offline = Catalog::open_offline(&update_root.0).expect("open persisted authorization");
-    let persisted = offline
-        .persisted_authorization()
-        .expect("read persisted authorization")
-        .expect("staged authorization remains");
-    assert_eq!(persisted.digest, staged.digest);
-    offline
-        .authorize_staged(&staged, before_expiry)
-        .expect("check-only must not invalidate the staged release");
+#[tokio::test]
+async fn an_untrusted_or_tampered_document_is_rejected() {
+    let trusted = signing_key(1);
+    let attacker = signing_key(9);
+    let keys = keys_document(&[&trusted]);
+
+    let mut forged = MemorySource::default();
+    publish(&mut forged, "stable", &document("stable", "0.2.0", 1, 'a'), &attacker);
+    let root = TestDir::new("forged");
     assert!(matches!(
-        offline.authorize_staged(&preview, before_expiry),
-        Err(UpdateError::ReleaseSuperseded { .. })
+        load(&root, &forged, &keys, Channel::Stable).await,
+        Err(UpdateError::ChannelSignature(_))
     ));
 
-    let selected = reloaded
-        .candidate(&policy)
-        .expect("persisting selection succeeds")
-        .expect("0.1.3 is eligible");
-    assert_eq!(selected.digest, stable_013.digest());
-    assert_eq!(
-        Catalog::open_offline(&update_root.0)
-            .expect("open after selection")
-            .persisted_authorization()
-            .expect("read selected authorization")
-            .expect("selection is persisted")
-            .digest,
-        stable_013.digest()
+    let mut tampered = MemorySource::default();
+    publish(&mut tampered, "stable", &document("stable", "0.2.0", 1, 'a'), &trusted);
+    let key = format!("{CHANNELS}stable.json");
+    let altered = String::from_utf8(tampered.0[&key].clone())
+        .expect("utf8")
+        .replace(&digest('a'), &digest('b'));
+    tampered.0.insert(key, altered.into_bytes());
+    let root = TestDir::new("tampered");
+    assert!(matches!(
+        load(&root, &tampered, &keys, Channel::Stable).await,
+        Err(UpdateError::ChannelSignature(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_channel_document_cannot_be_replayed_on_another_channel() {
+    let key = signing_key(1);
+    let mut source = MemorySource::default();
+    // A validly signed Stable document served under the Testing name.
+    let stable = document("stable", "0.2.0", 1, 'a');
+    publish(&mut source, "testing", &stable, &key);
+    let root = TestDir::new("wrong-channel");
+
+    assert!(matches!(
+        load(&root, &source, &keys_document(&[&key]), Channel::Testing).await,
+        Err(UpdateError::ChannelInvalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn expired_documents_are_rejected() {
+    let key = signing_key(1);
+    let mut source = MemorySource::default();
+    let mut expired = document("stable", "0.2.0", 1, 'a');
+    expired["expires"] = json!(now() - 1);
+    publish(&mut source, "stable", &expired, &key);
+    let root = TestDir::new("expired");
+
+    assert!(matches!(
+        load(&root, &source, &keys_document(&[&key]), Channel::Stable).await,
+        Err(UpdateError::AuthorizationExpired { .. })
+    ));
+}
+
+#[tokio::test]
+async fn an_older_sequence_is_a_replay_but_the_same_sequence_is_fine() {
+    let key = signing_key(1);
+    let keys = keys_document(&[&key]);
+    let root = TestDir::new("sequence");
+
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 5, 'a'), &key);
+    load(&root, &source, &keys, Channel::Stable).await.expect("sequence 5");
+    load(&root, &source, &keys, Channel::Stable)
+        .await
+        .expect("re-reading the same sequence is allowed");
+
+    publish(&mut source, "stable", &document("stable", "0.1.0", 4, 'b'), &key);
+    assert!(matches!(
+        load(&root, &source, &keys, Channel::Stable).await,
+        Err(UpdateError::ChannelRollback {
+            sequence: 4,
+            floor: 5,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_clock_behind_the_last_verification_fails_closed() {
+    let key = signing_key(1);
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    let root = TestDir::new("clock");
+    let store = CatalogStateStore::new(root.0.join("state/catalog.json"));
+    store
+        .write(&CatalogState {
+            last_verified_at: Some(now() + 3600),
+            ..CatalogState::new()
+        })
+        .expect("seed state");
+
+    assert!(matches!(
+        load(&root, &source, &keys_document(&[&key]), Channel::Stable).await,
+        Err(UpdateError::ClockRollback { .. })
+    ));
+}
+
+#[tokio::test]
+async fn unsafe_targets_and_bad_digests_are_rejected() {
+    let key = signing_key(1);
+    let keys = keys_document(&[&key]);
+    for target in [
+        "../etc/passwd",
+        "/abs/zerodeck.tar.gz",
+        "only-one-segment",
+        "a/b/c",
+        "v1/zero deck.tar.gz",
+        "v1/..",
+    ] {
+        let mut source = MemorySource::default();
+        let mut bad = document("stable", "0.2.0", 1, 'a');
+        bad["target"] = json!(target);
+        publish(&mut source, "stable", &bad, &key);
+        let root = TestDir::new("target");
+        assert!(
+            matches!(
+                load(&root, &source, &keys, Channel::Stable).await,
+                Err(UpdateError::InvalidLoaderTarget { .. })
+            ),
+            "target `{target}` must be rejected"
+        );
+    }
+
+    let mut source = MemorySource::default();
+    let mut bad = document("stable", "0.2.0", 1, 'a');
+    bad["digest"] = json!("not-a-digest");
+    publish(&mut source, "stable", &bad, &key);
+    let root = TestDir::new("digest");
+    assert!(load(&root, &source, &keys, Channel::Stable).await.is_err());
+}
+
+#[tokio::test]
+async fn unusable_trusted_keys_are_rejected() {
+    let key = signing_key(1);
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    for keys in [&br#"{"keys":[]}"#[..], br#"{"keys":["zz"]}"#, b"not json"] {
+        let root = TestDir::new("bad-keys");
+        assert!(matches!(
+            load(&root, &source, keys, Channel::Stable).await,
+            Err(UpdateError::InvalidTrustedKeys(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn selection_applies_policy_to_the_signed_release() {
+    let key = signing_key(1);
+    let keys = keys_document(&[&key]);
+    let root = TestDir::new("policy");
+
+    // Prerelease: only with the Testing policy.
+    let mut source = MemorySource::default();
+    publish(&mut source, "testing", &document("testing", "0.3.0-rc.1", 1, 'c'), &key);
+    let catalog = load(&root, &source, &keys, Channel::Testing).await.expect("load");
+    let testing = policy().with_channel(Channel::Testing);
+    assert!(catalog.preview_candidate(&testing).unwrap().is_none());
+    assert!(
+        catalog
+            .preview_candidate(&testing.clone().with_prereleases(true))
+            .unwrap()
+            .is_some()
+    );
+
+    // A newer updater requirement hides the release.
+    let mut source = MemorySource::default();
+    let mut needs_new = document("stable", "0.4.0", 1, 'd');
+    needs_new["min_updater"] = json!("9.0.0");
+    publish(&mut source, "stable", &needs_new, &key);
+    let min_root = TestDir::new("min");
+    let catalog = load(&min_root, &source, &keys, Channel::Stable)
+        .await
+        .expect("load");
+    assert!(catalog.preview_candidate(&policy()).unwrap().is_none());
+
+    // Installed version: older/equal are skipped, same version with another digest conflicts.
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
+    let installed_root = TestDir::new("installed");
+    let catalog = load(&installed_root, &source, &keys, Channel::Stable)
+        .await
+        .expect("load");
+    let newer = Version::parse("0.3.0").unwrap();
+    let same = Version::parse("0.2.0").unwrap();
+    assert!(
+        catalog
+            .preview_candidate(&policy().with_installed(newer, generation('f')))
+            .unwrap()
+            .is_none(),
+        "no downgrade"
+    );
+    assert!(
+        catalog
+            .preview_candidate(&policy().with_installed(same.clone(), generation('a')))
+            .unwrap()
+            .is_none(),
+        "already installed"
+    );
+    assert!(matches!(
+        catalog.preview_candidate(&policy().with_installed(same, generation('b'))),
+        Err(UpdateError::VersionConflict { .. })
+    ));
+
+    // A quarantined digest is never selected.
+    assert!(
+        catalog
+            .preview_candidate(&policy().with_quarantined([generation('a')]))
+            .unwrap()
+            .is_none()
     );
 }
 
 #[tokio::test]
-async fn selection_skips_a_quarantined_newest_target() {
-    let fixture = Fixture::new().await;
-    let root = TestDir::new("quarantine-root");
-    let older = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.2",
-        "stable",
-        "build-0.1.2",
-        "0.1.0",
-        "older",
-    );
-    let newest = TargetSpec::new(
-        "linux-x86_64",
-        "0.1.3",
-        "stable",
-        "build-0.1.3",
-        "0.1.0",
-        "newest",
-    );
-    let (older_digest, newest_digest) = (older.digest(), newest.digest());
-    fixture
-        .publish(&PublishSpec {
-            root_version: 1,
-            metadata_version: 1,
-            expires: FAR_FUTURE,
-            targets: vec![older, newest],
-        })
-        .await;
-    let catalog = load_catalog(&fixture, &root.0).await;
-    let updater = Version::parse("0.1.0").expect("updater version");
+async fn only_candidate_persists_and_a_changed_channel_drops_a_stale_authorization() {
+    let key = signing_key(1);
+    let keys = keys_document(&[&key]);
+    let root = TestDir::new("persist");
+    let mut source = MemorySource::default();
+    publish(&mut source, "stable", &document("stable", "0.2.0", 1, 'a'), &key);
 
-    let plain = catalog
-        .candidate(&SelectionPolicy::new(updater.clone()))
-        .expect("select")
-        .expect("a release");
-    assert_eq!(plain.digest, newest_digest);
+    let catalog = load(&root, &source, &keys, Channel::Stable).await.expect("load");
+    assert!(catalog.preview_candidate(&policy()).unwrap().is_some());
+    assert_eq!(
+        catalog.persisted_authorization().unwrap(),
+        None,
+        "check-only must not stage anything"
+    );
 
-    let skipping = SelectionPolicy::new(updater).with_quarantined([newest_digest]);
-    let fallback = catalog
-        .candidate(&skipping)
-        .expect("select")
-        .expect("falls back to the next eligible release");
-    assert_eq!(fallback.digest, older_digest);
+    let staged = catalog.candidate(&policy()).unwrap().expect("stage 0.2.0");
+    let reloaded = load(&root, &source, &keys, Channel::Stable).await.expect("reload");
+    assert_eq!(
+        reloaded
+            .persisted_authorization()
+            .unwrap()
+            .map(|release| release.digest),
+        Some(staged.digest),
+        "an unchanged channel keeps the staged authorization"
+    );
+
+    publish(&mut source, "stable", &document("stable", "0.3.0", 2, 'b'), &key);
+    let moved = load(&root, &source, &keys, Channel::Stable).await.expect("load 0.3.0");
+    assert_eq!(
+        moved.persisted_authorization().unwrap(),
+        None,
+        "the channel no longer names the staged release"
+    );
+}
+
+#[tokio::test]
+async fn offline_catalogs_cannot_select() {
+    let root = TestDir::new("offline");
+    let offline = Catalog::open_offline(&root.0).expect("open offline");
+    assert!(matches!(
+        offline.candidate(&policy()),
+        Err(UpdateError::CatalogNotLoaded | UpdateError::CatalogNotVerified)
+    ));
 }

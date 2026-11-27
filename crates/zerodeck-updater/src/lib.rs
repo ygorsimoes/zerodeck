@@ -30,7 +30,10 @@ pub use activation::{
 };
 pub use boot::BootRecoveryMarker;
 pub use bootstrap::{BootstrapOutcome, bootstrap_generation, confirm_bootstrap, prepare_bootstrap};
-pub use catalog::{AuthorizedRelease, Catalog, Channel, InstalledRelease, SelectionPolicy};
+pub use catalog::{
+    AuthorizedRelease, Catalog, Channel, ChannelSource, HttpChannelSource, InstalledRelease,
+    SelectionPolicy,
+};
 pub use generation::{GenerationId, GenerationLayout, GenerationRelease, GenerationStore};
 pub use request::{APPLY_REQUEST_SCHEMA, ApplyKind, ApplyRequest, ApplyRequestStore};
 pub use schema::{Schema, SchemaFile};
@@ -122,9 +125,29 @@ pub enum UpdateError {
         source: io::Error,
     },
 
-    /// Trusted TUF metadata loading or verification failed.
-    #[error("trusted catalog error: {0}")]
-    Catalog(Box<tough::error::Error>),
+    /// A channel file could not be fetched.
+    #[error("cannot fetch `{url}`: {reason}")]
+    ChannelFetch { url: String, reason: String },
+
+    /// The channel document is not signed by a trusted key.
+    #[error("channel signature rejected: {0}")]
+    ChannelSignature(String),
+
+    /// The channel document is malformed or names a different channel.
+    #[error("invalid channel document: {0}")]
+    ChannelInvalid(String),
+
+    /// The channel sequence moved backwards, so an older document is being replayed.
+    #[error("channel `{channel}` sequence {sequence} is older than the last verified {floor}")]
+    ChannelRollback {
+        channel: &'static str,
+        sequence: u64,
+        floor: u64,
+    },
+
+    /// The pinned trusted-keys document is unusable.
+    #[error("invalid trusted keys: {0}")]
+    InvalidTrustedKeys(String),
 
     /// A signed loader target does not match the loader distribution contract.
     #[error("invalid loader target `{target}`: {reason}")]
@@ -426,12 +449,6 @@ pub enum UpdateError {
     /// A `zerodeck-core` operation failed.
     #[error(transparent)]
     Core(Box<zerodeck_core::CoreError>),
-}
-
-impl From<tough::error::Error> for UpdateError {
-    fn from(error: tough::error::Error) -> Self {
-        Self::Catalog(Box::new(error))
-    }
 }
 
 impl From<zerodeck_core::CoreError> for UpdateError {

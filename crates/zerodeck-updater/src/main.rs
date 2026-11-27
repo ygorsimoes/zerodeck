@@ -215,7 +215,7 @@ async fn run_update(root: &Path, channel: &str, check_only: bool) -> Result<(), 
         source,
     })?;
 
-    let catalog = Catalog::load(root, metadata_url, targets_url, &trusted_root).await?;
+    let catalog = Catalog::load(root, metadata_url, targets_url, &trusted_root, channel).await?;
     let mut policy = SelectionPolicy::new(crate_version())
         .with_channel(channel)
         .with_prereleases(channel == Channel::Testing);

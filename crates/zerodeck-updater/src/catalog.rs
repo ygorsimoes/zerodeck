@@ -1,33 +1,32 @@
-//! Pinned-root TUF catalog selection and offline authorization checks.
+//! Signed release-channel verification, selection and offline authorization checks.
+//!
+//! A channel (`stable` or `testing`) is one small JSON document plus a detached ed25519 signature,
+//! both produced by the release automation. The client pins the public key(s) out-of-band, checks
+//! the signature, expiry and a never-decreasing `sequence`, and only then treats the named archive
+//! (identified by its SHA-256) as authorized.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io;
+use std::collections::BTreeSet;
+use std::fs;
+use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use tough::schema::Target;
-use tough::{
-    HttpTransportBuilder, Limits, Repository, RepositoryLoader, TargetName, Transport,
-    TransportError, TransportStream,
-};
 use url::Url;
 
 use crate::state::{CATALOG_STATE_SCHEMA, CatalogState, CatalogStateStore, SelectionRecord};
 use crate::{GenerationId, UpdateError};
 
-/// Architecture directory used by the first supported native loader distribution.
-pub const LOADER_TARGET_ARCH: &str = "linux-x86_64";
-
-const TUF_DATASTORE_DIR: &str = "tuf";
 const STATE_DIR: &str = "state";
 const CATALOG_STATE_FILE: &str = "catalog.json";
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest channel document or signature accepted from the network.
+const MAX_CHANNEL_BYTES: usize = 16 * 1024;
+/// Current channel document schema.
+const CHANNEL_SCHEMA: u32 = 1;
 
 /// Release channel signed into a loader target.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +132,7 @@ impl SelectionPolicy {
     }
 }
 
-/// A loader release authorized by the freshest locally trusted TUF metadata.
+/// A loader release authorized by the freshest verified channel document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizedRelease {
     /// Signed release channel.
@@ -148,7 +147,7 @@ pub struct AuthorizedRelease {
     pub build_id: String,
     /// Minimum updater version declared by the signed target.
     pub min_updater: Version,
-    /// Expected TUF target path relative to the targets base URL.
+    /// Archive path relative to the releases base URL (`<tag>/<asset>`).
     pub target: String,
     /// Download location derived from the targets base URL.
     #[serde(skip)]
@@ -167,57 +166,128 @@ impl AuthorizedRelease {
     }
 }
 
-/// Pinned-root TUF catalog plus its locally persisted verification state.
+/// The signed channel document (the bytes that carry the ed25519 signature).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelDocument {
+    schema: u32,
+    channel: Channel,
+    sequence: u64,
+    expires: u64,
+    version: Version,
+    digest: String,
+    size: u64,
+    build_id: String,
+    min_updater: Version,
+    target: String,
+}
+
+/// Public keys the client trusts, pinned out-of-band (`/etc/zerodeck/trusted-root.json`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustedKeys {
+    keys: Vec<String>,
+}
+
+/// Where the two channel files come from: HTTPS in production, memory in tests.
+pub trait ChannelSource {
+    /// Fetches at most [`MAX_CHANNEL_BYTES`] from `url`.
+    fn fetch(&self, url: &Url) -> impl Future<Output = Result<Vec<u8>, UpdateError>> + Send;
+}
+
+/// Bounded HTTPS fetcher for channel files.
+#[derive(Debug, Clone)]
+pub struct HttpChannelSource {
+    client: reqwest::Client,
+}
+
+impl HttpChannelSource {
+    /// Builds a client with connect and total timeouts.
+    pub fn new() -> Result<Self, UpdateError> {
+        let client = reqwest::Client::builder()
+            .timeout(METADATA_TIMEOUT)
+            .connect_timeout(METADATA_CONNECT_TIMEOUT)
+            .build()
+            .map_err(|error| UpdateError::ChannelFetch {
+                url: String::new(),
+                reason: error.to_string(),
+            })?;
+        Ok(Self { client })
+    }
+}
+
+impl ChannelSource for HttpChannelSource {
+    async fn fetch(&self, url: &Url) -> Result<Vec<u8>, UpdateError> {
+        let fail = |reason: String| UpdateError::ChannelFetch {
+            url: url.to_string(),
+            reason,
+        };
+        let mut response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|error| fail(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(fail(format!("HTTP status {}", response.status())));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| fail(error.to_string()))?
+        {
+            if body.len() + chunk.len() > MAX_CHANNEL_BYTES {
+                return Err(fail(format!("response exceeds {MAX_CHANNEL_BYTES} bytes")));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+}
+
+/// Signed channel catalog plus its locally persisted verification state.
 #[derive(Debug, Clone)]
 pub struct Catalog {
-    repository: Option<Repository>,
-    targets_url: Option<Url>,
+    release: Option<AuthorizedRelease>,
     state: CatalogStateStore,
     verified_at: u64,
     expires_at: u64,
 }
 
 impl Catalog {
-    /// Loads trusted TUF metadata over the bounded production HTTP transport.
+    /// Loads and verifies `channel` over HTTPS.
     ///
-    /// `trusted_root` must be supplied out-of-band; this method never trusts the first root it
-    /// sees.
+    /// `trusted_keys` is the pinned keys document; this method never trusts a key it fetched.
     pub async fn load(
         update_root: impl AsRef<Path>,
-        metadata_base_url: Url,
-        targets_base_url: Url,
-        trusted_root: &[u8],
+        channels_base_url: Url,
+        releases_base_url: Url,
+        trusted_keys: &[u8],
+        channel: Channel,
     ) -> Result<Self, UpdateError> {
-        let transport = HttpTransportBuilder::new()
-            .timeout(METADATA_TIMEOUT)
-            .connect_timeout(METADATA_CONNECT_TIMEOUT)
-            .tries(3)
-            .build();
-        Self::load_with_transport(
+        let source = HttpChannelSource::new()?;
+        Self::load_with_source(
             update_root,
-            metadata_base_url,
-            targets_base_url,
-            trusted_root,
-            transport,
+            channels_base_url,
+            releases_base_url,
+            trusted_keys,
+            channel,
+            &source,
         )
         .await
     }
 
-    /// Loads trusted metadata using `transport`.
-    ///
-    /// This exists so offline tests can use [`tough::FilesystemTransport`]; production callers use
-    /// [`Self::load`] and `tough`'s verified HTTP transport.
+    /// Loads `channel` from `source`; tests use an in-memory source.
     #[doc(hidden)]
-    pub async fn load_with_transport<T>(
+    pub async fn load_with_source<S: ChannelSource>(
         update_root: impl AsRef<Path>,
-        metadata_base_url: Url,
-        targets_base_url: Url,
-        trusted_root: &[u8],
-        transport: T,
-    ) -> Result<Self, UpdateError>
-    where
-        T: Transport + Send + Sync + 'static,
-    {
+        channels_base_url: Url,
+        releases_base_url: Url,
+        trusted_keys: &[u8],
+        channel: Channel,
+        source: &S,
+    ) -> Result<Self, UpdateError> {
         let update_root = update_root.as_ref();
         fs::create_dir_all(update_root).map_err(|source| UpdateError::Io {
             path: update_root.to_path_buf(),
@@ -227,23 +297,6 @@ impl Catalog {
             path: update_root.to_path_buf(),
             source,
         })?;
-        let metadata_base_url = directory_url(metadata_base_url)?;
-        let targets_base_url = directory_url(targets_base_url)?;
-        let datastore = update_root.join(TUF_DATASTORE_DIR);
-        fs::create_dir_all(&datastore).map_err(|source| UpdateError::Io {
-            path: datastore.clone(),
-            source,
-        })?;
-        let datastore = fs::canonicalize(&datastore).map_err(|source| UpdateError::Io {
-            path: datastore.clone(),
-            source,
-        })?;
-        if !datastore.starts_with(&update_root) {
-            return Err(UpdateError::PathEscape {
-                path: datastore,
-                root: update_root,
-            });
-        }
         let state_store =
             CatalogStateStore::new(update_root.join(STATE_DIR).join(CATALOG_STATE_FILE));
 
@@ -255,51 +308,75 @@ impl Catalog {
             return Err(UpdateError::ClockRollback { now, floor });
         }
 
-        let limits = Limits {
-            max_root_updates: 32,
-            ..Limits::default()
-        };
-        let repository =
-            RepositoryLoader::new(&trusted_root, metadata_base_url, targets_base_url.clone())
-                .datastore(&datastore)
-                .limits(limits)
-                .transport(BoxedTransport(Arc::new(transport)))
-                .load()
-                .await?;
-        sync_datastore(&datastore)?;
+        let keys = parse_trusted_keys(trusted_keys)?;
+        let channels_base_url = directory_url(channels_base_url)?;
+        let releases_base_url = directory_url(releases_base_url)?;
+        let document_url = join(&channels_base_url, &format!("{channel}.json"))?;
+        let signature_url = join(&channels_base_url, &format!("{channel}.json.sig"))?;
+        let document_bytes = source.fetch(&document_url).await?;
+        let signature_bytes = source.fetch(&signature_url).await?;
+        verify_signature(&keys, &document_bytes, &signature_bytes)?;
 
-        let expires_at = earliest_expiry(&repository)?;
-        if expires_at <= now {
+        let document: ChannelDocument = serde_json::from_slice(&document_bytes)
+            .map_err(|error| UpdateError::ChannelInvalid(format!("malformed document: {error}")))?;
+        if document.schema != CHANNEL_SCHEMA {
+            return Err(UpdateError::ChannelInvalid(format!(
+                "unsupported schema {}",
+                document.schema
+            )));
+        }
+        if document.channel != channel {
+            return Err(UpdateError::ChannelInvalid(format!(
+                "document is for `{}`, requested `{channel}`",
+                document.channel
+            )));
+        }
+        if document.expires <= now {
             return Err(UpdateError::AuthorizationExpired {
-                expires: expires_at,
+                expires: document.expires,
             });
         }
-        let authorization = previous.authorization.filter(|authorization| {
-            repository_authorizes(&repository, &targets_base_url, authorization)
-        });
+        let floor = previous
+            .channel_sequences
+            .get(channel.as_str())
+            .copied()
+            .unwrap_or(0);
+        if document.sequence < floor {
+            return Err(UpdateError::ChannelRollback {
+                channel: channel.as_str(),
+                sequence: document.sequence,
+                floor,
+            });
+        }
+        let release = release_from_document(&document, &releases_base_url)?;
+
+        let authorization = previous
+            .authorization
+            .filter(|authorization| authorization.same_identity(&release));
         let selection = previous.selection.filter(|_| authorization.is_some());
-        let state = CatalogState {
+        let mut channel_sequences = previous.channel_sequences;
+        channel_sequences.insert(channel.as_str().to_owned(), document.sequence);
+        state_store.write(&CatalogState {
             schema: CATALOG_STATE_SCHEMA,
             last_verified_at: Some(now),
-            expires_at: Some(expires_at),
+            expires_at: Some(document.expires),
             authorization,
             selection,
-        };
-        state_store.write(&state)?;
+            channel_sequences,
+        })?;
 
         Ok(Self {
-            repository: Some(repository),
-            targets_url: Some(targets_base_url),
+            release: Some(release),
             state: state_store,
             verified_at: now,
-            expires_at,
+            expires_at: document.expires,
         })
     }
 
     /// Opens only the persisted authorization state for an offline apply.
     ///
-    /// This never reads trusted metadata or the network. Use [`Self::authorize_staged`] before an
-    /// activation; [`Self::candidate`] requires metadata loaded with [`Self::load`].
+    /// This never reads channel files or the network. Use [`Self::authorize_staged`] before an
+    /// activation; [`Self::candidate`] requires a channel loaded with [`Self::load`].
     pub fn open_offline(update_root: impl AsRef<Path>) -> Result<Self, UpdateError> {
         let requested = update_root.as_ref();
         let root = fs::canonicalize(requested).map_err(|source| UpdateError::Io {
@@ -310,8 +387,6 @@ impl Catalog {
         // corrupt or absent persisted metadata must not block an offline rollback; an upgrade
         // still fails closed when `authorize_staged` reads the document.
         let state = CatalogStateStore::new(root.join(STATE_DIR).join(CATALOG_STATE_FILE));
-        // Tolerate a corrupt document so rollback can construct this handle; selection and
-        // authorization still parse it and fail closed.
         let (verified_at, expires_at) = match state.read() {
             Ok(persisted) => (
                 persisted.last_verified_at.unwrap_or(0),
@@ -320,8 +395,7 @@ impl Catalog {
             Err(_) => (0, 0),
         };
         Ok(Self {
-            repository: None,
-            targets_url: None,
+            release: None,
             state,
             verified_at,
             expires_at,
@@ -447,177 +521,112 @@ impl Catalog {
     }
 
     fn select(&self, policy: &SelectionPolicy) -> Result<Option<AuthorizedRelease>, UpdateError> {
-        let repository = self
-            .repository
-            .as_ref()
-            .ok_or(UpdateError::CatalogNotLoaded)?;
-        let targets_url = self
-            .targets_url
-            .as_ref()
-            .ok_or(UpdateError::CatalogNotLoaded)?;
-        let mut eligible: BTreeMap<Version, AuthorizedRelease> = BTreeMap::new();
-        for (name, target) in repository.all_targets() {
-            let Some(release) = release_from_target(name, target, targets_url)? else {
-                continue;
-            };
-            if release.channel != policy.channel {
-                continue;
-            }
-            if !release.version.pre.is_empty() && !policy.allow_prerelease {
-                continue;
-            }
-            if release.min_updater > policy.updater_version {
-                continue;
-            }
-            if policy.quarantined.contains(&release.digest) {
-                continue;
-            }
-            if let Some(installed) = &policy.installed {
-                if release.version < installed.version {
-                    continue;
-                }
-                if release.version == installed.version {
-                    if release.digest != installed.digest {
-                        return Err(UpdateError::VersionConflict {
-                            version: release.version,
-                            installed: installed.digest.clone(),
-                            candidate: release.digest,
-                        });
-                    }
-                    continue;
-                }
-            }
-            if let Some(existing) = eligible.get(&release.version) {
-                return Err(UpdateError::VersionConflict {
-                    version: release.version,
-                    installed: existing.digest.clone(),
-                    candidate: release.digest,
-                });
-            }
-            eligible.insert(release.version.clone(), release);
+        let release = self.release.as_ref().ok_or(UpdateError::CatalogNotLoaded)?;
+        if release.channel != policy.channel
+            || (!release.version.pre.is_empty() && !policy.allow_prerelease)
+            || release.min_updater > policy.updater_version
+            || policy.quarantined.contains(&release.digest)
+        {
+            return Ok(None);
         }
-        Ok(eligible.into_values().next_back())
-    }
-}
-
-fn release_from_target(
-    name: &TargetName,
-    target: &Target,
-    targets_url: &Url,
-) -> Result<Option<AuthorizedRelease>, UpdateError> {
-    let resolved = name.resolved();
-    let Some(rest) = resolved.strip_prefix(LOADER_TARGET_ARCH) else {
-        return Ok(None);
-    };
-    let Some(rest) = rest.strip_prefix('/') else {
-        return Ok(None);
-    };
-    if name.raw() != resolved {
-        return Err(UpdateError::InvalidLoaderTarget {
-            target: name.raw().to_owned(),
-            reason: "target path resolves to a different name".to_owned(),
-        });
-    }
-
-    let Some(file_version) = rest
-        .strip_prefix("zerodeck-")
-        .and_then(|value| value.strip_suffix(".tar.gz"))
-    else {
-        return Ok(None);
-    };
-    if file_version.contains('/') {
-        return Ok(None);
-    }
-    let version =
-        Version::parse(file_version).map_err(|error| UpdateError::InvalidLoaderTarget {
-            target: resolved.to_owned(),
-            reason: format!("invalid SemVer in target name: {error}"),
-        })?;
-
-    let channel = custom_string(target, "channel", resolved).and_then(|value| {
-        Channel::parse(value).ok_or_else(|| UpdateError::InvalidLoaderTarget {
-            target: resolved.to_owned(),
-            reason: format!("unsupported channel `{value}`"),
-        })
-    })?;
-    let custom_version =
-        Version::parse(custom_string(target, "version", resolved)?).map_err(|error| {
-            UpdateError::InvalidLoaderTarget {
-                target: resolved.to_owned(),
-                reason: format!("invalid custom version: {error}"),
+        if let Some(installed) = &policy.installed {
+            if release.version < installed.version {
+                return Ok(None);
             }
-        })?;
-    if custom_version != version {
-        return Err(UpdateError::InvalidLoaderTarget {
-            target: resolved.to_owned(),
-            reason: format!(
-                "custom version `{custom_version}` does not match target name `{version}`"
-            ),
-        });
-    }
-    let build_id = custom_string(target, "build_id", resolved)?;
-    if build_id.trim().is_empty() {
-        return Err(UpdateError::InvalidLoaderTarget {
-            target: resolved.to_owned(),
-            reason: "custom build_id is empty".to_owned(),
-        });
-    }
-    let min_updater =
-        Version::parse(custom_string(target, "min_updater", resolved)?).map_err(|error| {
-            UpdateError::InvalidLoaderTarget {
-                target: resolved.to_owned(),
-                reason: format!("invalid minimum updater version: {error}"),
+            if release.version == installed.version {
+                if release.digest != installed.digest {
+                    return Err(UpdateError::VersionConflict {
+                        version: release.version.clone(),
+                        installed: installed.digest.clone(),
+                        candidate: release.digest.clone(),
+                    });
+                }
+                return Ok(None);
             }
-        })?;
-    let digest = GenerationId::new(hex::encode(target.hashes.sha256.as_ref()))?;
-    let url = targets_url
-        .join(resolved)
-        .map_err(|error| UpdateError::InvalidLoaderTarget {
-            target: resolved.to_owned(),
-            reason: format!("cannot build target URL: {error}"),
-        })?;
-
-    Ok(Some(AuthorizedRelease {
-        channel,
-        version,
-        digest,
-        size: target.length,
-        build_id: build_id.to_owned(),
-        min_updater,
-        target: resolved.to_owned(),
-        url: Some(url),
-    }))
+        }
+        Ok(Some(release.clone()))
+    }
 }
 
-fn custom_string<'a>(
-    target: &'a Target,
-    key: &str,
-    target_name: &str,
-) -> Result<&'a str, UpdateError> {
-    target
-        .custom
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| UpdateError::InvalidLoaderTarget {
-            target: target_name.to_owned(),
-            reason: format!("signed target is missing string custom field `{key}`"),
-        })
-}
-
-fn repository_authorizes(
-    repository: &Repository,
-    targets_url: &Url,
-    authorization: &AuthorizedRelease,
-) -> bool {
-    repository
-        .all_targets()
-        .find(|(name, _)| name.raw() == authorization.target)
-        .and_then(|(name, target)| {
-            release_from_target(name, target, targets_url)
+fn parse_trusted_keys(bytes: &[u8]) -> Result<Vec<VerifyingKey>, UpdateError> {
+    let invalid = |reason: String| UpdateError::InvalidTrustedKeys(reason);
+    let document: TrustedKeys = serde_json::from_slice(bytes)
+        .map_err(|error| invalid(format!("malformed keys document: {error}")))?;
+    if document.keys.is_empty() {
+        return Err(invalid("the keys document lists no key".to_owned()));
+    }
+    document
+        .keys
+        .iter()
+        .map(|key| {
+            let raw: [u8; 32] = hex::decode(key)
                 .ok()
-                .flatten()
+                .and_then(|raw| raw.try_into().ok())
+                .ok_or_else(|| invalid(format!("`{key}` is not a 32-byte hex key")))?;
+            VerifyingKey::from_bytes(&raw).map_err(|error| invalid(error.to_string()))
         })
-        .is_some_and(|release| release.same_identity(authorization))
+        .collect()
+}
+
+fn verify_signature(
+    keys: &[VerifyingKey],
+    document: &[u8],
+    signature_hex: &[u8],
+) -> Result<(), UpdateError> {
+    let invalid = |reason: &str| UpdateError::ChannelSignature(reason.to_owned());
+    let raw: [u8; 64] = hex::decode(String::from_utf8_lossy(signature_hex).trim())
+        .ok()
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(|| invalid("the signature is not 64 bytes of hex"))?;
+    let signature = Signature::from_bytes(&raw);
+    keys.iter()
+        .any(|key| key.verify_strict(document, &signature).is_ok())
+        .then_some(())
+        .ok_or_else(|| invalid("no trusted key verifies the channel document"))
+}
+
+fn release_from_document(
+    document: &ChannelDocument,
+    releases_base_url: &Url,
+) -> Result<AuthorizedRelease, UpdateError> {
+    let invalid = |reason: String| UpdateError::InvalidLoaderTarget {
+        target: document.target.clone(),
+        reason,
+    };
+    let safe_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    let segments: Vec<&str> = document.target.split('/').collect();
+    if segments.len() != 2 || !segments.iter().all(|segment| safe_segment(segment)) {
+        return Err(invalid("target must be `<tag>/<asset>`".to_owned()));
+    }
+    if document.build_id.trim().is_empty() {
+        return Err(invalid("build_id is empty".to_owned()));
+    }
+    let digest = GenerationId::new(document.digest.clone())?;
+    let url = join(releases_base_url, &document.target)?;
+    Ok(AuthorizedRelease {
+        channel: document.channel,
+        version: document.version.clone(),
+        digest,
+        size: document.size,
+        build_id: document.build_id.clone(),
+        min_updater: document.min_updater.clone(),
+        target: document.target.clone(),
+        url: Some(url),
+    })
+}
+
+fn join(base: &Url, path: &str) -> Result<Url, UpdateError> {
+    base.join(path).map_err(|error| UpdateError::InvalidBaseUrl {
+        url: base.to_string(),
+        reason: error.to_string(),
+    })
 }
 
 fn directory_url(url: Url) -> Result<Url, UpdateError> {
@@ -633,55 +642,6 @@ fn directory_url(url: Url) -> Result<Url, UpdateError> {
     })
 }
 
-fn sync_datastore(path: &Path) -> Result<(), UpdateError> {
-    let entries = fs::read_dir(path).map_err(|source| UpdateError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| UpdateError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let file_type = entry.file_type().map_err(|source| UpdateError::Io {
-            path: entry.path(),
-            source,
-        })?;
-        if file_type.is_file() {
-            File::open(entry.path())
-                .and_then(|file| file.sync_all())
-                .map_err(|source| UpdateError::Io {
-                    path: entry.path(),
-                    source,
-                })?;
-        } else if !file_type.is_dir() {
-            return Err(UpdateError::Io {
-                path: entry.path(),
-                source: io::Error::other("unexpected entry in TUF datastore"),
-            });
-        }
-    }
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| UpdateError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn earliest_expiry(repository: &Repository) -> Result<u64, UpdateError> {
-    let expires = [
-        repository.root().signed.expires,
-        repository.timestamp().signed.expires,
-        repository.snapshot().signed.expires,
-        repository.targets().signed.expires,
-    ]
-    .into_iter()
-    .min()
-    .ok_or(UpdateError::CatalogNotVerified)?;
-    u64::try_from(expires.as_second()).map_err(|_| UpdateError::ClockBeforeEpoch)
-}
-
 fn now_seconds() -> Result<u64, UpdateError> {
     unix_seconds(SystemTime::now())
 }
@@ -690,16 +650,6 @@ fn unix_seconds(time: SystemTime) -> Result<u64, UpdateError> {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| UpdateError::ClockBeforeEpoch)
-}
-
-#[derive(Debug, Clone)]
-struct BoxedTransport(Arc<dyn Transport + Send + Sync>);
-
-#[tough::async_trait]
-impl Transport for BoxedTransport {
-    async fn fetch(&self, url: Url) -> Result<TransportStream, TransportError> {
-        self.0.fetch(url).await
-    }
 }
 
 #[cfg(test)]

@@ -491,6 +491,7 @@ impl Harness {
                     installed_version: None,
                     installed_digest: None,
                 }),
+                ..CatalogState::new()
             })
             .expect("write catalog state");
     }

@@ -1307,9 +1307,11 @@ scenario_reboot_during_recovery() {
     local crash="${candidate_archive}" crash_digest="${candidate_digest}"
     # systemd applies TimeoutStartSec to ExecStartPre as well as ExecStart. The packaged recovery
     # unit has TimeoutStartSec=60, so a 60 s pre-delay would time out and recover-boot would never
-    # run. Override the timeout to 180 s and keep the observable window at 20 s.
+    # run. Override the timeout to 180 s. The window must outlast the boot-to-SSH time (sshd is not
+    # ordered after recovery, and on KVM it becomes reachable about as fast as the delay ends), so
+    # use 60 s rather than a delay that SSH can arrive after.
     install_dropin zerodeck-recovery.service \
-        $'[Service]\nTimeoutStartSec=180\nExecStartPre=/bin/sleep 20'
+        $'[Service]\nTimeoutStartSec=180\nExecStartPre=/bin/sleep 60'
     prepare_pending_crash "${crash}" "${crash_digest}"
     hard_poweroff
     start_qemu

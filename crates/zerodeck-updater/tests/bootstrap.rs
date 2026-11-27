@@ -119,6 +119,7 @@ fn bootstrap_refuses_a_pending_activation_before_touching_state() {
         phase: TransactionPhase::Prepared,
         was_running: false,
         start_attempted: false,
+        rollback_target: None,
     });
     state_store(&dir.0).write(&state).expect("seed pending");
     let before = fs::read(state_store(&dir.0).path()).expect("read state bytes");
@@ -266,6 +267,52 @@ fn bootstrap_prepare_defers_confirmation_until_after_readiness() {
     let state = state_store(&dir.0).read().expect("read state");
     assert_eq!(state.last_confirmed, Some(generation));
     assert!(state.pending.is_none());
+}
+
+fn assert_bootstrap_retains_previous(last_confirmed_fill: Option<char>) {
+    let dir = TestDir::new("retained-rollback");
+    let previous = generation(&dir.0, 'a');
+    let candidate = generation(&dir.0, 'c');
+    let last_confirmed = last_confirmed_fill.map(|fill| generation(&dir.0, fill));
+    let store = GenerationStore::new(&dir.0).expect("open store");
+    store.switch_to(&previous).expect("activate previous");
+    let state = state_store(&dir.0);
+    state
+        .write(&UpdateState {
+            last_confirmed,
+            ..UpdateState::new()
+        })
+        .expect("seed state");
+
+    let prepared = zerodeck_updater::prepare_bootstrap(&dir.0, candidate.as_str(), true, false)
+        .expect("prepare conversion");
+    assert_eq!(prepared.rollback_target, Some(previous.clone()));
+    assert_eq!(
+        state
+            .read()
+            .expect("read prepared state")
+            .pending
+            .expect("prepared transaction")
+            .rollback_target,
+        Some(previous.clone()),
+        "the promised rollback target must be durable before confirmation"
+    );
+
+    let confirmed = zerodeck_updater::confirm_bootstrap(&dir.0).expect("confirm conversion");
+    assert_eq!(confirmed.rollback_target, Some(previous.clone()));
+    let confirmed_state = state.read().expect("read confirmed state");
+    assert_eq!(confirmed_state.last_confirmed, Some(candidate));
+    assert_eq!(confirmed_state.rollback_target, Some(previous.clone()));
+    assert!(
+        store.generation_dir(&previous).is_dir(),
+        "GC must retain the promised rollback generation"
+    );
+}
+
+#[test]
+fn bootstrap_confirmation_preserves_the_promised_rollback_target() {
+    assert_bootstrap_retains_previous(None);
+    assert_bootstrap_retains_previous(Some('b'));
 }
 
 #[test]

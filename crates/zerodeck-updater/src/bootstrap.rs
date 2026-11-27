@@ -135,6 +135,7 @@ pub fn prepare_bootstrap(
         phase: TransactionPhase::Prepared,
         was_running: false,
         start_attempted: false,
+        rollback_target: rollback_target.clone(),
     };
     persisted.pending = Some(transaction.clone());
     state.write(&persisted)?;

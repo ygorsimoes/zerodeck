@@ -5,8 +5,9 @@ lives in this directory on the default branch.
 
 ```bash
 cp deploy/update/COMPATIBILITY.md deploy/update/evidence/v0.1.0.md
-# Fill every field from observed Steam Deck / SteamOS hardware, then:
-just verify-stable-evidence v0.1.0
+# Fill every field from observed Steam Deck / SteamOS hardware, then (using the release tag, the
+# signed build ID and the managed archive SHA-256):
+just verify-stable-evidence v0.1.0 <build-id> <managed-sha256>
 ```
 
 `verify-stable-evidence` refuses a record that still contains `PENDING`, names a different tag,

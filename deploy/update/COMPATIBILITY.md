@@ -1,7 +1,7 @@
 # ZeroDeck loader compatibility and release evidence
 
-Copy this template to `deploy/update/evidence/<date>-<version>.md` for each release candidate and
-fill every field from observed hardware. **Never mark Stable eligible from an unrecorded run.**
+Copy this template to `deploy/update/evidence/<tag>.md` (for example `v0.1.0.md`) for each release
+candidate and fill every field from observed hardware. **Never mark Stable eligible from an unrecorded run.**
 Every field below starts as **PENDING**; replace it only with an observed value or `PASS`/`FAIL`
 plus the evidence reference (log, screenshot, command output or trace).
 

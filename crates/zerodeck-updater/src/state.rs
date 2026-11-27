@@ -64,8 +64,13 @@ impl UpdateState {
         let Some(pending) = self.pending.take() else {
             return;
         };
+        let requested_rollback = pending
+            .rollback_target
+            .filter(|generation| generation != &pending.candidate);
         let previous = self.last_confirmed.replace(pending.candidate.clone());
-        if let Some(previous) = previous
+        if let Some(requested) = requested_rollback {
+            self.rollback_target = Some(requested);
+        } else if let Some(previous) = previous
             && previous != pending.candidate
         {
             self.rollback_target = Some(previous);
@@ -111,6 +116,13 @@ pub struct PendingTransaction {
     /// Pre-start failures remain recoverable without quarantining the candidate.
     #[serde(default)]
     pub start_attempted: bool,
+    /// Rollback generation to retain when this transaction is confirmed.
+    ///
+    /// A bootstrap conversion can promise a rollback target that differs from `last_confirmed`
+    /// (or exists while `last_confirmed` is absent). Persisting it here makes confirmation keep
+    /// that generation through GC instead of deriving the target only from the old confirmation.
+    #[serde(default)]
+    pub rollback_target: Option<GenerationId>,
 }
 
 /// Durable progress markers for a pending activation.
@@ -343,6 +355,7 @@ mod tests {
             phase: TransactionPhase::Switched,
             was_running: true,
             start_attempted: true,
+            rollback_target: None,
         }
     }
 

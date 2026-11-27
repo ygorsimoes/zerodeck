@@ -704,6 +704,7 @@ mod tests {
                 phase: TransactionPhase::Switched,
                 was_running: true,
                 start_attempted: true,
+                rollback_target: None,
             }),
             ..UpdateState::new()
         };

@@ -358,6 +358,7 @@ pub async fn apply_pending_with(
         phase: TransactionPhase::Prepared,
         was_running: prepared.was_running,
         start_attempted: false,
+        rollback_target: None,
     };
     persisted.pending = Some(transaction.clone());
     persisted.last_result = None;
@@ -519,6 +520,7 @@ fn offline_rollback(
         phase: TransactionPhase::Prepared,
         was_running: false,
         start_attempted: false,
+        rollback_target: None,
     };
     persisted.pending = Some(transaction.clone());
     persisted.last_result = None;

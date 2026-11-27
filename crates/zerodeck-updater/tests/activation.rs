@@ -2037,6 +2037,7 @@ async fn duplicate_pending_transaction_is_rejected_without_touching_the_service(
             phase: TransactionPhase::Switched,
             was_running: true,
             start_attempted: true,
+            rollback_target: None,
         }),
         ..UpdateState::new()
     });
@@ -2343,6 +2344,7 @@ fn recover_discards_a_stale_request_only_without_a_pending_transaction() {
         phase: TransactionPhase::Prepared,
         was_running: false,
         start_attempted: false,
+        rollback_target: None,
     });
     state.write(&pending_state).expect("write pending state");
     requests.write(&request).expect("seed request");
@@ -2616,6 +2618,7 @@ async fn first_install_pre_start_interruption_does_not_quarantine() {
             phase: TransactionPhase::Prepared,
             was_running: false,
             start_attempted: false,
+            rollback_target: None,
         }),
         ..UpdateState::new()
     });

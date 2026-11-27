@@ -225,6 +225,19 @@ ensure_install_path() {
     fi
 }
 
+# Validate the controller PATH link before any mutation. A repeat install or convert has an
+# intentional symlink to this controller; anything else at that path is not ours to replace.
+validate_bin_link() {
+    if [[ -L "${bin_link}" ]]; then
+        local target
+        target="$(readlink "${bin_link}")"
+        [[ "${target}" == "${controller_bin}" ]] || \
+            die "refusing to replace an unexpected controller symlink: ${bin_link} -> ${target}"
+    elif [[ -e "${bin_link}" ]]; then
+        die "refusing to replace a non-symlink controller path: ${bin_link}"
+    fi
+}
+
 verify_root_owned_tree() {
     local path="$1"
     [[ "$(id -u)" -eq 0 ]] || return 0
@@ -565,7 +578,6 @@ fi
 
 for path in \
     "${controller_bin}" \
-    "${bin_link}" \
     "${root}/current" \
     "${root}/state/update.json" \
     "${root}/state/apply.json" \
@@ -576,6 +588,7 @@ done
 for unit in "${units[@]}"; do
     [[ -L "${systemd_dir}/${unit}" ]] && die "refusing to replace a symlinked unit: ${systemd_dir}/${unit}"
 done
+validate_bin_link
 
 was_active=0
 if service_active; then
@@ -713,10 +726,15 @@ install_bin_link() {
     mkdir -p "${directory}"
     chmod 0755 "${directory}"
     if [[ -e "${bin_link}" && ! -L "${bin_link}" ]]; then
-        die "refusing to replace a non-symlink controller path: ${bin_link}"
+        echo "${PROGRAM}: error: refusing to replace a non-symlink controller path: ${bin_link}" >&2
+        return 1
     fi
-    if [[ -L "${bin_link}" && "$(readlink "${bin_link}")" == "${controller_bin}" ]]; then
-        return 0
+    if [[ -L "${bin_link}" ]]; then
+        if [[ "$(readlink "${bin_link}")" == "${controller_bin}" ]]; then
+            return 0
+        fi
+        echo "${PROGRAM}: error: refusing to replace an unexpected controller symlink: ${bin_link}" >&2
+        return 1
     fi
     staged="${directory}/.zerodeckctl.$$"
     ln -s "${controller_bin}" "${staged}"
@@ -751,7 +769,10 @@ install_units() {
     mkdir -p "${systemd_dir}"
     chmod 0755 "${systemd_dir}"
     for unit in "${units[@]}"; do
-        [[ -L "${systemd_dir}/${unit}" ]] && die "refusing to replace a symlinked unit: ${systemd_dir}/${unit}"
+        if [[ -L "${systemd_dir}/${unit}" ]]; then
+            echo "${PROGRAM}: error: refusing to replace a symlinked unit: ${systemd_dir}/${unit}" >&2
+            return 1
+        fi
         staged="${systemd_dir}/.${unit}.new.$$"
         install -m 0644 "${manual_root}/systemd/${unit}" "${staged}"
         mv "${staged}" "${systemd_dir}/${unit}"
@@ -864,7 +885,10 @@ confirm_bootstrap() {
 wait_for_ready() {
     local invocation
     invocation="$("${systemctl}" show -p InvocationID --value zerodeck.service 2>/dev/null || true)"
-    [[ -n "${invocation}" ]] || die "zerodeck.service has no InvocationID after start"
+    if [[ -z "${invocation}" ]]; then
+        echo "${PROGRAM}: error: zerodeck.service has no InvocationID after start" >&2
+        return 1
+    fi
     python3 - "${ready_url}" "${identity_version}" "${identity_build_id}" "${invocation}" <<'PY'
 import json
 import sys

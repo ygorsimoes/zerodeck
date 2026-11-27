@@ -364,6 +364,75 @@ grep -q "zerodeck.service started" "${tmp}/start-success.log" || {
     echo "--start did not report a started service" >&2; exit 1;
 }
 
+# ── Repeat bootstrap reuses the intentional controller link; dry-run accepts an installed host ──
+read -r root controller units config < <(new_install repeat-install)
+base="$(base_for "${root}")"
+run_bootstrap "${base}" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" >"${tmp}/repeat-first.log"
+repeat_link="${base}/usr/local/bin/zerodeckctl"
+[[ -L "${repeat_link}" ]] || { echo "repeat test: first install has no controller link" >&2; exit 1; }
+run_bootstrap "${base}" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" --convert-existing-zerodeck \
+    >"${tmp}/repeat-second.log"
+[[ "$(readlink "${repeat_link}")" == "${controller}/bin/zerodeckctl" ]] || {
+    echo "repeat bootstrap did not retain the intentional controller link" >&2; exit 1;
+}
+run_bootstrap "${base}" "${manual}" "${manual_sha}" "${managed}" "${managed_sha}" \
+    "${trusted_root}" "${root_sha}" --convert-existing-zerodeck --dry-run \
+    >"${tmp}/repeat-dry-run.log"
+grep -q "would install generation" "${tmp}/repeat-dry-run.log" || {
+    echo "dry run on an installed host did not validate" >&2; exit 1;
+}
+
+# ── A regular file at the controller link path fails before any partial installation ──────────
+read -r root controller units config < <(new_install link-conflict)
+base="$(base_for "${root}")"
+old_generation="$(printf 'd%.0s' {1..64})"
+mkdir -p "${controller}/bin" "${units}" "${root}/state" "$(dirname "${base}/usr/local/bin/zerodeckctl")"
+printf 'old-controller\n' >"${controller}/bin/zerodeckctl"
+chmod 0755 "${controller}/bin/zerodeckctl"
+printf '[Service]\nEnvironment=OLD_UNIT=1\n' >"${units}/zerodeck.service"
+printf '%s\n' "${old_generation}" >"${root}/current"
+printf '{"schema":1,"last_confirmed":"%s","pending":null}\n' "${old_generation}" \
+    >"${root}/state/update.json"
+printf 'not-our-link\n' >"${base}/usr/local/bin/zerodeckctl"
+controller_before="$(fixture_sha256 "${controller}/bin/zerodeckctl")"
+current_before="$(fixture_sha256 "${root}/current")"
+state_before="$(fixture_sha256 "${root}/state/update.json")"
+unit_before="$(fixture_sha256 "${units}/zerodeck.service")"
+FAKE_ZERODECK_ACTIVE=1
+export FAKE_ZERODECK_ACTIVE
+: >"${FAKE_SYSTEMCTL_LOG}"
+expect_failure link-conflict run_bootstrap "${base}" "${manual}" "${manual_sha}" \
+    "${managed}" "${managed_sha}" "${trusted_root}" "${root_sha}" \
+    --convert-existing-zerodeck --start
+unset FAKE_ZERODECK_ACTIVE
+grep -q "non-symlink controller path" "${tmp}/link-conflict.log" || {
+    echo "controller link conflict did not explain itself" >&2
+    cat "${tmp}/link-conflict.log" >&2
+    exit 1
+}
+[[ "$(fixture_sha256 "${controller}/bin/zerodeckctl")" == "${controller_before}" ]] || {
+    echo "controller link conflict replaced the old controller" >&2; exit 1;
+}
+[[ "$(fixture_sha256 "${root}/current")" == "${current_before}" ]] || {
+    echo "controller link conflict changed current" >&2; exit 1;
+}
+[[ "$(fixture_sha256 "${root}/state/update.json")" == "${state_before}" ]] || {
+    echo "controller link conflict changed state" >&2; exit 1;
+}
+[[ "$(fixture_sha256 "${units}/zerodeck.service")" == "${unit_before}" ]] || {
+    echo "controller link conflict changed the unit" >&2; exit 1;
+}
+if grep -qE '(^| )stop( |$)' "${FAKE_SYSTEMCTL_LOG}"; then
+    echo "controller link conflict stopped the running service before refusing" >&2
+    cat "${FAKE_SYSTEMCTL_LOG}" >&2
+    exit 1
+fi
+[[ "$(cat "${base}/usr/local/bin/zerodeckctl")" == "not-our-link" ]] || {
+    echo "controller link conflict overwrote the foreign file" >&2; exit 1;
+}
+
 # ── Inputs are copied and verified before use: swapping the source cannot change the install ────
 # Add a large member so the extraction window is observable, then replace the caller's files as
 # soon as the verified copies are complete. The installation must still come from the copies.

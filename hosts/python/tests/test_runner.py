@@ -17,6 +17,59 @@ from zerodeck_py_host.settings import SettingsManager
 
 
 class PluginRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_probe_acknowledges_only_its_own_generation(self) -> None:
+        async def emit_sink(_payload: dict[str, object]) -> None:
+            return None
+
+        runner = PluginRunner(
+            entrypoint=Path("unused-main.py"),
+            plugin_name="ProbeDemo",
+            api_version=1,
+            emit_sink=emit_sink,
+            generation="generation-current",
+        )
+        raw_reply = await runner.handle_message(
+            json.dumps(
+                {
+                    "type": 3,
+                    "generation": "generation-current",
+                    "probe": 0,
+                }
+            )
+        )
+        assert raw_reply is not None
+        self.assertEqual(
+            json.loads(raw_reply),
+            {
+                "type": 3,
+                "generation": "generation-current",
+                "status": "ready",
+                "probe": 0,
+            },
+        )
+        self.assertIsNone(
+            await runner.handle_message(
+                json.dumps(
+                    {
+                        "type": 3,
+                        "generation": "generation-stale",
+                        "probe": 0,
+                    }
+                )
+            )
+        )
+        self.assertIsNone(
+            await runner.handle_message(
+                json.dumps(
+                    {
+                        "type": 3,
+                        "generation": "generation-current",
+                        "probe": 9,
+                    }
+                )
+            )
+        )
+
     async def test_api_version_0_legacy_kwargs_dispatch_and_decky_plugin_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

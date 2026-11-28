@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the updater VM gate against a pinned Arch Linux cloud image (systemd, SSH, passwordless sudo).
 #
-#   deploy/update/tests/vm-ci.sh <dist-dir> <tag> <candidate-managed-archive>
+#   deploy/update/tests/vm-ci.sh <dist-dir> <tag> <candidate-managed-archive> [candidate-sha256]
 #
 # Needs qemu-system-x86_64, qemu-img, cloud-localds (cloud-image-utils), curl, ssh-keygen and the
 # archives written by `just dist <tag>` plus a newer managed archive from `just build-vm-candidate`. The image digest is pinned here and verified before use.
@@ -13,13 +13,17 @@ IMAGE_URL="https://geo.mirror.pkgbuild.com/images/v20261115.625457/Arch-Linux-x8
 IMAGE_SHA256="dbd02830f6eb0fe07ef6e5edaddbae8b577ce4296d9e79118904704cce0a1f60"
 GUEST_USER="arch"
 
-[[ $# -eq 3 ]] || {
-    echo "usage: vm-ci.sh <dist-dir> <tag> <candidate-managed-archive>" >&2
+[[ $# -eq 3 || $# -eq 4 ]] || {
+    echo "usage: vm-ci.sh <dist-dir> <tag> <candidate-managed-archive> [candidate-sha256]" >&2
     exit 2
 }
 dist="$1"
 tag="$2"
 candidate="$3"
+candidate_digest=()
+if [[ $# -eq 4 ]]; then
+    candidate_digest=(--candidate-sha256 "$4")
+fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/zerodeck-vm-ci.XXXXXX")"
 trap 'rm -rf "${work}"' EXIT
@@ -39,11 +43,11 @@ YAML
 printf 'instance-id: zerodeck-vm-ci\nlocal-hostname: zerodeck-vm\n' >"${work}/meta-data"
 cloud-localds "${work}/seed.img" "${work}/user-data" "${work}/meta-data"
 
-exec bash "${here}/vm.sh" \
+bash "${here}/vm.sh" \
     --image "${work}/base.qcow2" --image-sha256 "${IMAGE_SHA256}" \
     --ssh-key "${work}/key" --ssh-user "${GUEST_USER}" \
     --manual "${dist}/zerodeck-${tag}-linux-x86_64.tar.gz" \
     --managed "${dist}/zerodeck-${tag}-linux-x86_64.managed.tar.gz" \
-    --candidate "${candidate}" \
+    --candidate "${candidate}" "${candidate_digest[@]}" \
     --accel kvm \
     --qemu-arg -drive --qemu-arg "file=${work}/seed.img,if=virtio,format=raw,readonly=on"

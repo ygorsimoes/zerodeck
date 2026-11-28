@@ -71,7 +71,7 @@ mod tests {
                 python_bin: "python3".to_owned(),
                 host_module_path: Some(python_host_dir()),
             },
-            startup_timeout: Duration::from_secs(5),
+            startup_timeout: Duration::from_secs(15),
             shutdown_timeout: Duration::from_millis(250),
             crash_window: Duration::from_secs(30),
             max_crashes_in_window: 3,
@@ -92,6 +92,7 @@ mod tests {
         let entrypoint = plugin_dir.join("main.py");
         fs::write(&entrypoint, main_py).expect("write main.py");
         PluginSpawnSpec {
+            generation: format!("test-{directory}"),
             directory: directory.to_owned(),
             manifest: manifest.clone(),
             version: Some("1.0.0".to_owned()),
@@ -112,6 +113,7 @@ mod tests {
         let paths = PlatformPaths::from_lookup(|k| lookup.get(k).map(|v| (*v).to_owned()));
 
         let spec = PluginSpawnSpec {
+            generation: "test-powertools".to_owned(),
             directory: "powertools".to_owned(),
             manifest: PluginManifest {
                 name: "PowerTools".to_owned(),
@@ -170,6 +172,7 @@ mod tests {
         let paths = PlatformPaths::from_lookup(|k| lookup.get(k).map(|v| (*v).to_owned()));
 
         let non_root_spec = PluginSpawnSpec {
+            generation: "test-myplug".to_owned(),
             directory: "myplug".to_owned(),
             manifest: PluginManifest {
                 name: "MyPlug".to_owned(),
@@ -314,6 +317,239 @@ class Plugin:
                 if name == "ValueError" && message == "bad value"
         ));
 
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_is_not_running_before_migration_finishes() {
+        let dir = TestDir::new("sup-migration-ready");
+        let paths = test_paths(&dir.0);
+        let supervisor = PluginSupervisor::new(paths.clone(), fast_supervisor_config())
+            .expect("init supervisor");
+        let mut events = supervisor.subscribe_events();
+        let release = dir.0.join("finish-migration");
+        let spec = write_plugin(
+            &paths,
+            "migrating",
+            &PluginManifest {
+                name: "Migrating".to_owned(),
+                author: "Tester".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            &format!(
+                r#"import asyncio, decky
+from pathlib import Path
+
+class Plugin:
+    async def _migration(self):
+        await decky.emit("migrating")
+        while not Path({release:?}).exists():
+            await asyncio.sleep(0.01)
+
+    async def _main(self):
+        await asyncio.Event().wait()
+
+    async def ping(self):
+        return "pong"
+"#
+            ),
+        );
+        let worker = supervisor
+            .spawn_plugin(spec)
+            .await
+            .expect("start supervisor");
+        let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .expect("migration started before timeout")
+            .expect("migration event");
+        assert_eq!(event.event, "migrating");
+        assert_eq!(worker.state(), PluginState::Starting);
+        fs::write(release, "").expect("let the migration finish");
+        assert_eq!(
+            worker
+                .call_method("ping", json!([]), false)
+                .await
+                .expect("RPC ready"),
+            json!("pong")
+        );
+        assert!(matches!(
+            worker
+                .wait_ready("another-generation", Duration::from_secs(3))
+                .await,
+            Err(HostError::GenerationMismatch)
+        ));
+        worker
+            .wait_ready("test-migrating", Duration::from_secs(20))
+            .await
+            .expect("long-running main must not block readiness");
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_cannot_confirm_ready_after_early_main_failure() {
+        let dir = TestDir::new("sup-main-failed");
+        let paths = test_paths(&dir.0);
+        let supervisor = PluginSupervisor::new(
+            paths.clone(),
+            SupervisorConfig {
+                startup_timeout: Duration::from_secs(15),
+                ..fast_supervisor_config()
+            },
+        )
+        .expect("init supervisor");
+        let spec = write_plugin(
+            &paths,
+            "early_failure",
+            &PluginManifest {
+                name: "EarlyFailure".to_owned(),
+                author: "Tester".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            "import asyncio\nclass Plugin:\n    async def _main(self):\n        await asyncio.sleep(0.1)\n        raise ValueError('startup failure')\n",
+        );
+        let worker = supervisor
+            .spawn_plugin(spec)
+            .await
+            .expect("start supervisor");
+        let result = worker
+            .wait_ready("test-early_failure", Duration::from_secs(20))
+            .await;
+        assert!(
+            matches!(result, Err(HostError::StartupFailed(reason)) if reason.contains("startup failure"))
+        );
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_must_answer_ipc_at_end_of_startup_observation() {
+        let dir = TestDir::new("sup-main-blocks-ipc");
+        let paths = test_paths(&dir.0);
+        let supervisor = PluginSupervisor::new(
+            paths.clone(),
+            SupervisorConfig {
+                startup_timeout: Duration::from_secs(15),
+                ..fast_supervisor_config()
+            },
+        )
+        .expect("init supervisor");
+        let spec = write_plugin(
+            &paths,
+            "stalled_ipc",
+            &PluginManifest {
+                name: "StalledIpc".to_owned(),
+                author: "Tester".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            "import asyncio, threading\nclass Plugin:\n    async def _main(self):\n        await asyncio.sleep(0.2)\n        threading.Event().wait()\n",
+        );
+        let worker = supervisor
+            .spawn_plugin(spec)
+            .await
+            .expect("start supervisor");
+        let result = worker
+            .wait_ready("test-stalled_ipc", Duration::from_secs(20))
+            .await;
+        assert!(matches!(result, Err(HostError::StartupFailed(_))));
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_first_migration_cannot_be_confirmed_by_a_later_retry() {
+        let dir = TestDir::new("sup-first-migration-fails");
+        let paths = test_paths(&dir.0);
+        let supervisor = PluginSupervisor::new(paths.clone(), fast_supervisor_config())
+            .expect("init supervisor");
+        let marker = dir.0.join("migration-attempted");
+        let mut events = supervisor.subscribe_events();
+        let spec = write_plugin(
+            &paths,
+            "retry_migration",
+            &PluginManifest {
+                name: "RetryMigration".to_owned(),
+                author: "Tester".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            &format!(
+                r#"import decky
+from pathlib import Path
+
+class Plugin:
+    async def _migration(self):
+        marker = Path({marker:?})
+        if not marker.exists():
+            marker.touch()
+            raise ValueError("first migration failed")
+        await decky.emit("retry")
+
+    async def ping(self):
+        return "pong"
+"#
+            ),
+        );
+        let worker = supervisor
+            .spawn_plugin(spec)
+            .await
+            .expect("start supervisor");
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("supervisor retries migration")
+            .expect("migration event on retry");
+        assert_eq!(event.event, "retry");
+        assert_eq!(
+            worker
+                .call_method("ping", json!([]), false)
+                .await
+                .expect("retry can serve calls"),
+            json!("pong")
+        );
+        let result = worker
+            .wait_ready("test-retry_migration", Duration::from_secs(20))
+            .await;
+        assert!(matches!(result, Err(HostError::StartupFailed(_))));
+        supervisor.shutdown_all().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_stops_a_worker_that_never_finishes_migration() {
+        let dir = TestDir::new("sup-migration-timeout");
+        let paths = test_paths(&dir.0);
+        let config = SupervisorConfig {
+            startup_timeout: Duration::from_millis(500),
+            max_crashes_in_window: 1,
+            ..fast_supervisor_config()
+        };
+        let supervisor = PluginSupervisor::new(paths.clone(), config).expect("init supervisor");
+        let spec = write_plugin(
+            &paths,
+            "stalled",
+            &PluginManifest {
+                name: "Stalled".to_owned(),
+                author: "Tester".to_owned(),
+                flags: vec![],
+                api_version: 1,
+            },
+            "import asyncio\nclass Plugin:\n    async def _migration(self):\n        await asyncio.Event().wait()\n",
+        );
+        let worker = supervisor
+            .spawn_plugin(spec)
+            .await
+            .expect("start supervisor");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while worker.state() != PluginState::Failed {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervisor should enforce its startup deadline");
         supervisor.shutdown_all().await;
     }
 

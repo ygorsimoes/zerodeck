@@ -31,6 +31,9 @@ cat >"${fake_gh}" <<'SCRIPT'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_GH_LOG}"
 [[ "${FAKE_GH_ATTEST_FAIL:-0}" == "1" ]] && exit 1
+if [[ "${FAKE_GH_VM_ATTEST_FAIL:-0}" == 1 && "$*" == *"/qualify-stable.yml"* ]]; then
+    exit 1
+fi
 exit 0
 SCRIPT
 chmod 0755 "${fake_gh}"
@@ -42,6 +45,20 @@ expect_failure() {
     shift
     if "$@" >"${tmp}/${label}.log" 2>&1; then
         echo "error: ${label} unexpectedly succeeded" >&2
+        cat "${tmp}/${label}.log" >&2
+        exit 1
+    fi
+}
+
+expect_exit() {
+    local label="$1" expected="$2"
+    shift 2
+    set +e
+    "$@" >"${tmp}/${label}.log" 2>&1
+    local actual=$?
+    set -e
+    if [[ "${actual}" -ne "${expected}" ]]; then
+        echo "error: ${label} exited ${actual}, expected ${expected}" >&2
         cat "${tmp}/${label}.log" >&2
         exit 1
     fi
@@ -75,6 +92,14 @@ grep -q -- "--signer-workflow fixture/repo/.github/workflows/release-please.yml"
 rm -rf "${tmp}/out2"
 FAKE_GH_ATTEST_FAIL=1 expect_failure attest sign_ok stable "${tmp}/out2"
 [[ ! -e "${tmp}/out2/stable.json" ]]
+
+# Stable needs VM evidence attested for the very same archive; Testing can still advance.
+unqualified() { FAKE_GH_VM_ATTEST_FAIL=1 sign_ok stable "$1"; }
+expect_exit unqualified 33 unqualified "${tmp}/unqualified"
+[[ ! -e "${tmp}/unqualified/stable.json" ]]
+FAKE_GH_VM_ATTEST_FAIL=1 sign_ok testing "${tmp}/unqualified" >/dev/null
+[[ -s "${tmp}/unqualified/testing.json.sig" ]]
+grep -Fq -- "attestation verify ${managed} --repo fixture/repo --signer-workflow fixture/repo/.github/workflows/qualify-stable.yml --source-ref refs/heads/main --predicate-type https://github.com/fixture/repo/attestations/stable-vm/v1" "${FAKE_GH_LOG}"
 
 # A prerelease never enters Stable; a tampered or mismatched archive never enters any channel.
 prerelease_tag="v0.1.0-rc.1"

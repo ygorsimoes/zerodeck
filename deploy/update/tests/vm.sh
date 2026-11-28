@@ -687,20 +687,21 @@ SCRIPT
 
 write_catalog_authorization() {
     local digest="$1" version="$2" build_id="$3" size="$4" target="$5"
-    guest_root_script <<'SCRIPT' "${digest}" "${version}" "${build_id}" "${size}" "${target}"
+    guest_root_script <<'SCRIPT' "${digest}" "${version}" "${build_id}" "${size}" "${target}" "${managed_version}"
 set -euo pipefail
 digest="$1"
 version="$2"
 build_id="$3"
 size="$4"
 target="$5"
-python3 - "/home/.zerodeck/state/catalog.json" "${digest}" "${version}" "${build_id}" "${size}" "${target}" <<'PY'
+controller_version="$6"
+python3 - "/home/.zerodeck/state/catalog.json" "${digest}" "${version}" "${build_id}" "${size}" "${target}" "${controller_version}" <<'PY'
 import json
 import os
 import sys
 import time
 
-path, digest, version, build_id, size, target = sys.argv[1:7]
+path, digest, version, build_id, size, target, controller_version = sys.argv[1:8]
 now = int(time.time())
 document = {
     "schema": 1,
@@ -712,11 +713,11 @@ document = {
         "digest": digest,
         "size": int(size),
         "build_id": build_id,
-        "min_updater": "0.1.0",
+        "min_updater": controller_version,
         "target": target,
     },
     # `upgrade` rechecks the selection that produced the authorization (channel, updater version).
-    "selection": {"channel": "stable", "updater_version": "0.1.0"},
+    "selection": {"channel": "stable", "updater_version": controller_version},
 }
 temporary = path + ".tmp"
 with open(temporary, "w", encoding="utf-8") as handle:

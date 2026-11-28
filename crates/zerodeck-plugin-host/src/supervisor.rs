@@ -13,18 +13,25 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use zerodeck_platform::{PlatformPaths, PrivilegeTarget, lock_unpoisoned};
-use zerodeck_protocol::{PluginIpcFromWorker, PluginIpcToWorker};
+use zerodeck_protocol::{PluginIpcFromWorker, PluginIpcToWorker, WorkerStartup};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, BorrowedFd};
 #[cfg(unix)]
-use zerodeck_platform::{HostUserIdentity, current_process_identity, ensure_owned_dir};
+use zerodeck_platform::{
+    HostUserIdentity, check_root_only_tree, check_secure_ancestors, current_process_identity,
+    ensure_owned_dir,
+};
 
 use crate::{BoxHostFuture, HostError, PluginRuntime, PluginSpawnSpec, PythonHostConfig};
 
 /// Maximum newline-delimited JSON line accepted from a worker (4 MiB, matching `zerodeck-py-host`).
 const MAX_IPC_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
+const STARTUP_OBSERVATION: Duration = Duration::from_secs(2);
+const OBSERVATION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const INITIAL_PROBE: u8 = 0;
+const OBSERVATION_PROBE: u8 = 1;
 
 /// Lifecycle state of a supervised plugin worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -35,6 +42,27 @@ pub enum PluginState {
     BackingOff,
     Failed,
     Stopping,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerStatus {
+    state: PluginState,
+    confirmed: bool,
+    ever_confirmed: bool,
+    initial_failure: Option<String>,
+    failure: Option<String>,
+}
+
+impl WorkerStatus {
+    fn new(state: PluginState) -> Self {
+        Self {
+            state,
+            confirmed: false,
+            ever_confirmed: false,
+            initial_failure: None,
+            failure: None,
+        }
+    }
 }
 
 /// Asynchronous event emitted by a plugin worker via `decky.emit(...)`.
@@ -85,7 +113,8 @@ pub struct PluginSupervisor {
     events_tx: broadcast::Sender<PluginEvent>,
     plugins: Mutex<HashMap<String, Arc<ManagedPlugin>>>,
     lifecycle_lock: tokio::sync::Mutex<()>,
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
+    allow_unsafe_root_plugins: Arc<AtomicBool>,
 }
 
 impl PluginSupervisor {
@@ -106,7 +135,8 @@ impl PluginSupervisor {
             events_tx,
             plugins: Mutex::new(HashMap::new()),
             lifecycle_lock: tokio::sync::Mutex::new(()),
-            shutting_down: AtomicBool::new(false),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            allow_unsafe_root_plugins: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -114,6 +144,12 @@ impl PluginSupervisor {
     #[must_use]
     pub fn subscribe_events(&self) -> broadcast::Receiver<PluginEvent> {
         self.events_tx.subscribe()
+    }
+
+    /// Sets the daemon's explicit development override for privileged worker launches.
+    pub fn set_allow_unsafe_root_plugins(&self, allow: bool) {
+        self.allow_unsafe_root_plugins
+            .store(allow, Ordering::Relaxed);
     }
 
     /// Returns the resolved unprivileged host username (used when building plugin envs).
@@ -179,6 +215,8 @@ impl PluginSupervisor {
             #[cfg(unix)]
             self.host_user.clone(),
             self.events_tx.clone(),
+            Arc::clone(&self.allow_unsafe_root_plugins),
+            Arc::clone(&self.shutting_down),
         )
         .await?;
 
@@ -207,11 +245,15 @@ impl PluginSupervisor {
     /// Returns the current [`PluginState`] for a supervised plugin if registered.
     #[must_use]
     pub fn plugin_state(&self, plugin_name: &str) -> Option<PluginState> {
-        let managed = {
-            let guard = lock_unpoisoned(&self.plugins);
-            guard.get(plugin_name).cloned()
-        }?;
-        Some(managed.state())
+        self.plugin_status(plugin_name).map(|(state, _)| state)
+    }
+
+    /// Returns the current state and startup failure, if any, from one worker snapshot.
+    #[must_use]
+    pub fn plugin_status(&self, plugin_name: &str) -> Option<(PluginState, Option<String>)> {
+        let managed = lock_unpoisoned(&self.plugins).get(plugin_name).cloned()?;
+        let status = managed.state_rx.borrow();
+        Some((status.state, status.failure.clone()))
     }
 
     /// Gracefully stops a single supervised plugin (running `_uninstall` when `uninstall` is true).
@@ -288,7 +330,7 @@ enum SupervisorCmd {
 #[derive(Debug)]
 pub struct ManagedPlugin {
     spec: PluginSpawnSpec,
-    state_rx: watch::Receiver<PluginState>,
+    state_rx: watch::Receiver<WorkerStatus>,
     active: Arc<Mutex<Option<ActiveWorker>>>,
     cmd_tx: mpsc::Sender<SupervisorCmd>,
     startup_timeout: Duration,
@@ -301,8 +343,10 @@ impl ManagedPlugin {
         config: SupervisorConfig,
         #[cfg(unix)] host_user: HostUserIdentity,
         events_tx: broadcast::Sender<PluginEvent>,
+        allow_unsafe_root_plugins: Arc<AtomicBool>,
+        shutting_down: Arc<AtomicBool>,
     ) -> Result<Arc<Self>, HostError> {
-        let (state_tx, state_rx) = watch::channel(PluginState::Starting);
+        let (state_tx, state_rx) = watch::channel(WorkerStatus::new(PluginState::Starting));
         let active = Arc::new(Mutex::new(None));
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -325,24 +369,60 @@ impl ManagedPlugin {
             state_tx,
             active,
             cmd_rx,
+            allow_unsafe_root_plugins,
+            shutting_down,
         };
         tokio::spawn(run_supervisor_loop(ctx, ready_tx));
 
-        let _ = ready_rx.await;
+        ready_rx.await.map_err(|_| HostError::WorkerStopped)??;
         Ok(managed)
     }
 
     /// Current lifecycle state of this plugin worker.
     #[must_use]
     pub fn state(&self) -> PluginState {
-        *self.state_rx.borrow()
+        self.state_rx.borrow().state
+    }
+
+    /// Waits for this generation to finish startup and its observation window.
+    pub async fn wait_ready(
+        &self,
+        expected_generation: &str,
+        timeout: Duration,
+    ) -> Result<(), HostError> {
+        if expected_generation != self.spec.generation {
+            return Err(HostError::GenerationMismatch);
+        }
+        let mut rx = self.state_rx.clone();
+        tokio::time::timeout(timeout, async {
+            loop {
+                {
+                    let current = rx.borrow_and_update();
+                    if let Some(reason) = &current.initial_failure {
+                        return Err(HostError::StartupFailed(reason.clone()));
+                    }
+                    if current.confirmed {
+                        return Ok(());
+                    }
+                    if let Some(reason) = &current.failure {
+                        return Err(HostError::StartupFailed(reason.clone()));
+                    }
+                    if !matches!(current.state, PluginState::Starting | PluginState::Running) {
+                        return Err(HostError::WorkerStopped);
+                    }
+                }
+                rx.changed().await.map_err(|_| HostError::WorkerStopped)?;
+            }
+        })
+        .await
+        .map_err(|_| HostError::StartupTimeout)?
     }
 
     async fn wait_for_active_worker(&self) -> Result<ActiveWorkerHandle, HostError> {
         let mut rx = self.state_rx.clone();
         let deadline = tokio::time::Instant::now() + self.startup_timeout;
         loop {
-            let current = *rx.borrow_and_update();
+            let current = rx.borrow_and_update().state;
             match current {
                 PluginState::Running => {
                     let guard = lock_unpoisoned(&self.active);
@@ -397,7 +477,9 @@ impl PluginRuntime for ManagedPlugin {
             let call = PluginIpcToWorker::new_call(method, args, legacy);
             let call_id = match &call {
                 PluginIpcToWorker::Call { id, .. } => id.clone(),
-                PluginIpcToWorker::Control { .. } => unreachable!(),
+                PluginIpcToWorker::Control { .. } | PluginIpcToWorker::StartupProbe { .. } => {
+                    unreachable!()
+                }
             };
             let encoded =
                 serde_json::to_string(&call).map_err(zerodeck_protocol::ProtocolError::from)?;
@@ -450,91 +532,222 @@ struct SupervisorTaskCtx {
     #[cfg(unix)]
     host_user: HostUserIdentity,
     events_tx: broadcast::Sender<PluginEvent>,
-    state_tx: watch::Sender<PluginState>,
+    state_tx: watch::Sender<WorkerStatus>,
     active: Arc<Mutex<Option<ActiveWorker>>>,
     cmd_rx: mpsc::Receiver<SupervisorCmd>,
+    allow_unsafe_root_plugins: Arc<AtomicBool>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl SupervisorTaskCtx {
     fn set_state(&self, next: PluginState) {
-        let _ = self.state_tx.send(next);
+        self.state_tx.send_modify(|status| {
+            status.state = next;
+            status.confirmed = false;
+            if next == PluginState::Starting {
+                status.failure = None;
+            }
+        });
+    }
+
+    fn record_failure(&self, reason: String) {
+        self.state_tx.send_modify(|status| {
+            if !status.ever_confirmed && status.initial_failure.is_none() {
+                status.initial_failure = Some(reason.clone());
+            }
+            status.failure = Some(reason);
+        });
     }
 }
 
-async fn run_supervisor_loop(mut ctx: SupervisorTaskCtx, initial_ready: oneshot::Sender<()>) {
+async fn run_supervisor_loop(
+    mut ctx: SupervisorTaskCtx,
+    initial_ready: oneshot::Sender<Result<(), HostError>>,
+) {
     let mut initial_ready = Some(initial_ready);
-    let mut recent_crashes: VecDeque<Instant> = VecDeque::new();
-    let mut backoff = ctx.config.initial_backoff;
+    let mut restart = RestartState {
+        recent_crashes: VecDeque::new(),
+        backoff: ctx.config.initial_backoff,
+        startup_failures: 0,
+    };
+    let env_python_path = std::env::var("PYTHONPATH").ok();
 
     loop {
         ctx.set_state(PluginState::Starting);
+        let validation = tokio::select! {
+            biased;
+            command = ctx.cmd_rx.recv() => {
+                acknowledge_stopped(&ctx, command);
+                return;
+            }
+            result = validate_worker_launch(
+                &ctx.paths,
+                &ctx.spec,
+                &ctx.allow_unsafe_root_plugins,
+                ctx.config.python_host.host_module_path.as_deref()
+                    .or(env_python_path.as_deref()),
+            ) => result,
+        };
+        if let Err(err) = validation {
+            let reason = err.to_string();
+            warn!(plugin = %ctx.spec.manifest.name, %reason, "plugin worker launch refused");
+            if let Some(tx) = initial_ready.take() {
+                let _ = tx.send(Err(err));
+            } else {
+                ctx.record_failure(reason);
+                ctx.set_state(PluginState::Failed);
+                wait_for_shutdown_only(&mut ctx).await;
+            }
+            return;
+        }
         let spawned_at = Instant::now();
-        let spawn_result = spawn_worker_process(&ctx);
+        let spawn_result = spawn_worker_process(&mut ctx);
         if let Some(tx) = initial_ready.take() {
-            let _ = tx.send(());
+            let _ = tx.send(Ok(()));
         }
 
         let mut running = match spawn_result {
-            Ok(worker) => {
-                ctx.set_state(PluginState::Running);
-                info!(plugin = %ctx.spec.manifest.name, "plugin worker started");
-                worker
+            Ok(worker) => worker,
+            Err(HostError::WorkerStopped) => {
+                ctx.set_state(PluginState::Stopped);
+                return;
             }
             Err(err) => {
                 error!(plugin = %ctx.spec.manifest.name, error = %err, "failed to spawn plugin worker");
-                if record_crash_and_check_trip(&mut recent_crashes, &ctx.config) {
-                    ctx.set_state(PluginState::Failed);
-                    wait_for_shutdown_only(&mut ctx).await;
+                ctx.record_failure(err.to_string());
+                restart.startup_failures = restart.startup_failures.saturating_add(1);
+                if handle_unexpected_exit(
+                    &mut ctx,
+                    spawned_at,
+                    &mut restart.recent_crashes,
+                    &mut restart.backoff,
+                    restart.startup_failures,
+                )
+                .await
+                {
                     return;
                 }
-                ctx.set_state(PluginState::BackingOff);
-                if wait_backoff_or_shutdown(&mut ctx, backoff).await {
-                    ctx.set_state(PluginState::Stopped);
-                    return;
-                }
-                backoff = next_backoff(backoff, ctx.config.max_backoff);
+                restart.backoff = next_backoff(restart.backoff, ctx.config.max_backoff);
                 continue;
             }
         };
 
         let exit_reason = wait_worker_or_command(&mut ctx, &mut running).await;
+        let confirmed = ctx.state_tx.borrow().confirmed;
+        ctx.set_state(PluginState::Stopping);
         fail_pending_calls(&running.pending);
         *lock_unpoisoned(&ctx.active) = None;
-
-        match exit_reason {
-            WorkerExit::Shutdown { uninstall, done } => {
-                ctx.set_state(PluginState::Stopping);
-                let res = terminate_worker(running, uninstall, ctx.config.shutdown_timeout).await;
-                ctx.set_state(PluginState::Stopped);
-                let _ = done.send(res);
-                return;
-            }
-            WorkerExit::IpcClosed => {
-                warn!(
-                    plugin = %ctx.spec.manifest.name,
-                    "plugin IPC reader terminated; terminating worker for restart"
-                );
-                let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
-                if handle_unexpected_exit(&mut ctx, spawned_at, &mut recent_crashes, &mut backoff)
-                    .await
-                {
-                    return;
-                }
-            }
-            WorkerExit::Crashed(status_msg) => {
-                warn!(
-                    plugin = %ctx.spec.manifest.name,
-                    reason = %status_msg,
-                    "plugin worker exited unexpectedly"
-                );
-                if handle_unexpected_exit(&mut ctx, spawned_at, &mut recent_crashes, &mut backoff)
-                    .await
-                {
-                    return;
-                }
-            }
+        if handle_worker_exit(
+            &mut ctx,
+            exit_reason,
+            running,
+            confirmed,
+            spawned_at,
+            &mut restart,
+        )
+        .await
+        {
+            return;
         }
     }
+}
+
+struct RestartState {
+    recent_crashes: VecDeque<Instant>,
+    backoff: Duration,
+    startup_failures: usize,
+}
+
+async fn handle_worker_exit(
+    ctx: &mut SupervisorTaskCtx,
+    exit_reason: WorkerExit,
+    running: RunningWorkerProcess,
+    confirmed: bool,
+    spawned_at: Instant,
+    restart: &mut RestartState,
+) -> bool {
+    let reason = match exit_reason {
+        WorkerExit::Shutdown { uninstall, done } => {
+            let res = terminate_worker(running, uninstall, ctx.config.shutdown_timeout).await;
+            ctx.set_state(PluginState::Stopped);
+            let _ = done.send(res);
+            return true;
+        }
+        WorkerExit::IpcClosed => {
+            ctx.record_failure("plugin IPC reader terminated".to_owned());
+            let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
+            "plugin IPC reader terminated".to_owned()
+        }
+        WorkerExit::StartupFailed(reason) => {
+            ctx.record_failure(reason.clone());
+            let _ = terminate_worker(running, false, ctx.config.shutdown_timeout).await;
+            reason
+        }
+        WorkerExit::Crashed(reason) => reason,
+    };
+    warn!(plugin = %ctx.spec.manifest.name, %reason, "plugin worker exited unexpectedly");
+    ctx.record_failure(reason);
+    if confirmed {
+        restart.startup_failures = 0;
+    } else {
+        restart.startup_failures = restart.startup_failures.saturating_add(1);
+    }
+    handle_unexpected_exit(
+        ctx,
+        spawned_at,
+        &mut restart.recent_crashes,
+        &mut restart.backoff,
+        restart.startup_failures,
+    )
+    .await
+}
+
+/// Checks the actual executable tree for every launch, including supervisor-owned retries.
+async fn validate_worker_launch(
+    paths: &PlatformPaths,
+    spec: &PluginSpawnSpec,
+    allow_unsafe_root_plugins: &AtomicBool,
+    python_path: Option<&str>,
+) -> Result<(), HostError> {
+    #[cfg(unix)]
+    if spec.privilege_target() == PrivilegeTarget::Root && current_process_identity().euid == 0 {
+        if allow_unsafe_root_plugins.load(Ordering::Relaxed) {
+            warn!(plugin = %spec.manifest.name, "--allow-unsafe-root-plugins skips the ownership check");
+            return Ok(());
+        }
+        let directory = paths.plugins_dir().join(&spec.directory);
+        let entrypoint = spec.entrypoint.clone();
+        let plugin = spec.manifest.name.clone();
+        let python_path = python_path.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            // Shared ancestors make both plugin import roots reachable through a trusted path.
+            check_secure_ancestors(&entrypoint)?;
+            // Python loads vendored modules from DECKY_PLUGIN_DIR and starts in the entrypoint's
+            // parent. Both import roots must be trusted.
+            check_root_only_tree(&directory)?;
+            if let Some(parent) = entrypoint.parent().filter(|parent| *parent != directory) {
+                check_root_only_tree(parent)?;
+            }
+            // A root worker also imports the Python host and any other PYTHONPATH modules. Never
+            // let a user-writable entry shadow root-owned code.
+            if let Some(path) = python_path {
+                for entry in std::env::split_paths(&path) {
+                    if entry.as_os_str().is_empty() {
+                        continue;
+                    }
+                    check_secure_ancestors(&entry)?;
+                    check_root_only_tree(&entry)?;
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| HostError::StartupFailed(format!("cannot validate `{plugin}`: {err}")))?
+        .map_err(HostError::UnsafeRootPlugin)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (paths, spec, allow_unsafe_root_plugins, python_path);
+    Ok(())
 }
 
 async fn handle_unexpected_exit(
@@ -542,12 +755,15 @@ async fn handle_unexpected_exit(
     spawned_at: Instant,
     recent_crashes: &mut VecDeque<Instant>,
     backoff: &mut Duration,
+    startup_failures: usize,
 ) -> bool {
     if spawned_at.elapsed() >= ctx.config.stability_window {
         *backoff = ctx.config.initial_backoff;
         recent_crashes.clear();
     }
-    if record_crash_and_check_trip(recent_crashes, &ctx.config) {
+    if startup_failures >= ctx.config.max_crashes_in_window
+        || record_crash_and_check_trip(recent_crashes, &ctx.config)
+    {
         error!(
             plugin = %ctx.spec.manifest.name,
             window_secs = ctx.config.crash_window.as_secs(),
@@ -565,6 +781,13 @@ async fn handle_unexpected_exit(
     }
     *backoff = next_backoff(*backoff, ctx.config.max_backoff);
     false
+}
+
+fn acknowledge_stopped(ctx: &SupervisorTaskCtx, command: Option<SupervisorCmd>) {
+    ctx.set_state(PluginState::Stopped);
+    if let Some(SupervisorCmd::Shutdown { done, .. }) = command {
+        let _ = done.send(Ok(()));
+    }
 }
 
 fn record_crash_and_check_trip(
@@ -612,6 +835,7 @@ enum WorkerExit {
         done: oneshot::Sender<Result<(), HostError>>,
     },
     IpcClosed,
+    StartupFailed(String),
     Crashed(String),
 }
 
@@ -622,26 +846,101 @@ struct RunningWorkerProcess {
     write_task: tokio::task::JoinHandle<()>,
     read_task: tokio::task::JoinHandle<()>,
     pending: SharedPendingCalls,
+    startup_rx: watch::Receiver<Option<WorkerStartup>>,
+}
+
+#[derive(PartialEq, Eq)]
+enum StartupPhase {
+    Starting,
+    Observing,
+    Verifying,
+    Confirmed,
+}
+
+fn send_startup_probe(
+    running: &RunningWorkerProcess,
+    generation: &str,
+    probe: u8,
+) -> Result<(), HostError> {
+    let frame = serde_json::to_string(&PluginIpcToWorker::StartupProbe {
+        generation: generation.to_owned(),
+        probe,
+    })
+    .map_err(zerodeck_protocol::ProtocolError::from)?;
+    running
+        .write_tx
+        .try_send(frame)
+        .map_err(|_| HostError::WorkerStopped)
 }
 
 async fn wait_worker_or_command(
     ctx: &mut SupervisorTaskCtx,
     running: &mut RunningWorkerProcess,
 ) -> WorkerExit {
-    tokio::select! {
-        status = running.child.wait() => {
-            let msg = match status {
-                Ok(exit) => format!("exit status {exit}"),
-                Err(err) => format!("wait error: {err}"),
-            };
-            WorkerExit::Crashed(msg)
-        }
-        _ = &mut running.read_task => WorkerExit::IpcClosed,
-        cmd = ctx.cmd_rx.recv() => match cmd {
-            Some(SupervisorCmd::Shutdown { uninstall, done }) => WorkerExit::Shutdown { uninstall, done },
-            None => {
-                let (done, _) = oneshot::channel();
-                WorkerExit::Shutdown { uninstall: false, done }
+    let deadline = tokio::time::sleep(ctx.config.startup_timeout);
+    tokio::pin!(deadline);
+    let mut phase = StartupPhase::Starting;
+    let mut startup_open = true;
+    if let Err(err) = send_startup_probe(running, &ctx.spec.generation, INITIAL_PROBE) {
+        return WorkerExit::StartupFailed(err.to_string());
+    }
+    loop {
+        tokio::select! {
+            biased;
+            cmd = ctx.cmd_rx.recv() => {
+                return match cmd {
+                    Some(SupervisorCmd::Shutdown { uninstall, done }) => WorkerExit::Shutdown { uninstall, done },
+                    None => {
+                        let (done, _) = oneshot::channel();
+                        WorkerExit::Shutdown { uninstall: false, done }
+                    }
+                };
+            }
+            changed = running.startup_rx.changed(), if startup_open && phase != StartupPhase::Confirmed => {
+                startup_open = changed.is_ok();
+                match running.startup_rx.borrow_and_update().as_ref() {
+                    Some(WorkerStartup::StartupFailed { error }) => {
+                        return WorkerExit::StartupFailed(error.clone());
+                    }
+                    Some(WorkerStartup::Ready { probe: INITIAL_PROBE }) if phase == StartupPhase::Starting && startup_open => {
+                        if deadline.is_elapsed() {
+                            return WorkerExit::StartupFailed(HostError::StartupTimeout.to_string());
+                        }
+                        phase = StartupPhase::Observing;
+                        ctx.set_state(PluginState::Running);
+                        info!(plugin = %ctx.spec.manifest.name, "plugin worker ready for IPC");
+                        deadline.as_mut().reset(tokio::time::Instant::now() + STARTUP_OBSERVATION);
+                    }
+                    Some(WorkerStartup::Ready { probe: OBSERVATION_PROBE }) if phase == StartupPhase::Verifying && startup_open => {
+                        if deadline.is_elapsed() {
+                            return WorkerExit::StartupFailed(HostError::StartupTimeout.to_string());
+                        }
+                        phase = StartupPhase::Confirmed;
+                        ctx.state_tx.send_modify(|status| {
+                            status.confirmed = true;
+                            status.ever_confirmed = true;
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut running.read_task => return WorkerExit::IpcClosed,
+            status = running.child.wait() => {
+                let msg = match status {
+                    Ok(exit) => format!("exit status {exit}"),
+                    Err(err) => format!("wait error: {err}"),
+                };
+                return WorkerExit::Crashed(msg);
+            }
+            () = &mut deadline, if phase != StartupPhase::Confirmed => {
+                if phase != StartupPhase::Observing {
+                    return WorkerExit::StartupFailed(HostError::StartupTimeout.to_string());
+                }
+                if let Err(err) = send_startup_probe(running, &ctx.spec.generation, OBSERVATION_PROBE) {
+                    return WorkerExit::StartupFailed(err.to_string());
+                }
+                phase = StartupPhase::Verifying;
+                deadline.as_mut().reset(tokio::time::Instant::now() + OBSERVATION_PROBE_TIMEOUT);
             }
         }
     }
@@ -652,16 +951,15 @@ async fn terminate_worker(
     uninstall: bool,
     grace: Duration,
 ) -> Result<(), HostError> {
+    let deadline = tokio::time::Instant::now() + grace;
     if let Ok(encoded) = serde_json::to_string(&PluginIpcToWorker::Control { uninstall }) {
-        let _ = running.write_tx.send(encoded).await;
+        let _ = tokio::time::timeout_at(deadline, running.write_tx.send(encoded)).await;
     }
 
     // Dropping the sender signals the writer task to flush the Control frame and shut down
     // the socket write half, delivering clean EOF to `zerodeck-py-host`.
     drop(running.write_tx);
-    let _ = tokio::time::timeout(Duration::from_millis(500), &mut running.write_task).await;
-
-    if tokio::time::timeout(grace, running.child.wait())
+    if tokio::time::timeout_at(deadline, running.child.wait())
         .await
         .is_err()
     {
@@ -670,6 +968,7 @@ async fn terminate_worker(
         let _ = running.child.wait().await;
     }
 
+    running.write_task.abort();
     running.read_task.abort();
     Ok(())
 }
@@ -691,10 +990,21 @@ fn send_sigkill(child: &mut tokio::process::Child) {
 }
 
 #[cfg(unix)]
-fn spawn_worker_process(ctx: &SupervisorTaskCtx) -> Result<RunningWorkerProcess, HostError> {
+fn spawn_worker_process(ctx: &mut SupervisorTaskCtx) -> Result<RunningWorkerProcess, HostError> {
     let (parent_std, child_std) = prepare_worker_dirs_and_socket(ctx)?;
     let mut cmd = build_isolated_command(ctx, child_std.as_raw_fd());
 
+    match ctx.cmd_rx.try_recv() {
+        Ok(command) => {
+            acknowledge_stopped(ctx, Some(command));
+            return Err(HostError::WorkerStopped);
+        }
+        Err(mpsc::error::TryRecvError::Disconnected) => return Err(HostError::WorkerStopped),
+        Err(mpsc::error::TryRecvError::Empty) => {}
+    }
+    if ctx.shutting_down.load(Ordering::SeqCst) {
+        return Err(HostError::WorkerStopped);
+    }
     let child = cmd.spawn().map_err(|source| HostError::ProcessIo {
         plugin: ctx.spec.manifest.name.clone(),
         source,
@@ -844,6 +1154,7 @@ fn wire_worker_io(
 
     let (write_tx, mut write_rx) = mpsc::channel::<String>(128);
     let pending: SharedPendingCalls = Arc::new(Mutex::new(PendingCalls::default()));
+    let (startup_tx, startup_rx) = watch::channel(None);
 
     let write_plugin = plugin_name.clone();
     let write_task = tokio::spawn(async move {
@@ -860,8 +1171,17 @@ fn wire_worker_io(
     let read_plugin = plugin_name.clone();
     let read_pending = Arc::clone(&pending);
     let read_events = ctx.events_tx.clone();
+    let generation = ctx.spec.generation.clone();
     let read_task = tokio::spawn(async move {
-        run_ipc_reader(read_plugin, read_half, read_pending, read_events).await;
+        run_ipc_reader(
+            read_plugin,
+            read_half,
+            read_pending,
+            read_events,
+            generation,
+            startup_tx,
+        )
+        .await;
     });
 
     *lock_unpoisoned(&ctx.active) = Some(ActiveWorker {
@@ -876,11 +1196,12 @@ fn wire_worker_io(
         write_task,
         read_task,
         pending,
+        startup_rx,
     })
 }
 
 #[cfg(not(unix))]
-fn spawn_worker_process(ctx: &SupervisorTaskCtx) -> Result<RunningWorkerProcess, HostError> {
+fn spawn_worker_process(ctx: &mut SupervisorTaskCtx) -> Result<RunningWorkerProcess, HostError> {
     Err(HostError::ProcessIo {
         plugin: ctx.spec.manifest.name.clone(),
         source: std::io::Error::new(
@@ -895,6 +1216,8 @@ async fn run_ipc_reader<R: AsyncRead + Unpin>(
     reader: R,
     pending: SharedPendingCalls,
     events_tx: broadcast::Sender<PluginEvent>,
+    expected_generation: String,
+    startup_tx: watch::Sender<Option<WorkerStartup>>,
 ) {
     let mut buf = BufReader::new(reader);
     loop {
@@ -940,6 +1263,19 @@ async fn run_ipc_reader<R: AsyncRead + Unpin>(
                             event,
                             args,
                         });
+                    }
+                    Ok(PluginIpcFromWorker::Startup { generation, status }) => {
+                        if generation == expected_generation {
+                            startup_tx.send_if_modified(|current| {
+                                if matches!(current, Some(WorkerStartup::StartupFailed { .. }))
+                                    || current.as_ref() == Some(&status)
+                                {
+                                    return false;
+                                }
+                                *current = Some(status);
+                                true
+                            });
+                        }
                     }
                     Err(err) => {
                         warn!(plugin = %plugin_name, error = %err, "ignored malformed IPC line");
@@ -1085,14 +1421,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipc_discards_startup_reports_for_another_generation() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let (events, mut event_rx) = broadcast::channel(1);
+        let (startup_tx, mut startup_rx) = watch::channel(None);
+        let task = tokio::spawn(run_ipc_reader(
+            "demo".to_owned(),
+            reader,
+            Arc::new(Mutex::new(PendingCalls::default())),
+            events,
+            "current".to_owned(),
+            startup_tx,
+        ));
+        writer
+            .write_all(
+                b"{\"type\":3,\"generation\":\"older\",\"status\":\"ready\",\"probe\":0}\n\
+                  {\"type\":2,\"event\":\"processed\",\"args\":[]}\n",
+            )
+            .await
+            .expect("write startup and marker frames");
+        assert_eq!(
+            event_rx.recv().await.expect("marker event").event,
+            "processed"
+        );
+        assert_eq!(*startup_rx.borrow(), None);
+        writer
+            .write_all(
+                b"{\"type\":3,\"generation\":\"current\",\"status\":\"ready\",\"probe\":0}\n",
+            )
+            .await
+            .expect("write current startup report");
+        startup_rx.changed().await.expect("current report");
+        assert_eq!(
+            *startup_rx.borrow(),
+            Some(WorkerStartup::Ready {
+                probe: INITIAL_PROBE
+            })
+        );
+        drop(writer);
+        task.await.expect("IPC reader exits");
+    }
+
+    #[tokio::test]
     async fn wait_for_active_worker_observes_transition_without_lost_wakeup() {
-        let (state_tx, state_rx) = watch::channel(PluginState::Starting);
+        let (state_tx, state_rx) = watch::channel(WorkerStatus::new(PluginState::Starting));
         let active = Arc::new(Mutex::new(None));
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
         let (write_tx, _write_rx) = mpsc::channel(1);
 
         let managed = ManagedPlugin {
             spec: PluginSpawnSpec {
+                generation: "test".to_owned(),
                 directory: "demo".to_owned(),
                 manifest: zerodeck_protocol::PluginManifest {
                     name: "Demo".to_owned(),
@@ -1117,7 +1496,7 @@ mod tests {
             write_tx,
             pending: Arc::new(Mutex::new(PendingCalls::default())),
         });
-        let _ = state_tx.send(PluginState::Running);
+        let _ = state_tx.send(WorkerStatus::new(PluginState::Running));
 
         let handle = managed
             .wait_for_active_worker()

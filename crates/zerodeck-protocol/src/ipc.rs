@@ -11,6 +11,7 @@ pub enum PluginIpcType {
     Call = 0,
     Response = 1,
     Event = 2,
+    Startup = 3,
 }
 
 impl PluginIpcType {
@@ -20,6 +21,7 @@ impl PluginIpcType {
             0 => Ok(Self::Call),
             1 => Ok(Self::Response),
             2 => Ok(Self::Event),
+            3 => Ok(Self::Startup),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -49,6 +51,10 @@ pub enum PluginIpcToWorker {
     },
     Control {
         uninstall: bool,
+    },
+    StartupProbe {
+        generation: String,
+        probe: u8,
     },
 }
 
@@ -80,6 +86,11 @@ impl Serialize for PluginIpcToWorker {
             Control {
                 uninstall: bool,
             },
+            StartupProbe {
+                r#type: PluginIpcType,
+                generation: &'a str,
+                probe: u8,
+            },
         }
 
         let wire = match self {
@@ -98,6 +109,11 @@ impl Serialize for PluginIpcToWorker {
             Self::Control { uninstall } => Wire::Control {
                 uninstall: *uninstall,
             },
+            Self::StartupProbe { generation, probe } => Wire::StartupProbe {
+                r#type: PluginIpcType::Startup,
+                generation,
+                probe: *probe,
+            },
         };
         wire.serialize(serializer)
     }
@@ -111,6 +127,14 @@ pub struct PluginIpcError {
     /// Formatted traceback, when the worker provides one.
     #[serde(default)]
     pub traceback: Option<String>,
+}
+
+/// Startup status sent by the worker host over its private IPC connection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkerStartup {
+    Ready { probe: u8 },
+    StartupFailed { error: String },
 }
 
 /// Messages received from a plugin worker process over newline-delimited JSON.
@@ -127,6 +151,10 @@ pub enum PluginIpcFromWorker {
     Event {
         event: String,
         args: Vec<Value>,
+    },
+    Startup {
+        generation: String,
+        status: WorkerStartup,
     },
 }
 
@@ -173,6 +201,16 @@ impl PluginIpcFromWorker {
                     .transpose()?
                     .unwrap_or_default();
                 Ok(Self::Event { event, args })
+            }
+            PluginIpcType::Startup => {
+                let generation = value
+                    .get("generation")
+                    .and_then(Value::as_str)
+                    .filter(|generation| !generation.is_empty())
+                    .ok_or(ProtocolError::MissingField("generation"))?
+                    .to_owned();
+                let status = serde_json::from_value(value)?;
+                Ok(Self::Startup { generation, status })
             }
             PluginIpcType::Call => Err(ProtocolError::UnexpectedMessageDirection(code)),
         }

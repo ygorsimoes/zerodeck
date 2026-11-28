@@ -39,7 +39,7 @@ All file routes percent-decode path segments, reject empty/`..`/backslash/null-b
 - `POST /methods/get_plugins`: returns `200 OK` `{ "success": true, "result": ["<plugin_name>", ...] }` in `pluginOrder` + directory order.
 - `POST /methods/call_plugin_method`: accepts JSON `{ "plugin_name": string, "method_name": string, "args"?: object | array, "legacy"?: bool }`.
   - When `legacy` is omitted, infers `api_version == 0` from the target plugin's `plugin.json`; omitted `args` defaults to `{}` (legacy) or `[]` (`api_version >= 1`).
-  - Rejects empty or `_`-prefixed private methods (`400 Bad Request`), unknown plugins (`404 Not Found`), and disabled, passive, blocked (spawn preflight refused, see `failure_reason`), failed, or stopped workers (`503 Service Unavailable`).
+  - Rejects empty or `_`-prefixed private methods (`400 Bad Request`), unknown plugins (`404 Not Found`), and disabled, passive, blocked (launch policy refused, see `failure_reason`), failed, or stopped workers (`503 Service Unavailable`).
   - Returns `200 OK` `{ "success": true, "result": <value> }` on success, or `200 OK` `{ "success": false, "result": { "name": string, "error": string, "traceback": string | null } }` when the Python plugin raises an exception.
 
 ### WebSocket Router (`/ws?auth=<token>`)
@@ -58,7 +58,7 @@ Messages are JSON objects keyed by integer `type`:
 Implemented WS routes:
 - `utilities/ping` -> `REPLY` `"pong"`.
 - `utilities/filepicker` with positional `[path?, include_files?, filter?, extensions?, show_hidden?, max_entries?, include_folders?]` or 1-element options object -> lists entries within `SafePathSet` (`$DECKY_USER_HOME`/`$HOME`, `/run/media`, `$UNPRIVILEGED_PATH`/`$DECKY_HOME`), returning `{ path, realpath, files: [{ name, path, realpath, isdir, size, modified }], truncated }`. Symlink targets escaping allowed roots are omitted; a requested path outside every allowed root fails with `PathEscapeError`, whose message lists all allowed roots.
-- `loader/get_plugins` -> `REPLY` array of `PluginSummary` `{ "name", "version", "load_type", "disabled", "passive", "state", "failure_reason" }` ordered by `pluginOrder`. `failure_reason` is `null` unless the spawn preflight refused to start the plugin's worker; then `state` is `"Failed"` and `failure_reason` says why (the Python worker host is unavailable, or a `"root"` plugin's tree is not root-only, naming the offending path). Calls to such a plugin, and the `loader/reload_plugin`, `loader/enable_plugin` or `loader/install_plugin` call that tried to start it, fail with `PluginBlockedError`.
+- `loader/get_plugins` -> `REPLY` array of `PluginSummary` `{ "name", "version", "load_type", "disabled", "passive", "state", "failure_reason" }` ordered by `pluginOrder`. `failure_reason` names why a worker is refused or failed: a launch-policy refusal (the Python worker host is unavailable, a `"root"` plugin tree or import root is not root-only, or a host path is unsafe), a startup failure (import, migration, timeout, early `_main` failure), or a crash-loop stop. A launch-policy refusal makes calls fail with `PluginBlockedError`; a startup or runtime failure leaves the worker retrying until the crash-loop guard marks it `Failed`.
 - `loader/call_plugin_method` with `args: [plugin_name, method_name, ...positional_args]` -> dispatches `legacy: false`. Private `_`-prefixed methods are rejected with `PermissionError`.
 - `loader/call_legacy_plugin_method` with `args: [plugin_name, method_name, kwargs_object?]` -> dispatches `legacy: true` (defaults omitted kwargs to `{}`).
 - `loader/reload_plugin` with `args: [plugin_name]` -> restarts the plugin worker cleanly and replies `true`. If the refreshed `plugin.json` renames the plugin onto a name another plugin directory already owns, the reload fails with `DuplicatePluginNameError` and both plugins stay as they were.
@@ -71,7 +71,7 @@ Implemented WS routes:
 
 Server-to-client `EVENT` (`type: 5`) frames:
 - `loader/plugin_event`: `args` is `[{ "plugin": string, "event": string, "args": Value[] }]` emitted by a worker's `decky.emit(...)`, matching `WSRouter` listener spreading (`listener(...data.args)`).
-- `loader/plugins_changed`: `args` is `[PluginSummary[]]` (same shape as `loader/get_plugins`, including `failure_reason`) broadcast after plugin install, uninstall, enable, disable, order changes, debug manifest updates, or a reload that the spawn preflight refused or that clears an earlier refusal.
+- `loader/plugins_changed`: `args` is `[PluginSummary[]]` (same shape as `loader/get_plugins`, including `failure_reason`) broadcast after plugin install, uninstall, enable, disable, order changes, debug manifest updates, a launch-policy refusal or clearing it, or a worker startup failure.
 - `zerodeck/plugin_reloaded`: `args` is `[{ "plugin": string, "directory": string }]` broadcast when the debug watcher reloads a `"debug"` plugin backend.
 - `zerodeck/frontend_reloaded`: `args` is `[{ "plugin": string, "directory": string }]` broadcast when the debug watcher detects changes under a `"debug"` plugin's `dist/` directory.
 
@@ -100,9 +100,17 @@ Each line is a UTF-8 JSON object terminated by `\n` (up to 4 MiB per frame):
 | `0` | `CALL` | Daemon -> Worker | `id` (UUID string), `method`, `args`, `legacy` (optional bool) |
 | `1` | `RESPONSE` | Worker -> Daemon | `id`, `success`, `res`, `error` (optional) |
 | `2` | `EVENT` | Worker -> Daemon | `event`, `args` |
+| `3` | `STARTUP_PROBE` | Daemon -> Worker | `generation`, `probe` (`0` at startup, `1` after observation) |
+| `3` | `STARTUP` | Worker -> Daemon | `generation`, `status` (`ready` with matching `probe`, or `startup_failed` with `error`) |
 | — | `CONTROL` | Daemon -> Worker | `uninstall: bool` |
 
 When `success` is `false`, `res` holds the error message string and the worker adds `error: { "name": string, "traceback": string | null }` (the exception class name and formatted traceback), which maps onto the WebSocket `ERROR` frame's `name`/`traceback`. Receivers must treat `error` as optional and ignore it if malformed.
+
+`STARTUP` is internal. The daemon supplies the opaque generation at launch and ignores reports for
+any other generation. The worker answers the first probe through its IPC handler after import and
+migration, subject to a 15-second startup deadline by default. Confirmation requires a two-second
+observation without a crash or early `_main` failure, followed by a second IPC response within one
+second. A later automatic retry cannot retroactively confirm a failed first attempt.
 
 The daemon spawns each active plugin over an anonymous Unix `socketpair()` FD (`--fd`, clearing `FD_CLOEXEC` in `pre_exec`) with a sanitized environment (`env_clear()`), `cwd` set to `DECKY_PLUGIN_DIR`, and `stdout`/`stderr` piped into structured `tracing` logs. The worker takes ownership of the inherited IPC socket FD and closes it on shutdown. On graceful uninstall (`Control { uninstall: true }` followed by socket write-half shutdown), the worker completes `_unload` and `_uninstall` before exiting; hung workers are terminated with `SIGKILL` after the shutdown grace timeout.
 
@@ -132,7 +140,7 @@ The daemon spawns each active plugin over an anonymous Unix `socketpair()` FD (`
 - Managed lifecycle keys (`pluginOrder`, `disabledPlugins`, `disabled_plugins`) must be mutated via `loader/set_plugin_order`, `loader/enable_plugin`, and `loader/disable_plugin` rather than `loader/set_setting`.
 
 ### Root Plugin Ownership Check
-- When the daemon runs as root, every spawn of a `"root"` plugin (startup, enable, reload, install, debug hot-reload) first checks that `plugins/` itself and every entry of the plugin's directory are owned by uid 0, are not group- or world-writable, and are not symlinks. Otherwise the plugin stays `Failed` with a `failure_reason` naming the path (`owned by uid N, not root`, `writable by group/others (mode 0oNNN)`, `symlink`, or `unreadable: ...`). Crash restarts by the worker supervisor (with backoff) re-exec the plugin without re-running the check; this is tracked with the `PRIVILEGED_PATH` open decision.
+- When the daemon runs as root, every launch of a `"root"` plugin, including automatic restarts, checks that the plugin tree and all ancestors are owned by uid 0, are not group- or world-writable, and are not symlinks. Otherwise the plugin stays `Failed` with a `failure_reason` naming the path (`owned by uid N, not root`, `writable by group/others (mode 0oNNN)`, `symlink`, or `unreadable: ...`).
 - The daemon flag `--allow-unsafe-root-plugins` (env `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`, off by default) skips the check and logs a warning on each spawn. It is a development escape hatch that grants root to code a non-root user can edit, so it is read only from the daemon's own command line or environment, which only root controls. `loader.json` cannot enable it: `settings/` belongs to the unprivileged user.
 
 ### Python Worker Modules & Environment

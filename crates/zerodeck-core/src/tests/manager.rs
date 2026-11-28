@@ -91,11 +91,6 @@ async fn call_plugin_ok(
         .expect("call plugin method")
 }
 
-#[cfg(unix)]
-fn running_as_root() -> bool {
-    zerodeck_platform::current_process_identity().euid == 0
-}
-
 /// Writes a backend plugin and a fake `python3` that leaves `marker` behind if it ever runs.
 #[cfg(unix)]
 fn write_spawn_marker_plugin(
@@ -521,77 +516,6 @@ async fn plugin_manager_set_setting_rejects_managed_keys_and_resolve_plugin_file
             zerodeck_platform::PlatformError::PathEscape { .. }
         ))
     ));
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn unsafe_root_plugins_opt_in_bypasses_tree_check() {
-    if running_as_root() {
-        eprintln!("skipping: the temp tree is root-owned when tests run as root");
-        return;
-    }
-    let dir = TestDir::new("mgr-unsafe-root-opt-in");
-    let paths = manager_test_paths(&dir.0);
-    write_watcher_plugin(
-        &paths.plugins_dir().join("rooted"),
-        "Rooted",
-        &["root"],
-        "v1",
-    );
-    // loader.json must be ignored; only the daemon setter may opt in.
-    fs::create_dir_all(paths.settings_dir()).expect("settings dir");
-    fs::write(
-        paths.settings_dir().join("loader.json"),
-        r#"{"developer":{"allow_unsafe_root_plugins":true}}"#,
-    )
-    .expect("write loader.json");
-
-    let mut manager = crate::PluginManager::open(
-        paths.clone(),
-        zerodeck_plugin_host::SupervisorConfig {
-            python_host: zerodeck_plugin_host::PythonHostConfig {
-                python_bin: "python3".to_owned(),
-                host_module_path: Some(python_host_module_path()),
-            },
-            ..zerodeck_plugin_host::SupervisorConfig::default()
-        },
-        "0.1.0",
-    )
-    .expect("open manager");
-    // The temp tree is owned by the test user, so the tree check fails as it would for a
-    // deck-owned plugin under a root daemon.
-    manager.assume_root_daemon_for_tests();
-    manager.start_all().await.expect("start_all");
-
-    let rooted = manager
-        .list_plugins()
-        .into_iter()
-        .find(|p| p.name == "Rooted")
-        .expect("plugin");
-    assert_eq!(rooted.state, zerodeck_plugin_host::PluginState::Failed);
-    let reason = rooted.failure_reason.expect("failure reason");
-    assert!(
-        reason.contains(&paths.plugins_dir().display().to_string()),
-        "{reason}"
-    );
-    assert!(reason.contains("not root"), "{reason}");
-
-    manager.set_allow_unsafe_root_plugins(true);
-    manager
-        .reload_plugin("Rooted")
-        .await
-        .expect("opt-in skips the tree check");
-    assert_eq!(
-        call_plugin_ok(&manager, "Rooted", "version_tag").await,
-        serde_json::json!("v1")
-    );
-    let rooted = manager
-        .list_plugins()
-        .into_iter()
-        .find(|p| p.name == "Rooted")
-        .expect("plugin");
-    assert_eq!(rooted.failure_reason, None);
-    manager.shutdown_all().await;
 }
 
 #[cfg(unix)]

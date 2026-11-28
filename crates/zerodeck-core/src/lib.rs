@@ -10,7 +10,6 @@ pub mod filepicker;
 pub mod http_policy;
 pub mod installer;
 mod manager;
-mod preflight;
 mod settings;
 pub mod watcher;
 

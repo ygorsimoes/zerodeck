@@ -193,11 +193,14 @@ in `/opt/zerodeck/{frontend,python}` and next to the binary (`<exe>/../{frontend
 and the source tree; release builds never do, because those can be writable by a non-root user. If
 `zerodeck_py_host` cannot be imported, the daemon still starts and serves the UI, logs one error,
 and every backend plugin shows as `Failed` with the reason in `failure_reason`.
+If you override `PYTHONPATH`, use the worker host from the same ZeroDeck release as the daemon.
 
-Plugins flagged `"root"` keep root privileges, so a root daemon only starts them from a tree that
-only root can modify: `plugins/` and every file and directory of the plugin must be owned by root,
-must not be group- or world-writable, and must not be symlinks. Store installs already produce such
-trees. Otherwise the plugin shows as `Failed` with the offending path in `failure_reason`. For local
+Plugins flagged `"root"` keep root privileges. On every launch, including automatic restarts, a
+root daemon requires the plugin tree and its ancestors to be root-owned, without symlinks or
+group- or world-write permissions. On a stock Steam Deck, the default `~/homebrew/plugins`
+location does not meet this policy. To run privileged plugins, configure `PRIVILEGED_PATH` in a
+root-controlled location and keep `UNPRIVILEGED_PATH` pointed at the existing settings, data and
+logs. A refused plugin shows as `Failed` with the offending path in `failure_reason`. For local
 development you can skip the check with `--allow-unsafe-root-plugins` /
 `ZERODECK_ALLOW_UNSAFE_ROOT_PLUGINS=1`, set in the daemon's own command line or a systemd drop-in.
 It is deliberately not a `loader.json` setting: `settings/` belongs to the unprivileged user, who
@@ -215,8 +218,9 @@ must not be able to grant themselves root.
 
 - **Install:** a verified `bootstrap.sh` installs `zerodeckd` as a managed systemd service that uses
   your existing `~/homebrew/plugins`.
-- **Update:** merging the Release Please PR publishes an immutable release and CI signs the channel
-  automatically. On the Deck, `zerodeckctl update` verifies the signed channel and stages the
+- **Update:** merging the Release Please PR publishes an immutable release. CI signs Stable only
+  after a VM qualification pass for the exact managed archive. On the Deck, `zerodeckctl update`
+  verifies the signed channel and stages the
   release; `zerodeckctl upgrade` activates it explicitly, with offline rollback to the retained
   generation. Nothing is signed or promoted by hand.
 - **Recovery:** an interrupted activation restores the previous generation or leaves a recoverable

@@ -130,19 +130,47 @@ Signing is automatic and lives only in `.github/workflows/channels.yml`:
   restricted to protected branches; no person holds it and nothing is signed on a laptop;
 - `deploy/update/sign-channel.sh` refuses to sign unless the archive digest, `release.json` identity
   and GitHub build provenance (exact repository, signer workflow, source commit) verify;
-- documents are valid for 90 days and re-signed when 30 days remain, so the daily run keeps them
-  fresh. A release that was never made immutable or is still a draft is never signed.
+- Stable also requires a VM attestation for that same managed archive digest from
+  `Qualify Stable` on `main`. Qualification always updates from the newest published Stable
+  release that already has VM evidence; a lower-version fixture is allowed only when no previous
+  immutable stable release exists. The channels job selects the newest qualified Stable release
+  directly from immutable release history. It never reads the mutable `channels` branch to choose
+  a target, so rewriting that branch cannot redirect signing or downgrade Stable. A published
+  candidate can enter Testing while Stable waits for a passing result. The release workflow
+  dispatches qualification after publication; a passing qualification asks the channels workflow
+  to sign immediately. If it fails, rerun `Qualify Stable` for the same tag. If no release has a
+  qualified result, the channels run leaves Stable unchanged, so qualify the intended release
+  before its 90-day document expires. The qualification
+  workflow enforces the baseline from immutable release history, and `sign-channel.sh` trusts only
+  attestations from that workflow on `main`;
+- documents are valid for 90 days and the daily run re-signs the selected release, so a channel
+  that has a qualified target does not expire. A release that was never made immutable or is still
+  a draft is never signed.
+
+The qualification VM runs generic Linux with systemd. SteamOS survival and Game Mode compatibility
+are recorded independently in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 What this protects: a compromised download host cannot substitute bytes (digest and length are
 signed), nobody can replay an older channel, and a push to the `channels` branch alone cannot forge
 a release. What it does not: someone who can modify workflows on `main` or read environment secrets
 can sign. Keep `main` protected and the `release-signing` environment restricted.
 
-**Rotating the key.** Add the new public key to `deploy/update/trusted-root.json` (a list), ship a
-release signed by the old key, wait for clients to update, then replace the secret and remove the
-old key in a later release. Clients accept any listed key. If the secret leaks, replace it
-immediately and ship a release whose `trusted-root.json` omits the old key; clients that already
-trust the leaked key must be re-bootstrapped.
+**Rotating the key.** Managed `update` and `upgrade` replace the daemon generation; they never change
+the pinned `/etc/zerodeck/trusted-root.json`. Key rotation is an administrative bootstrap operation:
+
+1. Publish a manual archive with both the current and replacement public keys. Keep signing the
+   channels with the current key during this transition.
+2. On each installation, independently verify the manual and matching managed archive's build
+   provenance and SHA-256, then run the packaged bootstrap with `--convert-existing-zerodeck`
+   and the verified digests. Pass `--start` if the existing daemon is running. This updates the
+   pinned keys without resetting the catalog's replay protection.
+3. After confirming that the target installations trust the replacement key, change the CI signing
+   secret and verify that a client from step 2 can check the newly signed channel. Publish and deploy
+   a manual archive without the retired key to remove the old trust.
+
+If a key leaks, replace the CI secret immediately. Re-bootstrap affected installations with an
+independently verified manual archive that omits the leaked key; do not use the compromised
+channel to establish replacement trust.
 
 ## First install bootstrap
 

@@ -319,8 +319,7 @@ async fn shutdown_signal() {
     info!("received shutdown signal, draining ZeroDeck server");
 }
 
-/// Warns once when a root daemon runs plugins from below directories a non-root user can modify:
-/// that user can swap the tree between the spawn ownership check and the spawn itself.
+/// Warns when the configured plugin root cannot be used for privileged workers.
 #[cfg(unix)]
 fn warn_about_writable_ancestors(paths: &PlatformPaths) {
     if zerodeck_platform::current_process_identity().euid != 0 {
@@ -337,8 +336,8 @@ fn warn_about_writable_ancestors(paths: &PlatformPaths) {
         .join(", ");
     warn!(
         paths = %flagged,
-        "PRIVILEGED_PATH or its parents are writable by a non-root user, who could replace root \
-         plugins after their ownership check"
+        "PRIVILEGED_PATH or its parents are writable by a non-root user; \
+         the default launch policy will refuse root plugins here"
     );
 }
 

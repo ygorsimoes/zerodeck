@@ -1,5 +1,9 @@
 # Updater VM gate
 
+`just check-release` also exercises the release tooling without a VM: archive/package identity,
+bootstrap and publish scripts, Ed25519 channel signing and the Stable qualification gate, and
+Stable/Testing channel selection from immutable release history.
+
 `vm.sh` is the disposable Linux/systemd gate for the managed loader. It boots a caller-provided
 image under QEMU with a qcow2 overlay, installs the packaged release with the shipped
 `bootstrap.sh`, and drives the production controller and systemd units over SSH.

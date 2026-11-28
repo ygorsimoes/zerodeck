@@ -7,6 +7,8 @@ use zerodeck_protocol::PluginManifest;
 /// Specification describing how to launch an out-of-process plugin worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSpawnSpec {
+    /// Opaque identity of the plugin code being started.
+    pub generation: String,
     pub directory: String,
     pub manifest: PluginManifest,
     pub version: Option<String>,

@@ -11,12 +11,17 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_zerodeckd");
 
 static NEXT_HOME: AtomicUsize = AtomicUsize::new(0);
+static NEXT_PLUGIN_QUERY: AtomicUsize = AtomicUsize::new(0);
 
 struct TempHome(PathBuf);
 
 impl TempHome {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
+        Self::under(&std::env::temp_dir(), label)
+    }
+
+    fn under(parent: &Path, label: &str) -> Self {
+        let path = parent.join(format!(
             "zerodeckd-{label}-{}-{}",
             std::process::id(),
             NEXT_HOME.fetch_add(1, Ordering::Relaxed)
@@ -72,6 +77,22 @@ fn daemon_command_at(binary: &Path, home: &TempHome, host: &str, port: u16) -> C
         cmd.env("LLVM_PROFILE_FILE", profile_file);
     }
     cmd
+}
+
+/// Spawns a freshly copied generation binary. The Docker volume can briefly report ETXTBSY after
+/// `std::fs::copy` closes, so retry that specific race instead of failing the test sporadically.
+fn spawn_generation(cmd: &mut Command) -> Child {
+    let mut attempts = 0;
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return child,
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 100 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("spawn the generation's zerodeckd: {err}"),
+        }
+    }
 }
 
 fn healthcheck(home: &TempHome, host: &str, port: u16) -> bool {
@@ -857,10 +878,12 @@ fn copy_python_host(home: &TempHome) -> PathBuf {
 /// Reads the `loader/get_plugins` entry for `name` over a fresh WebSocket session.
 async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
     let token = fetch_auth_token(&reqwest::Client::new(), port).await;
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws?auth={token}"))
-            .await
-            .expect("connect ws");
+    let session = NEXT_PLUGIN_QUERY.fetch_add(1, Ordering::Relaxed);
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://127.0.0.1:{port}/ws?auth={token}&session=plugin-query-{session}"
+    ))
+    .await
+    .expect("connect ws");
     let reply = ws_call_reply(
         &mut ws,
         1,
@@ -881,12 +904,84 @@ async fn get_plugin_entry(port: u16, name: &str) -> serde_json::Value {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires root; run with just test-privileged"]
+async fn privileged_restart_revalidates_tree() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    let host_user = std::env::var("ZERODECK_TEST_HOST_USER").expect("unprivileged host user");
+    let home = TempHome::under(Path::new("/var/lib"), "guarded-restart");
+    let plugin = home.0.join("plugins/guarded");
+    std::fs::create_dir_all(&plugin).expect("create root-owned plugin directory");
+    std::fs::write(
+        plugin.join("plugin.json"),
+        r#"{"name":"Guarded","author":"Tester","flags":["root"],"api_version":1}"#,
+    )
+    .expect("write plugin manifest");
+    let entrypoint = plugin.join("main.py");
+    std::fs::write(
+        &entrypoint,
+        r"import asyncio, os
+from pathlib import Path
+
+class Plugin:
+    async def _main(self):
+        while Path(__file__).exists():
+            await asyncio.sleep(0.01)
+        os._exit(1)
+",
+    )
+    .expect("write worker fixture");
+    let port = free_port("127.0.0.1");
+    let py_host = copy_python_host(&home);
+    let mut daemon = Daemon(
+        daemon_command(&home, "127.0.0.1", port)
+            .env("PYTHONPATH", py_host)
+            .env("DECKY_USER", host_user)
+            .spawn()
+            .expect("start daemon"),
+    );
+    wait_until_healthy(&home, "127.0.0.1", port);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while get_plugin_entry(port, "Guarded").await["state"] != "Running" {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("trusted worker reached Running");
+    // Running is published after the first IPC round trip; wait through the two-second observation
+    // so this exercises a restart of a confirmed worker, not a startup retry.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(get_plugin_entry(port, "Guarded").await["state"], "Running");
+
+    std::fs::remove_file(&entrypoint).expect("remove the installed entrypoint");
+    let failed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let worker = get_plugin_entry(port, "Guarded").await;
+            if worker["state"] == "Failed" {
+                break worker;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("restart refuses missing code without entering a crash loop");
+    assert!(
+        failed["failure_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(&entrypoint.display().to_string())),
+        "{failed}"
+    );
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root; run with just test-privileged"]
 async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
     assert_eq!(rustix::process::geteuid().as_raw(), 0);
     let host_user = std::env::var("ZERODECK_TEST_HOST_USER")
         .expect("ZERODECK_TEST_HOST_USER names the unprivileged host user");
 
-    let home = TempHome::new("root-plugin-owner");
+    let home = TempHome::under(Path::new("/var/lib"), "root-plugin-owner");
     let plug_dir = home.0.join("plugins").join("root_plug");
     std::fs::create_dir_all(&plug_dir).expect("create plugin dir");
     std::fs::write(
@@ -962,6 +1057,64 @@ async fn privileged_root_plugin_in_user_owned_dir_is_blocked() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    sigterm(&daemon);
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root; run with just test-privileged"]
+async fn privileged_root_plugin_rejects_user_writable_python_path() {
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    let host_user = std::env::var("ZERODECK_TEST_HOST_USER").expect("unprivileged host user");
+    let home = TempHome::under(Path::new("/var/lib"), "unsafe-python-path");
+    let plugin = home.0.join("plugins/guarded");
+    std::fs::create_dir_all(&plugin).expect("create root-owned plugin directory");
+    std::fs::write(
+        plugin.join("plugin.json"),
+        r#"{"name":"Guarded","author":"Tester","flags":["root"],"api_version":1}"#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.py"),
+        "class Plugin:\n    async def ping(self):\n        return 'pong'\n",
+    )
+    .expect("write plugin entrypoint");
+
+    let py_host = copy_python_host(&home);
+    let chown = Command::new("chown")
+        .args(["-R", &host_user])
+        .arg(&py_host)
+        .status()
+        .expect("run chown");
+    assert!(chown.success(), "make the host tree user-owned");
+
+    let port = free_port("127.0.0.1");
+    let mut daemon = Daemon(
+        daemon_command(&home, "127.0.0.1", port)
+            .env("PYTHONPATH", &py_host)
+            .env("DECKY_USER", host_user)
+            .spawn()
+            .expect("start daemon"),
+    );
+    wait_until_healthy(&home, "127.0.0.1", port);
+    let blocked = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let worker = get_plugin_entry(port, "Guarded").await;
+            if worker["state"] == "Failed" {
+                break worker;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("an unsafe Python host path must block a root worker");
+    assert!(
+        blocked["failure_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains(&py_host.display().to_string())),
+        "{blocked}"
+    );
     sigterm(&daemon);
     assert!(wait_for_exit(&mut daemon, Duration::from_secs(10)).success());
 }
@@ -1104,13 +1257,9 @@ async fn managed_daemon_uses_one_generation() {
 
     let port = free_port("127.0.0.1");
     let generation_binary = generation_one.join("bin/zerodeckd");
-    let mut daemon = Daemon(
-        daemon_command_at(&generation_binary, &home, "127.0.0.1", port)
-            .arg("--managed-generation")
-            .arg(&generation_one)
-            .spawn()
-            .expect("spawn the generation's zerodeckd"),
-    );
+    let mut command = daemon_command_at(&generation_binary, &home, "127.0.0.1", port);
+    command.arg("--managed-generation").arg(&generation_one);
+    let mut daemon = Daemon(spawn_generation(&mut command));
     wait_until_healthy(&home, "127.0.0.1", port);
 
     let plugin_deadline = Instant::now() + Duration::from_secs(5);

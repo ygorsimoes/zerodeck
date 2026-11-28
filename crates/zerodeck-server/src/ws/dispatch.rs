@@ -19,6 +19,18 @@ use crate::ws::args::parse_uninstall_args;
 use crate::ws::errors::core_error_to_ws;
 use crate::ws::errors::ws_error;
 
+/// Returns `true` only for routes whose execution is side-effect free.
+///
+/// `FULL_SYNC` may run one of these routes again when the daemon lost the recorded outcome.
+/// Every other route, including arbitrary plugin methods, is conservatively treated as potentially
+/// mutating and is never re-executed without a recorded outcome.
+pub(crate) fn is_replay_safe(route: &str) -> bool {
+    matches!(
+        route,
+        "utilities/ping" | "utilities/filepicker" | "loader/get_plugins" | "loader/get_settings"
+    )
+}
+
 pub(crate) async fn dispatch_call(state: AppState, call: WsCallPayload) -> WsServerMessage {
     match call.route.as_str() {
         "utilities/ping" => WsServerMessage::Reply {
@@ -299,7 +311,34 @@ mod tests {
     use zerodeck_plugin_host::HostError;
     use zerodeck_protocol::WsServerMessage;
 
-    use super::{reply, reply_done};
+    use super::{is_replay_safe, reply, reply_done};
+
+    #[test]
+    fn replay_safety_is_an_explicit_read_only_allowlist() {
+        for route in [
+            "utilities/ping",
+            "utilities/filepicker",
+            "loader/get_plugins",
+            "loader/get_settings",
+        ] {
+            assert!(is_replay_safe(route), "{route} must be replay-safe");
+        }
+        for route in [
+            "loader/call_plugin_method",
+            "loader/call_legacy_plugin_method",
+            "loader/install_plugin",
+            "utilities/install_plugin",
+            "loader/uninstall_plugin",
+            "loader/enable_plugin",
+            "loader/disable_plugin",
+            "loader/set_plugin_order",
+            "loader/set_setting",
+            "loader/reload_plugin",
+            "utilities/unknown",
+        ] {
+            assert!(!is_replay_safe(route), "{route} must not be replay-safe");
+        }
+    }
 
     #[test]
     fn reply_serializes_the_ok_value() {

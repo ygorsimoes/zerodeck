@@ -7,7 +7,7 @@ use std::future::Future;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderValue, Method, Request, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Uri, header};
 use axum::middleware;
 use axum::response::Json;
 use axum::routing::{any, get, post};
@@ -29,6 +29,13 @@ use crate::routes::static_files::handle_plugin_frontend_bundle;
 use crate::routes::static_files::handle_static_file;
 use crate::state::AppState;
 use crate::ws::handle_ws_upgrade;
+
+/// Response header through which `/auth/token` advertises the daemon's WS replay capabilities.
+pub(crate) const CAPABILITIES_HEADER: &str = "x-zerodeck-capabilities";
+
+/// Capability value meaning `FULL_SYNC` replays are answered without ever executing a potentially
+/// mutating call twice.
+pub(crate) const FULL_SYNC_AT_MOST_ONCE_CAPABILITY: &str = "full-sync-at-most-once";
 
 /// Constructs the Axum [`Router`] with strict CORS, CSRF enforcement, and core endpoints.
 pub fn build_router(state: AppState) -> Router {
@@ -141,6 +148,19 @@ async fn handle_readyz(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn handle_auth_token(State(state): State<AppState>) -> String {
-    state.csrf_token().to_owned()
+/// Returns the daemon's CSRF token and advertises the WS replay capabilities negotiated before the
+/// frontend sends a `FULL_SYNC` replay.
+async fn handle_auth_token(State(state): State<AppState>) -> (HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(CAPABILITIES_HEADER),
+        HeaderValue::from_static(FULL_SYNC_AT_MOST_ONCE_CAPABILITY),
+    );
+    // Only this endpoint needs the capability header to be readable from the Steam origin; keeping
+    // the CORS exposure local leaves `/fetch`'s upstream-header stripping untouched.
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static(CAPABILITIES_HEADER),
+    );
+    (headers, state.csrf_token().to_owned())
 }

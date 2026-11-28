@@ -26,6 +26,7 @@ use crate::routes::static_files::handle_plugin_assets_file;
 use crate::routes::static_files::handle_plugin_data_file;
 use crate::routes::static_files::handle_plugin_dist_file;
 use crate::routes::static_files::handle_plugin_frontend_bundle;
+use crate::routes::static_files::handle_plugin_relative_file;
 use crate::routes::static_files::handle_static_file;
 use crate::state::AppState;
 use crate::ws::handle_ws_upgrade;
@@ -73,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
             "/plugins/{name}/assets/{*path}",
             get(handle_plugin_assets_file),
         )
+        .route("/plugins/{name}/{*path}", get(handle_plugin_relative_file))
         .route("/plugins/{name}/data/{*path}", get(handle_plugin_data_file))
         .layer(middleware::from_fn_with_state(
             state.clone(),

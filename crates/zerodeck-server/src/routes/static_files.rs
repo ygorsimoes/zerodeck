@@ -106,6 +106,35 @@ pub(crate) async fn handle_plugin_assets_file(
     .await
 }
 
+/// Decky-compatible asset URLs: plugin bundles reference `/plugins/<name>/<file>` (for example the
+/// public path `@decky/rollup` emits). Look in `dist/` first, then `assets/`, both behind the plugin
+/// path jail.
+pub(crate) async fn handle_plugin_relative_file(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    AxumPath((raw_name, raw_path)): AxumPath<(String, String)>,
+) -> Response {
+    let plugin_name = match decode_safe_segment(&raw_name) {
+        Ok(name) => name,
+        Err(err) => return err.into_response(),
+    };
+    let rel_path = match decode_safe_rel_path(&raw_path) {
+        Ok(path) => path,
+        Err(err) => return err.into_response(),
+    };
+    let PluginBackend::Live(manager) = state.backend() else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+    for scope in [PluginFileScope::Dist, PluginFileScope::Assets] {
+        if let Ok(resolved) = manager.resolve_plugin_file(&plugin_name, scope, &rel_path) {
+            return stream_file_response(&resolved, method, false, if_modified_since(&headers))
+                .await;
+        }
+    }
+    (StatusCode::NOT_FOUND, "Not Found").into_response()
+}
+
 pub(crate) async fn handle_plugin_data_file(
     State(state): State<AppState>,
     method: Method,

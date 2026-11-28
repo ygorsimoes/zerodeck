@@ -7,9 +7,9 @@ use std::future::Future;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderValue, Method, Request, Uri, header};
+use axum::http::{HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::middleware;
-use axum::response::Json;
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{any, get, post};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -26,6 +26,7 @@ use crate::routes::static_files::handle_plugin_assets_file;
 use crate::routes::static_files::handle_plugin_data_file;
 use crate::routes::static_files::handle_plugin_dist_file;
 use crate::routes::static_files::handle_plugin_frontend_bundle;
+use crate::routes::static_files::handle_plugin_relative_file;
 use crate::routes::static_files::handle_static_file;
 use crate::state::AppState;
 use crate::ws::handle_ws_upgrade;
@@ -53,6 +54,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(handle_healthz))
         .route("/readyz", get(handle_readyz))
+        .route("/cef/status", get(handle_cef_status))
+        .route("/cef/reset", post(handle_cef_reset))
         .route("/auth/token", get(handle_auth_token))
         .route("/ws", get(handle_ws_upgrade))
         .route("/fetch", any(crate::fetch::handle_fetch))
@@ -73,6 +76,7 @@ pub fn build_router(state: AppState) -> Router {
             "/plugins/{name}/assets/{*path}",
             get(handle_plugin_assets_file),
         )
+        .route("/plugins/{name}/{*path}", get(handle_plugin_relative_file))
         .route("/plugins/{name}/data/{*path}", get(handle_plugin_data_file))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -139,6 +143,33 @@ async fn handle_readyz(State(state): State<AppState>) -> Json<Value> {
         "python_host_ready": config.python_host_ready,
         "invocation_id": &config.invocation_id,
     }))
+}
+
+/// Reports Steam integration health separately from daemon readiness.
+async fn handle_cef_status(State(state): State<AppState>) -> Response {
+    match state.cef_supervisor() {
+        Some(supervisor) => Json(supervisor.status()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CEF supervisor is not running",
+        )
+            .into_response(),
+    }
+}
+
+/// Clears a persisted safe mode and resumes discovery.
+async fn handle_cef_reset(State(state): State<AppState>) -> Response {
+    match state.cef_supervisor() {
+        Some(supervisor) => {
+            let reset = supervisor.reset_safe_mode();
+            Json(json!({ "reset": reset, "status": supervisor.status() })).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CEF supervisor is not running",
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_auth_token(State(state): State<AppState>) -> String {

@@ -86,6 +86,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Reject an incomplete frontend before it can become a release generation.
+verify_frontend_bundle() {
+    local directory="$1"
+    local file
+    for file in index.js fallback.js; do
+        if [[ ! -s "${directory}/${file}" ]]; then
+            echo "error: frontend bundle is missing or empty: ${file}" >&2
+            exit 1
+        fi
+        local syntax_check="${work}/frontend-${file}.mjs"
+        cp "${directory}/${file}" "${syntax_check}"
+        if ! node --check "${syntax_check}" >/dev/null 2>&1; then
+            echo "error: frontend bundle does not parse as an ES module: ${file}" >&2
+            exit 1
+        fi
+    done
+}
+
 stage_manual=""
 if [[ "${mode}" == "manual" || "${mode}" == "all" ]]; then
     stage_manual="${work}/manual/zerodeck-${tag}-linux-${arch_name}"
@@ -104,11 +122,14 @@ if [[ "${mode}" == "manual" || "${mode}" == "all" ]]; then
     cp deploy/update/trusted-root.json "${stage_manual}/trusted-root.json"
     cp deploy/update/RELEASE.md "${stage_manual}/docs/RELEASE.md"
     cp deploy/update/COMPATIBILITY.md "${stage_manual}/docs/COMPATIBILITY.md"
+    cp deploy/update/QUALIFICATION.md "${stage_manual}/docs/QUALIFICATION.md"
+    cp docs/architecture/performance-budget.md "${stage_manual}/docs/PERFORMANCE.md"
     cp LICENSE README.md "${stage_manual}/"
     chmod 0755 "${stage_manual}/bin/zerodeckd" "${stage_manual}/bin/zerodeckctl" \
         "${stage_manual}/bootstrap.sh"
     chmod 0644 "${stage_manual}"/systemd/* "${stage_manual}"/docs/* \
         "${stage_manual}/LICENSE" "${stage_manual}/README.md" "${stage_manual}/trusted-root.json"
+    verify_frontend_bundle "${stage_manual}/frontend"
 fi
 
 stage_managed=""
@@ -131,6 +152,7 @@ if [[ "${mode}" == "managed" || "${mode}" == "all" ]]; then
             container=""
         fi
         chmod 0755 "${stage_managed}/bin/zerodeckd"
+        verify_frontend_bundle "${stage_managed}/frontend"
     fi
 fi
 

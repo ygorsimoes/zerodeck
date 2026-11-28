@@ -101,3 +101,19 @@ Consequences:
 The current Node tests implement both profiles with injectable module/text loaders. Official
 `@decky/rollup` and `@decky/ui` artifacts remain development-only test inputs; they are never
 included in a ZeroDeck release archive.
+
+## Quick Access Menu host
+
+The QAM host mounts `#zerodeck-qam-host` as a page overlay with Steam's ReactDOM. It lists enabled
+and disabled plugins, renders the selected plugin's `content`, calls `loader/enable_plugin` /
+`loader/disable_plugin`, reloads one plugin, shows load errors, and reports the CEF state. Opening
+it sets `useQuickAccessVisible` to true. A floating `ZeroDeck` button and `Ctrl+Shift+Z` toggle the
+panel, so it works before any Steam-internal React tree integration exists.
+
+The host calls `zerodeck/cef/confirm` with `qam_ready: true` only after it mounts. If Steam's
+ReactDOM is unavailable, the host does not confirm and CEF remains in its bootstrap/backoff path.
+
+**Known limitation:** this is a page overlay, not a tab injected into Steam's internal
+QuickAccessMenuBrowserView React tree. The tab adapter needs the Steam module/scope resolution path
+described above and must be qualified on real SteamOS before it replaces the overlay. The overlay is
+the functional QAM surface for the experimental Phase 4 release.

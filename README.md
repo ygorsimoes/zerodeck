@@ -55,6 +55,7 @@ plugin contracts, rebuilt from scratch as a native daemon.
 | Plugin static, asset and data routes behind the path jail | ✅ |
 | SSRF-guarded `/fetch` CORS proxy, `FilePicker`, and staged ZIP/`remote_binary` installer | ✅ |
 | WebSocket `FULL_SYNC` deduplication and `"debug"` plugin hot-reload | ✅ |
+| Plugin frontend runtime (ESM/legacy) with a clean-room `@decky/ui` subset and page QAM host | 🚧 |
 | Injection into Steam's UI and the Quick Access Menu | 🚧 |
 
 ✅ shipped and tested · 🚧 in progress (see [Roadmap](#roadmap))

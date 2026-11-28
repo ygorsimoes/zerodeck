@@ -2,6 +2,7 @@ import { createLoaderApi, installDeckyApi } from './decky/api.ts';
 import { DFL } from './decky/dfl.ts';
 import { PluginLoader, type PluginSummary } from './decky/plugin-loader.ts';
 import { daemonOrigin, webSocketBase } from './origin.ts';
+import { QamHost } from './qam/host.ts';
 import { WSRouter } from './wsrouter.ts';
 
 interface CefInjectionInfo {
@@ -39,12 +40,14 @@ async function fetchAuthToken(): Promise<string> {
 /**
  * Confirms the CEF attempt that injected this bundle. The daemon binds the confirmation to its
  * instance, the CEF target and the attempt id, so a stale page cannot acknowledge a new injection.
+ * `qam_ready` is true only after the panel host mounted.
  */
+let qamReady = false;
 async function confirmCef(router: WSRouter): Promise<void> {
   const cef = window.__zerodeckCef;
   if (!cef) return;
   try {
-    await router.call('zerodeck/cef/confirm', { ...cef, qam_ready: false });
+    await router.call('zerodeck/cef/confirm', { ...cef, qam_ready: qamReady });
   } catch (err: unknown) {
     console.warn('[ZeroDeck] CEF confirmation failed', err);
   }
@@ -86,6 +89,18 @@ const loader = new PluginLoader({
   },
 });
 window.DeckyPluginLoader = loader;
+
+const qam = new QamHost({
+  router,
+  loader,
+  origin,
+  getToken: () => window.zerodeckAuthToken,
+  onMounted: () => {
+    qamReady = true;
+    void confirmCef(router);
+  },
+});
+qam.mount();
 
 router.addEventListener('loader/plugins_changed', (plugins) => {
   void loader.sync(plugins as PluginSummary[]);

@@ -67,6 +67,7 @@ export class PluginLoader {
   private readonly loaded = new Map<string, LoadedPlugin>();
   private readonly summaries = new Map<string, PluginSummary>();
   private readonly errors = new Map<string, string>();
+  private readonly listeners = new Set<() => void>();
   private generation = 0;
 
   constructor(deps: PluginLoaderDeps) {
@@ -81,6 +82,19 @@ export class PluginLoader {
   /** Per-plugin load failures, for the Quick Access Menu and diagnostics. */
   loadErrors(): PluginLoadError[] {
     return [...this.errors.entries()].map(([name, error]) => ({ name, error }));
+  }
+
+  /** Backend summaries from the last sync, including disabled and passive plugins. */
+  pluginSummaries(): PluginSummary[] {
+    return [...this.summaries.values()];
+  }
+
+  /** Subscribes a UI host to load/unload/reload changes. */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   /**
@@ -221,5 +235,8 @@ export class PluginLoader {
 
   private notifyChange(): void {
     this.deps.onChange?.();
+    for (const listener of this.listeners) {
+      listener();
+    }
   }
 }

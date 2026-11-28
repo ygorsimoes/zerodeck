@@ -67,10 +67,14 @@ fn is_csrf_exempt(method: &Method, path: &str) -> bool {
         return true;
     }
 
-    segments.len() >= 4
-        && segments[0] == "plugins"
-        && !segments[1].is_empty()
-        && matches!(segments[2], "assets" | "data" | "dist")
+    is_plugin_asset_path(&segments)
+}
+
+/// Plugin bundles load their own images and fonts by plain URL, without custom headers. The
+/// handler behind `/plugins/{name}/{*path}` only serves files inside that plugin's `dist/` or
+/// `assets/` jail.
+fn is_plugin_asset_path(segments: &[&str]) -> bool {
+    segments.len() >= 3 && segments[0] == "plugins" && !segments[1].is_empty()
 }
 
 /// Enforces `X-Decky-Auth` CSRF token verification on protected HTTP endpoints.

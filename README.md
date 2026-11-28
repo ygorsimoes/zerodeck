@@ -55,6 +55,7 @@ plugin contracts, rebuilt from scratch as a native daemon.
 | Plugin static, asset and data routes behind the path jail | ✅ |
 | SSRF-guarded `/fetch` CORS proxy, `FilePicker`, and staged ZIP/`remote_binary` installer | ✅ |
 | WebSocket `FULL_SYNC` deduplication and `"debug"` plugin hot-reload | ✅ |
+| Plugin frontend runtime (ESM/legacy) with a clean-room `@decky/ui` subset and page QAM host | 🚧 |
 | Injection into Steam's UI and the Quick Access Menu | 🚧 |
 
 ✅ shipped and tested · 🚧 in progress (see [Roadmap](#roadmap))
@@ -186,6 +187,7 @@ conflict behavior, conversion backup and recovery, and how channels are signed.
 | | `PRIVILEGED_PATH` | `UNPRIVILEGED_PATH` | Root for `plugins/` and `services/` |
 | | `ZERODECK_FRONTEND_DIR` | auto-detected | Directory containing the `@zerodeck/frontend` bundle |
 | | `PYTHONPATH` | auto-detected | Override search path containing `zerodeck_py_host` |
+| | `ZERODECK_DISABLE_CEF` | off | Keep the Steam CEF supervisor disabled (`1` disables it) |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
 Without `ZERODECK_FRONTEND_DIR` / `PYTHONPATH`, the frontend and `zerodeck_py_host` are searched

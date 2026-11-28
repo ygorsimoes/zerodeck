@@ -184,7 +184,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e AS runtime
 # x-release-please-start-version
-ARG VERSION=0.1.0
+ARG VERSION=0.1.1
 # x-release-please-end
 LABEL org.opencontainers.image.title="ZeroDeck" \
       org.opencontainers.image.description="Performance-first, security-hardened Steam Deck plugin loader daemon" \

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0" # x-release-please-version
+version = "0.1.1" # x-release-please-version
 edition = "2024"
 rust-version = "1.100"
 license = "MIT"
@@ -30,12 +30,12 @@ strip = "debuginfo"
 
 [workspace.dependencies]
 # x-release-please-start-version
-zerodeck-protocol = { version = "0.1.0", path = "crates/zerodeck-protocol" }
-zerodeck-platform = { version = "0.1.0", path = "crates/zerodeck-platform" }
-zerodeck-core = { version = "0.1.0", path = "crates/zerodeck-core" }
-zerodeck-plugin-host = { version = "0.1.0", path = "crates/zerodeck-plugin-host" }
-zerodeck-cef = { version = "0.1.0", path = "crates/zerodeck-cef" }
-zerodeck-server = { version = "0.1.0", path = "crates/zerodeck-server" }
+zerodeck-protocol = { version = "0.1.1", path = "crates/zerodeck-protocol" }
+zerodeck-platform = { version = "0.1.1", path = "crates/zerodeck-platform" }
+zerodeck-core = { version = "0.1.1", path = "crates/zerodeck-core" }
+zerodeck-plugin-host = { version = "0.1.1", path = "crates/zerodeck-plugin-host" }
+zerodeck-cef = { version = "0.1.1", path = "crates/zerodeck-cef" }
+zerodeck-server = { version = "0.1.1", path = "crates/zerodeck-server" }
 # x-release-please-end
 
 tokio = { version = "1.54.1", features = ["full"] }

@@ -1,6 +1,6 @@
 [project]
 name = "zerodeck-py-host"
-version = "0.1.0"
+version = "0.1.1"
 description = "Isolated Python plugin worker host for ZeroDeck"
 requires-python = ">=3.10"
 license = { text = "MIT" }

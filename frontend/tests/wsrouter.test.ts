@@ -343,6 +343,28 @@ test('WSRouter.start requires refreshAuthToken', () => {
   assert.throws(() => new WSRouter().start(), /refreshAuthToken/);
 });
 
+test('WSRouter onOpen runs after the initial FULL_SYNC flush', async () => {
+  const sockets: MockWebSocket[] = [];
+  let opened = 0;
+  const router = new WSRouter({
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+    onOpen: () => {
+      opened += 1;
+      assert.equal(JSON.parse(sockets[0].sent[0]).type, MessageType.FullSync);
+    },
+  });
+
+  const conn = router.connect('tok-on-open');
+  assert.equal(opened, 0);
+  sockets[0].emit('open', {});
+  await conn;
+  assert.equal(opened, 1);
+});
+
 test('WSRouter rejects calls that exceed callTimeoutMs and stops replaying them', async () => {
   const sockets: MockWebSocket[] = [];
   const router = new WSRouter({

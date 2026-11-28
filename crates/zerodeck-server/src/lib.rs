@@ -21,9 +21,24 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use zerodeck_protocol::{ProtocolError, WsClientMessage};
+    use std::sync::Arc;
+
+    use zerodeck_cef::{CefSupervisor, CefSupervisorConfig, CefTiming};
+    use zerodeck_protocol::{ProtocolError, WsCallPayload, WsClientMessage, WsServerMessage};
 
     use crate::{AppState, ServerConfig, build_router};
+
+    fn cef_supervisor() -> Arc<CefSupervisor> {
+        Arc::new(
+            CefSupervisor::new(CefSupervisorConfig {
+                daemon_instance: "daemon-test".to_owned(),
+                frontend_base_url: "http://127.0.0.1:1337".to_owned(),
+                timing: CefTiming::default(),
+                enabled: true,
+            })
+            .expect("build CEF supervisor"),
+        )
+    }
 
     #[tokio::test]
     async fn readyz_is_authenticated_and_reports_no_internal_paths() {
@@ -194,6 +209,140 @@ mod tests {
             .await
             .expect("call traversal plugin assets");
         assert_eq!(traversal_assets.status(), StatusCode::FORBIDDEN);
+    }
+
+    async fn readyz_json(app: &axum::Router, token: &str) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .header("X-Decky-Auth", token)
+                    .body(Body::empty())
+                    .expect("build /readyz"),
+            )
+            .await
+            .expect("call /readyz");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read /readyz");
+        serde_json::from_slice(&body).expect("readyz json")
+    }
+
+    #[tokio::test]
+    async fn cef_status_is_authenticated_and_does_not_change_readiness() {
+        let supervisor = cef_supervisor();
+        let state = AppState::builder(ServerConfig::default())
+            .cef_supervisor(Arc::clone(&supervisor))
+            .build()
+            .expect("build app state");
+        let token = state.csrf_token().to_owned();
+        let app = build_router(state);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/cef/status")
+                    .body(Body::empty())
+                    .expect("build /cef/status"),
+            )
+            .await
+            .expect("call unauthenticated /cef/status");
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/cef/status")
+                    .header("X-Decky-Auth", &token)
+                    .body(Body::empty())
+                    .expect("build authenticated /cef/status"),
+            )
+            .await
+            .expect("call authenticated /cef/status");
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = to_bytes(status.into_body(), 4096)
+            .await
+            .expect("read /cef/status");
+        let status: serde_json::Value = serde_json::from_slice(&body).expect("cef status json");
+        assert_eq!(status["state"], serde_json::json!("waiting_for_steam"));
+
+        let ready_before = readyz_json(&app, &token).await;
+        supervisor.enter_safe_mode("test safe mode");
+        let ready_after = readyz_json(&app, &token).await;
+        assert_eq!(ready_before, ready_after);
+
+        let safe_status = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/cef/status")
+                    .header("X-Decky-Auth", &token)
+                    .body(Body::empty())
+                    .expect("build /cef/status"),
+            )
+            .await
+            .expect("call /cef/status");
+        let body = to_bytes(safe_status.into_body(), 4096)
+            .await
+            .expect("read /cef/status");
+        let safe_status: serde_json::Value =
+            serde_json::from_slice(&body).expect("cef status json");
+        assert_eq!(safe_status["state"], serde_json::json!("safe_mode"));
+
+        let reset = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/cef/reset")
+                    .header("X-Decky-Auth", &token)
+                    .body(Body::empty())
+                    .expect("build /cef/reset"),
+            )
+            .await
+            .expect("call /cef/reset");
+        assert_eq!(reset.status(), StatusCode::OK);
+        let body = to_bytes(reset.into_body(), 4096)
+            .await
+            .expect("read /cef/reset");
+        let reset: serde_json::Value = serde_json::from_slice(&body).expect("reset json");
+        assert_eq!(reset["reset"], serde_json::json!(true));
+        assert_eq!(
+            reset["status"]["state"],
+            serde_json::json!("waiting_for_steam")
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_cef_confirmation_rejects_a_stale_attempt() {
+        let state = AppState::builder(ServerConfig::default())
+            .cef_supervisor(cef_supervisor())
+            .build()
+            .expect("build app state");
+        let frame = crate::ws::dispatch::dispatch_call(
+            state,
+            WsCallPayload {
+                id: 3,
+                route: "zerodeck/cef/confirm".to_owned(),
+                args: vec![serde_json::json!({
+                    "instance": "other-daemon",
+                    "context": "1",
+                    "attempt": "stale",
+                    "qam_ready": false
+                })],
+            },
+        )
+        .await;
+        match frame {
+            WsServerMessage::Error { id, error } => {
+                assert_eq!(id, 3);
+                assert_eq!(error.name, "StaleCefConfirmation");
+            }
+            other => panic!("expected a stale confirmation error, got {other:?}"),
+        }
     }
 
     async fn status_for_host(host: &str) -> StatusCode {

@@ -2544,11 +2544,15 @@ dependencies = [
 name = "zerodeck-cef"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+ "url",
+ "uuid",
  "zerodeck-protocol",
 ]
 
@@ -2680,6 +2684,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zerodeck-cef",
  "zerodeck-core",
  "zerodeck-platform",

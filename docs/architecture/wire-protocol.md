@@ -94,6 +94,26 @@ Connection limits:
 - Each connection runs at most 64 calls at once (`ServerConfig::ws_max_in_flight_calls`); up to 1024 more wait for a free slot (`ServerConfig::ws_max_queued_calls`). A `CALL`, or a message inside `FULL_SYNC`, that arrives while in-flight + queued calls are at that limit is answered immediately with `ERROR (-1)` named `TooManyPendingCalls`; the rest of a `FULL_SYNC` batch is still processed. Waiting calls never block the connection, so keepalive pongs and other frames keep flowing.
 - Clients reconnect with exponential backoff (1 s doubling up to 30 s, reset after a successful open) and fetch a fresh token from `/auth/token` before each attempt.
 
+### CEF Supervision
+
+Steam integration has its own lifecycle and never gates daemon liveness or the updater readiness contract.
+
+- `GET /cef/status` requires `X-Decky-Auth` and returns
+  `{state, reason, attempt, context, qam_ready, consecutive_failures, retry_in_ms}`. `state` is one
+  of `waiting_for_steam`, `attaching`, `bootstrapping`, `active`, `backoff`, `safe_mode`, or
+  `disabled`. `/healthz` and `/readyz` keep their existing meaning in every state.
+- `POST /cef/reset` requires `X-Decky-Auth`, clears safe mode and its persisted marker, and returns
+  `{reset, status}`. `ZERODECK_DISABLE_CEF=1` keeps the supervisor in `disabled`.
+- The injected frontend confirms over `/ws` with `zerodeck/cef/confirm` and one object argument
+  `{instance, context, attempt, qam_ready?}`. Only the current daemon instance, CEF target and
+  attempt id are accepted; any other confirmation returns `StaleCefConfirmation`.
+- The supervisor discovers the `GamepadUI` target at the loopback debugger URL, requires a loopback
+  `ws://` target, and issues only `Runtime.evaluate` with the bootstrap script. Discovery and
+  injection are single-flight; a new context cancels the previous attempt and creates a fresh one.
+- `bootstrapping` has a 10 s confirmation deadline. Failures use 1 s to 30 s exponential backoff;
+  three unexpected failures inside 60 s enter `safe_mode`, which is persisted in
+  `settings/cef-safe-mode.json` until `POST /cef/reset` or an operator removes the marker.
+
 ## 2. Plugin Backend IPC (JSON Lines over Unix Domain Socket / Inherited FD)
 
 Each line is a UTF-8 JSON object terminated by `\n` (up to 4 MiB per frame):

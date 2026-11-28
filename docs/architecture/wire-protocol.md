@@ -25,6 +25,9 @@ All file routes percent-decode path segments, reject empty/`..`/backslash/null-b
 - `GET /plugins/load_main/{name}` and `GET /plugins/{name}/frontend_bundle`: resolve `{name}` (`manifest.name` first, falling back to directory name) and serve `<plugins_dir>/<dir>/dist/index.js` with `Content-Type: text/javascript; charset=utf-8` and `Cache-Control: no-store`.
 - `GET /plugins/{name}/dist/{*path}`: serves from `<plugins_dir>/<dir>/dist`.
 - `GET /plugins/{name}/assets/{*path}`: serves from `<plugins_dir>/<dir>/assets`.
+- `GET /plugins/{name}/{*path}`: Decky-compatible Rollup public path; resolves the file inside
+  `dist/` first, then `assets/`, both behind the plugin `SafePath` jail. It is public for `GET`/`HEAD`
+  because plugin bundles load images and fonts by plain URL without custom headers.
 - `GET /plugins/{name}/data/{*path}`: serves from `<data_dir>/<dir>`. This route stays public (no auth token), a Phase 3 decision kept for Decky parity: plugin frontends load their own data files by plain URL. Files are served read-only and every path goes through the `SafePath` jail, so traversal and symlink escapes are rejected.
 
 ### `/fetch` Streaming CORS Proxy

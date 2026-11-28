@@ -1078,6 +1078,65 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn plugin_relative_assets_follow_the_rollup_public_path_without_auth() {
+            let dir = std::env::temp_dir().join(format!("zd-srv-assets-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let plugin = paths.plugins_dir().join("assets");
+            std::fs::create_dir_all(plugin.join("dist")).expect("dist");
+            std::fs::create_dir_all(plugin.join("assets")).expect("assets");
+            std::fs::write(
+                plugin.join("plugin.json"),
+                r#"{"name":"Assets","author":"Tester"}"#,
+            )
+            .expect("plugin.json");
+            std::fs::write(plugin.join("dist/index.js"), "export default () => ({});")
+                .expect("index");
+            std::fs::write(plugin.join("assets/logo.txt"), "logo").expect("asset");
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+            let (addr, _token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+            let client = reqwest::Client::new();
+
+            let response = client
+                .get(format!("http://{addr}/plugins/Assets/logo.txt"))
+                .send()
+                .await
+                .expect("GET asset");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.text().await.expect("asset body"), "logo");
+
+            let traversal = client
+                .get(format!(
+                    "http://{addr}/plugins/Assets/%2e%2e/%2e%2e/etc/passwd"
+                ))
+                .send()
+                .await
+                .expect("GET traversal");
+            assert!(
+                matches!(
+                    traversal.status(),
+                    reqwest::StatusCode::FORBIDDEN | reqwest::StatusCode::NOT_FOUND
+                ),
+                "{}",
+                traversal.status()
+            );
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
         async fn oversized_message_closes_connection() {
             let config = ServerConfig {
                 ws_max_message_bytes: 1024,

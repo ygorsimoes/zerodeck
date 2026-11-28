@@ -18,4 +18,28 @@ pub enum CefError {
     /// Protocol failure while parsing CDP payload.
     #[error(transparent)]
     Protocol(#[from] zerodeck_protocol::ProtocolError),
+
+    /// Invalid supervisor or debugger configuration.
+    #[error("invalid CEF configuration: {0}")]
+    InvalidConfig(String),
+
+    /// A confirmation does not belong to the current daemon instance, context and attempt.
+    #[error("stale CEF confirmation")]
+    StaleConfirmation,
+
+    /// The CDP command did not answer before its deadline.
+    #[error("CDP command timed out")]
+    CdpTimeout,
+
+    /// The supervisor only allows the specific CDP methods it issues itself.
+    #[error("CDP method not allowed: {0}")]
+    CdpMethodNotAllowed(String),
+
+    /// The evaluated bootstrap raised an exception or returned a CDP error.
+    #[error("CDP evaluation failed: {0}")]
+    CdpEvaluationFailed(String),
+
+    /// The CDP endpoint closed or returned malformed data.
+    #[error("invalid CDP response: {0}")]
+    CdpResponse(String),
 }

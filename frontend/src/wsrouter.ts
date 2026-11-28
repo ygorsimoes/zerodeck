@@ -80,6 +80,8 @@ export interface WSRouterOptions {
    * from another session. Defaults to a fresh `crypto.randomUUID()`.
    */
   sessionId?: string;
+  /** Called after a connection opens and pending frames have been flushed. */
+  onOpen?: () => void;
 }
 
 export class PyError extends Error {
@@ -117,6 +119,7 @@ export class WSRouter {
   private readonly createSocket: (url: string) => WebSocketLike;
   private readonly refreshAuthToken?: () => Promise<string>;
   private readonly callTimeoutMs?: number;
+  private readonly onOpen?: () => void;
   readonly sessionId: string;
 
   constructor(options: WSRouterOptions = {}) {
@@ -133,6 +136,7 @@ export class WSRouter {
       options.createSocket ?? ((url: string) => new WebSocket(url) as unknown as WebSocketLike);
     this.refreshAuthToken = options.refreshAuthToken;
     this.callTimeoutMs = options.callTimeoutMs;
+    this.onOpen = options.onOpen;
   }
 
   /**
@@ -158,6 +162,7 @@ export class WSRouter {
         resolve();
         const messages = Array.from(this.runningCalls.values()).map((pending) => pending.message);
         this.write({ type: MessageType.FullSync, messages });
+        this.onOpen?.();
       });
 
       ws.addEventListener('message', (rawEvent) => {

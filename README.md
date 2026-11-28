@@ -186,6 +186,7 @@ conflict behavior, conversion backup and recovery, and how channels are signed.
 | | `PRIVILEGED_PATH` | `UNPRIVILEGED_PATH` | Root for `plugins/` and `services/` |
 | | `ZERODECK_FRONTEND_DIR` | auto-detected | Directory containing the `@zerodeck/frontend` bundle |
 | | `PYTHONPATH` | auto-detected | Override search path containing `zerodeck_py_host` |
+| | `ZERODECK_DISABLE_CEF` | off | Keep the Steam CEF supervisor disabled (`1` disables it) |
 | | `RUST_LOG` | `info` | Log filter, e.g. `zerodeck_server=debug` |
 
 Without `ZERODECK_FRONTEND_DIR` / `PYTHONPATH`, the frontend and `zerodeck_py_host` are searched

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use zerodeck_cef::{CefConfirmation, CefError};
 use zerodeck_core::{CoreError, PluginManager, PluginSummary};
 use zerodeck_protocol::{WsCallPayload, WsServerMessage};
 
@@ -42,6 +43,7 @@ pub(crate) async fn dispatch_call(state: AppState, call: WsCallPayload) -> WsSer
         "loader/set_plugin_order" => dispatch_set_plugin_order(&state, &call).await,
         "loader/get_settings" => dispatch_get_settings(&state, &call),
         "loader/set_setting" => dispatch_set_setting(&state, &call).await,
+        "zerodeck/cef/confirm" => dispatch_cef_confirm(&state, &call),
         other => ws_error(
             call.id,
             "RouteNotFoundError",
@@ -249,6 +251,44 @@ async fn dispatch_set_plugin_order(state: &AppState, call: &WsCallPayload) -> Ws
         Err(msg) => return ws_error(call.id, "ValueError", msg, None),
     };
     reply_done(call.id, manager.set_plugin_order(order).await)
+}
+
+fn dispatch_cef_confirm(state: &AppState, call: &WsCallPayload) -> WsServerMessage {
+    let Some(supervisor) = state.cef_supervisor() else {
+        return ws_error(
+            call.id,
+            "CefUnavailableError",
+            "the CEF supervisor is not running",
+            None,
+        );
+    };
+    let Some(value) = call.args.first() else {
+        return ws_error(call.id, "ValueError", "missing confirmation object", None);
+    };
+    let confirmation: CefConfirmation = match serde_json::from_value(value.clone()) {
+        Ok(confirmation) => confirmation,
+        Err(err) => {
+            return ws_error(
+                call.id,
+                "ValueError",
+                format!("invalid CEF confirmation: {err}"),
+                None,
+            );
+        }
+    };
+    match supervisor.confirm(&confirmation) {
+        Ok(()) => WsServerMessage::Reply {
+            id: call.id,
+            result: json!(true),
+        },
+        Err(CefError::StaleConfirmation) => ws_error(
+            call.id,
+            "StaleCefConfirmation",
+            "confirmation does not match the current daemon instance, context and attempt",
+            None,
+        ),
+        Err(err) => ws_error(call.id, "CefError", err.to_string(), None),
+    }
 }
 
 fn dispatch_get_settings(state: &AppState, call: &WsCallPayload) -> WsServerMessage {

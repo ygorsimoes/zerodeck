@@ -3,7 +3,8 @@
 Observations that only a real Steam Deck / SteamOS install can confirm. The update path itself
 (signed channel, staging, activation, rollback, crash recovery) is tested in CI, including a KVM
 VM run (see [`tests/README.md`](tests/README.md)); this file records what that cannot show. It
-informs a release and does **not** gate publication or the channels. Copy it per release
+informs a release and does **not** gate Testing publication or the channels; it gates the Stable
+Steam Deck claim defined in [`QUALIFICATION.md`](QUALIFICATION.md). Copy it per release
 (`deploy/update/evidence/<tag>.md` if you want it kept), replace each field with an observed value or
 `PASS`/`FAIL` plus a reference (log, screenshot, command output), and leave unobserved fields
 **PENDING**.

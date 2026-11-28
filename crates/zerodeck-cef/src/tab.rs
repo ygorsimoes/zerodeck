@@ -4,6 +4,33 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::CefError;
 
+/// Returns `true` when `raw` is a loopback `ws://` URL (Steam CDP only listens locally).
+#[must_use]
+pub fn is_loopback_ws_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "ws" && host_is_loopback(&url)
+}
+
+/// Returns `true` when `raw` is a loopback `http://` base URL.
+#[must_use]
+pub fn is_loopback_http_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "http" && url.username().is_empty() && host_is_loopback(&url)
+}
+
+fn host_is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
 const SHARED_CONTEXT_TITLES: &[&str] = &[
     "SharedJSContext",
     "Steam Shared Context presented by Valve™",
@@ -15,6 +42,23 @@ const SHARED_CONTEXT_TITLES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CefConfig {
     pub debugger_base_url: String,
+}
+
+impl CefConfig {
+    /// Validates that remote debugging is a loopback HTTP endpoint.
+    ///
+    /// # Errors
+    /// Returns [`CefError::InvalidConfig`] for a malformed, non-HTTP or non-loopback URL.
+    pub fn validate(&self) -> Result<(), CefError> {
+        if is_loopback_http_url(&self.debugger_base_url) {
+            Ok(())
+        } else {
+            Err(CefError::InvalidConfig(format!(
+                "CEF debugger URL must be a loopback http URL, got {:?}",
+                self.debugger_base_url
+            )))
+        }
+    }
 }
 
 impl Default for CefConfig {

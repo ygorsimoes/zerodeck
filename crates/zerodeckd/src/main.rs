@@ -13,9 +13,15 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use zerodeck_cef::CefConfig;
+use uuid::Uuid;
+use zerodeck_cef::{
+    CefConfig, CefHandle, CefStatus, CefSupervisor, CefSupervisorConfig, CefTiming, LiveCefDriver,
+    spawn_supervisor,
+};
 use zerodeck_core::{
     InstallerLimits, OutboundHttpPolicy, PluginManager, SettingsManager, discover_plugins,
     start_debug_watcher,
@@ -24,7 +30,6 @@ use zerodeck_platform::PlatformPaths;
 use zerodeck_plugin_host::{PythonHostConfig, SupervisorConfig};
 use zerodeck_protocol::WsMessageType;
 use zerodeck_server::{AppState, ServerConfig, serve};
-
 #[derive(Debug, Parser)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -380,39 +385,131 @@ fn resolve_loader_paths(managed: Option<&install::ManagedGeneration>) -> LoaderP
     }
 }
 
-async fn run_daemon(
-    cli: Cli,
+/// Running CEF supervisor plus the task that persists safe mode across daemon restarts.
+struct CefRuntime {
+    handle: CefHandle,
+    persistence: JoinHandle<()>,
+}
+
+/// Starts Steam integration without making daemon startup depend on Steam being present.
+fn start_cef(
+    marker: PathBuf,
+    frontend_base_url: String,
+    config: &CefConfig,
+) -> Option<(Arc<CefSupervisor>, CefRuntime)> {
+    if std::env::var("ZERODECK_DISABLE_CEF").is_ok_and(|value| value == "1") {
+        info!("CEF supervisor disabled by ZERODECK_DISABLE_CEF");
+        return None;
+    }
+    if let Err(err) = config.validate() {
+        warn!(error = %err, "CEF supervisor disabled");
+        return None;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(error = %err, "failed to build the CEF HTTP client; supervisor disabled");
+            return None;
+        }
+    };
+    let driver = match LiveCefDriver::new(client, config.clone(), Duration::from_secs(5)) {
+        Ok(driver) => driver,
+        Err(err) => {
+            warn!(error = %err, "CEF driver disabled");
+            return None;
+        }
+    };
+    let supervisor = match CefSupervisor::new(CefSupervisorConfig {
+        daemon_instance: Uuid::new_v4().to_string(),
+        frontend_base_url,
+        timing: CefTiming::default(),
+        enabled: true,
+    }) {
+        Ok(supervisor) => Arc::new(supervisor),
+        Err(err) => {
+            warn!(error = %err, "CEF supervisor disabled");
+            return None;
+        }
+    };
+    if let Ok(raw) = std::fs::read(&marker) {
+        let reason = serde_json::from_slice::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(|reason| reason.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "persisted CEF safe mode".to_owned());
+        supervisor.enter_safe_mode(reason);
+    }
+    let persistence = spawn_cef_persistence(supervisor.subscribe(), marker);
+    let handle = spawn_supervisor(Arc::new(driver), Arc::clone(&supervisor));
+    info!(state = %supervisor.status().state, "CEF supervisor started");
+    Some((
+        supervisor,
+        CefRuntime {
+            handle,
+            persistence,
+        },
+    ))
+}
+
+/// Persists safe mode while it is active and clears the marker once the operator resets it.
+fn spawn_cef_persistence(
+    mut status: watch::Receiver<CefStatus>,
+    marker: PathBuf,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let current = status.borrow().clone();
+            if current.state == "safe_mode" {
+                let payload = serde_json::json!({
+                    "reason": current.reason,
+                    "state": current.state,
+                })
+                .to_string();
+                if let Err(err) = zerodeck_platform::atomic_write(&marker, payload.as_bytes()) {
+                    warn!(error = %err, path = %marker.display(), "failed to persist CEF safe mode");
+                }
+            } else if let Err(err) = std::fs::remove_file(&marker)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(error = %err, path = %marker.display(), "failed to clear CEF safe-mode marker");
+            }
+            if status.changed().await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn build_app_state(
+    config: ServerConfig,
+    manager: &Arc<PluginManager>,
+    cef_supervisor: Option<Arc<CefSupervisor>>,
+) -> Result<AppState> {
+    let mut builder = AppState::builder(config)
+        .manager(Arc::clone(manager))
+        .http_client(manager.http_client().clone());
+    if let Some(supervisor) = cef_supervisor {
+        builder = builder.cef_supervisor(supervisor);
+    }
+    builder.build().context("initialize server state")
+}
+
+async fn start_plugin_manager(
+    config: &ServerConfig,
     paths: PlatformPaths,
     settings: SettingsManager,
     plugins: Vec<zerodeck_core::DiscoveredPlugin>,
-    generation: Option<install::ManagedGeneration>,
-) -> Result<()> {
-    let addrs = resolve(&cli.host, cli.port).await?;
-    check_bind_policy(&addrs, cli.allow_non_loopback)?;
-    #[cfg(unix)]
-    warn_about_writable_ancestors(&paths);
-
-    let LoaderPaths {
-        python_host,
-        frontend_dir,
-        version,
-        build_id,
-    } = resolve_loader_paths(generation.as_ref());
-    let python_host_missing = probe_python_host(&python_host).await;
-    let config = ServerConfig {
-        host: cli.host,
-        port: cli.port,
-        cef: CefConfig::default(),
-        python_host: python_host.clone(),
-        frontend_dir,
-        version,
-        build_id,
-        python_host_ready: python_host_missing.is_none(),
-        // systemd sets this for every service process and the updater compares it with the unit's
-        // current `InvocationID` before accepting `/readyz` as the freshly started daemon.
-        invocation_id: std::env::var("INVOCATION_ID").unwrap_or_default(),
-        ..ServerConfig::default()
-    };
+    python_host: PythonHostConfig,
+    python_host_missing: Option<String>,
+    allow_unsafe_root_plugins: bool,
+) -> Result<Arc<PluginManager>> {
     let http_client = OutboundHttpPolicy::production()
         .with_timeouts(
             Some(config.fetch_connect_timeout),
@@ -443,13 +540,60 @@ async fn run_daemon(
         error!(reason = %reason, "Python worker host unavailable; backend plugins will not start");
         manager.set_python_host_missing(Some(reason));
     }
-    if cli.allow_unsafe_root_plugins {
+    if allow_unsafe_root_plugins {
         warn!("--allow-unsafe-root-plugins is set: root plugins skip the ownership check");
         manager.set_allow_unsafe_root_plugins(true);
     }
     if let Err(err) = manager.start_all().await {
         warn!(error = %err, "one or more plugins failed during startup");
     }
+    Ok(manager)
+}
+
+async fn run_daemon(
+    cli: Cli,
+    paths: PlatformPaths,
+    settings: SettingsManager,
+    plugins: Vec<zerodeck_core::DiscoveredPlugin>,
+    generation: Option<install::ManagedGeneration>,
+) -> Result<()> {
+    let addrs = resolve(&cli.host, cli.port).await?;
+    check_bind_policy(&addrs, cli.allow_non_loopback)?;
+    #[cfg(unix)]
+    warn_about_writable_ancestors(&paths);
+    let cef_marker = paths.settings_dir().join("cef-safe-mode.json");
+
+    let LoaderPaths {
+        python_host,
+        frontend_dir,
+        version,
+        build_id,
+    } = resolve_loader_paths(generation.as_ref());
+    let python_host_missing = probe_python_host(&python_host).await;
+    let config = ServerConfig {
+        host: cli.host,
+        port: cli.port,
+        cef: CefConfig::default(),
+        python_host: python_host.clone(),
+        frontend_dir,
+        version,
+        build_id,
+        python_host_ready: python_host_missing.is_none(),
+        // systemd sets this for every service process and the updater compares it with the unit's
+        // current `InvocationID` before accepting `/readyz` as the freshly started daemon.
+        invocation_id: std::env::var("INVOCATION_ID").unwrap_or_default(),
+        ..ServerConfig::default()
+    };
+    let manager = start_plugin_manager(
+        &config,
+        paths,
+        settings,
+        plugins,
+        python_host,
+        python_host_missing,
+        cli.allow_unsafe_root_plugins,
+    )
+    .await?;
 
     let listener = match bind_first(&addrs).await {
         Ok(listener) => listener,
@@ -459,6 +603,15 @@ async fn run_daemon(
         }
     };
     let addr = listener.local_addr().context("read bound address")?;
+    let cef = start_cef(
+        cef_marker,
+        format!("http://{}", probe_target(addr)),
+        &config.cef,
+    );
+    let (cef_supervisor, mut cef_runtime) = match cef {
+        Some((supervisor, runtime)) => (Some(supervisor), Some(runtime)),
+        None => (None, None),
+    };
     let watcher = match start_debug_watcher(Arc::clone(&manager)) {
         Ok(handle) => Some(handle),
         Err(err) => {
@@ -470,11 +623,7 @@ async fn run_daemon(
         .frontend_dir
         .as_ref()
         .map(|p| p.display().to_string());
-    let state = AppState::builder(config)
-        .manager(Arc::clone(&manager))
-        .http_client(manager.http_client().clone())
-        .build()
-        .context("initialize server state")?;
+    let state = build_app_state(config, &manager, cef_supervisor)?;
 
     info!(listen = %addr, frontend_dir = ?frontend_dir, "ZeroDeck daemon listening");
     if let Err(error) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
@@ -484,6 +633,10 @@ async fn run_daemon(
         .await
         .context("serve HTTP/WS");
 
+    if let Some(runtime) = cef_runtime.take() {
+        runtime.handle.shutdown().await;
+        runtime.persistence.abort();
+    }
     if let Some(watcher) = watcher {
         watcher.stop().await;
     }
@@ -677,5 +830,48 @@ mod tests {
         ] {
             check_bind_policy(&addrs(list), true).expect("opt-in allows any address");
         }
+    }
+
+    #[tokio::test]
+    async fn cef_safe_mode_marker_is_persisted_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("zd-cef-marker-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let marker = dir.join("cef-safe-mode.json");
+        let status = |state: &str, reason: Option<&str>| CefStatus {
+            state: state.to_owned(),
+            reason: reason.map(str::to_owned),
+            attempt: None,
+            context: None,
+            qam_ready: false,
+            consecutive_failures: 0,
+            retry_in_ms: None,
+        };
+        let (tx, rx) = watch::channel(status("waiting_for_steam", None));
+        let task = spawn_cef_persistence(rx, marker.clone());
+
+        tx.send(status("safe_mode", Some("repeated failures")))
+            .expect("send safe mode");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("marker written");
+        let raw = std::fs::read_to_string(&marker).expect("read marker");
+        assert!(raw.contains("repeated failures"), "{raw}");
+
+        tx.send(status("waiting_for_steam", None))
+            .expect("send waiting");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("marker cleared");
+
+        task.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

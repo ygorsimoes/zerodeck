@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 use uuid::Uuid;
-use zerodeck_cef::CefConfig;
+use zerodeck_cef::{CefConfig, CefSupervisor};
 use zerodeck_core::{
     CheckedHttpClient, DEFAULT_MAX_REMOTE_BINARY_BYTES, DEFAULT_MAX_ZIP_DOWNLOAD_BYTES,
     DiscoveredPlugin, LoaderEvent, OutboundHttpPolicy, PluginManager,
@@ -113,6 +113,7 @@ struct AppStateInner {
     backend: PluginBackend,
     http_client: CheckedHttpClient,
     ws_sync_cache: Arc<WsSyncCache>,
+    cef_supervisor: Option<Arc<CefSupervisor>>,
 }
 
 /// Builds an [`AppState`]. See [`AppState::builder`].
@@ -121,6 +122,7 @@ pub struct AppStateBuilder {
     config: ServerConfig,
     backend: PluginBackend,
     http_client: Option<CheckedHttpClient>,
+    cef_supervisor: Option<Arc<CefSupervisor>>,
 }
 
 impl AppStateBuilder {
@@ -139,6 +141,13 @@ impl AppStateBuilder {
         self
     }
 
+    /// Exposes the Steam CEF supervisor status and confirmation routes.
+    #[must_use]
+    pub fn cef_supervisor(mut self, supervisor: Arc<CefSupervisor>) -> Self {
+        self.cef_supervisor = Some(supervisor);
+        self
+    }
+
     /// Creates the state with a fresh ephemeral auth token.
     pub fn build(self) -> Result<AppState, ServerError> {
         let http_client = match self.http_client {
@@ -150,7 +159,12 @@ impl AppStateBuilder {
                 )
                 .build_checked_client()?,
         };
-        Ok(AppState::from_parts(self.config, self.backend, http_client))
+        Ok(AppState::from_parts(
+            self.config,
+            self.backend,
+            http_client,
+            self.cef_supervisor,
+        ))
     }
 }
 
@@ -163,6 +177,7 @@ impl AppState {
             config,
             backend: PluginBackend::Static(Vec::new()),
             http_client: None,
+            cef_supervisor: None,
         }
     }
 
@@ -170,6 +185,7 @@ impl AppState {
         config: ServerConfig,
         backend: PluginBackend,
         http_client: CheckedHttpClient,
+        cef_supervisor: Option<Arc<CefSupervisor>>,
     ) -> Self {
         let ws_sync_cache = Arc::new(WsSyncCache::new(
             config.ws_sync_cache_capacity,
@@ -182,6 +198,7 @@ impl AppState {
                 backend,
                 http_client,
                 ws_sync_cache,
+                cef_supervisor,
             }),
         }
     }
@@ -209,6 +226,11 @@ impl AppState {
 
     pub(crate) fn ws_sync_cache(&self) -> &Arc<WsSyncCache> {
         &self.inner.ws_sync_cache
+    }
+
+    /// Steam CEF supervisor when the daemon started one.
+    pub(crate) fn cef_supervisor(&self) -> Option<&Arc<CefSupervisor>> {
+        self.inner.cef_supervisor.as_ref()
     }
 
     pub(crate) fn subscribe_plugin_events(&self) -> Option<broadcast::Receiver<PluginEvent>> {

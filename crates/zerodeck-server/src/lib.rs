@@ -196,6 +196,44 @@ mod tests {
         assert_eq!(traversal_assets.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn auth_token_advertises_at_most_once_full_sync_to_the_steam_origin() {
+        let state = AppState::builder(ServerConfig::default())
+            .build()
+            .expect("build app state");
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/auth/token")
+                    .header("Origin", "https://steamloopback.host")
+                    .body(Body::empty())
+                    .expect("build /auth/token req"),
+            )
+            .await
+            .expect("call /auth/token");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-zerodeck-capabilities")
+                .and_then(|value| value.to_str().ok()),
+            Some("full-sync-at-most-once")
+        );
+        let exposed = response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            exposed.split(',').any(|header| header
+                .trim()
+                .eq_ignore_ascii_case("x-zerodeck-capabilities")),
+            "{exposed}"
+        );
+    }
+
     async fn status_for_host(host: &str) -> StatusCode {
         let app = build_router(
             AppState::builder(ServerConfig::default())
@@ -1077,6 +1115,141 @@ mod tests {
             assert_eq!(reply, json!({"type": 1, "id": 7, "result": "pong"}));
         }
 
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn full_sync_does_not_reexecute_a_mutation_after_ack_eviction() {
+            let (manager, addr, token, dir, counter) =
+                spawn_counter_plugin_server(ServerConfig::default()).await;
+            let mut ws = connect(addr, &token).await;
+            let call_inc = json!({
+                "type": 0, "id": 42, "route": "loader/call_plugin_method",
+                "args": ["Counter", "inc"]
+            });
+
+            ws.send(Message::Text(call_inc.to_string().into()))
+                .await
+                .expect("send call");
+            assert_eq!(
+                next_text_frame(&mut ws).await,
+                json!({"type": 1, "id": 42, "result": 1})
+            );
+
+            // Acknowledging the reply evicts the cached outcome; a later FULL_SYNC replay must not
+            // run the plugin method again even though the daemon no longer remembers it.
+            ws.send(Message::Text(
+                json!({"type": 3, "id": 42}).to_string().into(),
+            ))
+            .await
+            .expect("send ack");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            ws.send(Message::Text(
+                json!({"type": 4, "messages": [call_inc]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send full sync");
+            let replayed = next_text_frame(&mut ws).await;
+            assert_eq!(replayed["type"], json!(-1));
+            assert_eq!(replayed["error"]["name"], json!("IndeterminateCallOutcome"));
+            assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+            // An explicit CALL is a new request, not a replay, so it still executes.
+            ws.send(Message::Text(call_inc.to_string().into()))
+                .await
+                .expect("send explicit call");
+            assert_eq!(
+                next_text_frame(&mut ws).await,
+                json!({"type": 1, "id": 42, "result": 2})
+            );
+            assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn full_sync_does_not_reexecute_a_mutation_after_cache_expiry() {
+            let config = ServerConfig {
+                ws_sync_cache_ttl: Duration::ZERO,
+                ..ServerConfig::default()
+            };
+            let (manager, addr, token, dir, counter) = spawn_counter_plugin_server(config).await;
+            let mut ws = connect(addr, &token).await;
+            let call_inc = json!({
+                "type": 0, "id": 7, "route": "loader/call_plugin_method",
+                "args": ["Counter", "inc"]
+            });
+
+            ws.send(Message::Text(call_inc.to_string().into()))
+                .await
+                .expect("send call");
+            assert_eq!(
+                next_text_frame(&mut ws).await,
+                json!({"type": 1, "id": 7, "result": 1})
+            );
+
+            // Zero TTL prunes the completed entry before the next lookup, just like an expiry.
+            ws.send(Message::Text(
+                json!({"type": 4, "messages": [call_inc]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("send full sync");
+            let replayed = next_text_frame(&mut ws).await;
+            assert_eq!(replayed["type"], json!(-1));
+            assert_eq!(replayed["error"]["name"], json!("IndeterminateCallOutcome"));
+            assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn full_sync_after_daemon_restart_does_not_reexecute_a_mutation() {
+            let (manager, addr, token, dir, counter) =
+                spawn_counter_plugin_server(ServerConfig::default()).await;
+            let mut first = connect(addr, &token).await;
+            let call_inc = json!({
+                "type": 0, "id": 9, "route": "loader/call_plugin_method",
+                "args": ["Counter", "inc"]
+            });
+            first
+                .send(Message::Text(call_inc.to_string().into()))
+                .await
+                .expect("send call");
+            assert_eq!(
+                next_text_frame(&mut first).await,
+                json!({"type": 1, "id": 9, "result": 1})
+            );
+            drop(first);
+
+            // A second server shares the plugin worker but starts with an empty sync cache, which
+            // is what a daemon restart looks like to a client that reconnects with a new token.
+            let (restarted_addr, restarted_token) =
+                spawn_manager_server(ServerConfig::default(), manager.clone()).await;
+            let mut second = connect(restarted_addr, &restarted_token).await;
+            second
+                .send(Message::Text(
+                    json!({"type": 4, "messages": [call_inc]})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .expect("send full sync");
+            let replayed = next_text_frame(&mut second).await;
+            assert_eq!(replayed["type"], json!(-1));
+            assert_eq!(replayed["error"]["name"], json!("IndeterminateCallOutcome"));
+            assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+
+            manager.shutdown_all().await;
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[tokio::test]
         async fn oversized_message_closes_connection() {
             let config = ServerConfig {
@@ -1180,6 +1353,52 @@ mod tests {
             let token = state.csrf_token().to_owned();
             tokio::spawn(serve(listener, state, std::future::pending()));
             (addr, token)
+        }
+
+        /// Server backed by a plugin whose `inc` method appends one to a counter file, so tests can
+        /// observe whether a replayed call executed twice.
+        #[cfg(unix)]
+        async fn spawn_counter_plugin_server(
+            config: ServerConfig,
+        ) -> (
+            std::sync::Arc<zerodeck_core::PluginManager>,
+            SocketAddr,
+            String,
+            std::path::PathBuf,
+            std::path::PathBuf,
+        ) {
+            let dir = std::env::temp_dir().join(format!("zd-srv-counter-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let paths = server_test_paths(&dir);
+            let counter_file = dir.join("count.txt");
+            std::fs::write(&counter_file, "0").expect("seed counter");
+
+            let plug = paths.plugins_dir().join("counter");
+            std::fs::create_dir_all(&plug).expect("plug dir");
+            std::fs::write(
+                plug.join("plugin.json"),
+                r#"{"name":"Counter","author":"Tester","api_version":1}"#,
+            )
+            .expect("plugin.json");
+            let py = format!(
+                "from pathlib import Path\nP = Path({:?})\nclass Plugin:\n    async def inc(self):\n        n = int(P.read_text()) + 1\n        P.write_text(str(n))\n        return n\n",
+                counter_file.display().to_string()
+            );
+            std::fs::write(plug.join("main.py"), py).expect("main.py");
+
+            let sup_cfg = zerodeck_plugin_host::SupervisorConfig {
+                python_host: zerodeck_plugin_host::PythonHostConfig {
+                    python_bin: "python3".to_owned(),
+                    host_module_path: Some(python_host_dir()),
+                },
+                ..zerodeck_plugin_host::SupervisorConfig::default()
+            };
+            let manager = std::sync::Arc::new(
+                zerodeck_core::PluginManager::open(paths, sup_cfg, "0.1.0").expect("open mgr"),
+            );
+            manager.start_all().await.expect("start_all");
+            let (addr, token) = spawn_manager_server(config, manager.clone()).await;
+            (manager, addr, token, dir, counter_file)
         }
 
         async fn next_text_frame<S>(ws: &mut S) -> Value
@@ -1364,14 +1583,17 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        #[cfg(unix)]
         #[tokio::test]
         async fn ws_full_sync_rejects_only_excess_messages() {
-            let (manager, addr, token, dir) = spawn_slow_plugin_server(tiny_limits()).await;
+            let (addr, token) = spawn_server(tiny_limits()).await;
             let mut ws = connect(addr, &token).await;
+            // `utilities/ping` is replay-safe, so an unrecorded FULL_SYNC entry may execute; the
+            // admission limit still applies to each message in the batch.
+            let ping =
+                |id: u64| json!({"type": 0, "id": id, "route": "utilities/ping", "args": []});
             let full_sync = json!({
                 "type": 4,
-                "messages": [slow_call(1, 300), slow_call(2, 301), slow_call(3, 302)]
+                "messages": [ping(1), ping(2), ping(3)]
             });
             ws.send(Message::Text(full_sync.to_string().into()))
                 .await
@@ -1384,15 +1606,12 @@ mod tests {
                 if frame["error"]["name"] == json!("TooManyPendingCalls") {
                     rejected.push(frame["id"].clone());
                 } else {
-                    assert_eq!(frame["result"], json!("waited"));
+                    assert_eq!(frame["result"], json!("pong"));
                     replied.push(frame["id"].clone());
                 }
             }
             assert_eq!(rejected, vec![json!(3)]);
             assert_eq!(replied, vec![json!(1), json!(2)]);
-
-            manager.shutdown_all().await;
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[cfg(unix)]
@@ -1866,6 +2085,9 @@ class Plugin:
                 .send(Message::Text(call_slow.to_string().into()))
                 .await
                 .expect("send slow");
+            // Let the daemon register the call before the connection goes away; a replay with no
+            // recorded outcome is correctly reported as indeterminate instead of joined.
+            tokio::time::sleep(Duration::from_millis(50)).await;
             drop(ws_drop);
             ws2.send(Message::Text(
                 json!({"type": 4, "messages": [call_slow]})

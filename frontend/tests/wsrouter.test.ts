@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { MessageType, PyError, type WebSocketLike, WSRouter } from '../src/wsrouter.ts';
+import {
+  FULL_SYNC_AT_MOST_ONCE,
+  IndeterminateOutcomeError,
+  MessageType,
+  PyError,
+  parseAuthResponse,
+  type WebSocketLike,
+  WSRouter,
+} from '../src/wsrouter.ts';
 
 class MockWebSocket implements WebSocketLike {
   readyState = 1;
@@ -124,7 +132,7 @@ test('WSRouter dispatches EVENT (5) and replays in-flight CALLs on FULL_SYNC (4)
   assert.deepEqual(receivedEvents, [{ plugin: 'Demo' }]);
 
   const pendingCall = router.call('slow/method', 99);
-  const conn2 = router.connect('tok-3');
+  const conn2 = router.connect('tok-3', true);
   sockets[1].emit('open', {});
   await conn2;
 
@@ -341,6 +349,79 @@ test('WSRouter.start keeps retrying until the daemon hands out a token', async (
 
 test('WSRouter.start requires refreshAuthToken', () => {
   assert.throws(() => new WSRouter().start(), /refreshAuthToken/);
+});
+
+test('parseAuthResponse reads the at-most-once capability from /auth/token headers', () => {
+  assert.deepEqual(parseAuthResponse('tok', FULL_SYNC_AT_MOST_ONCE), {
+    token: 'tok',
+    capabilities: [FULL_SYNC_AT_MOST_ONCE],
+  });
+  assert.deepEqual(parseAuthResponse('tok', null), { token: 'tok', capabilities: [] });
+  assert.deepEqual(parseAuthResponse('tok', ` one , ${FULL_SYNC_AT_MOST_ONCE} ,two `), {
+    token: 'tok',
+    capabilities: ['one', FULL_SYNC_AT_MOST_ONCE, 'two'],
+  });
+});
+
+test('WSRouter sends calls created while disconnected as CALLs, not FULL_SYNC replays', async () => {
+  const sockets: MockWebSocket[] = [];
+  const router = new WSRouter({
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const pending = router.call<[string, number], boolean>('loader/set_setting', 'demo.key', 1);
+  const conn = router.connect('tok-unsent', true);
+  sockets[0].emit('open', {});
+  await conn;
+
+  const frames = sockets[0].sent.map((raw) => JSON.parse(raw));
+  assert.equal(frames[0].type, MessageType.FullSync);
+  assert.deepEqual(frames[0].messages, []);
+  assert.equal(frames[1].type, MessageType.Call);
+  assert.equal(frames[1].route, 'loader/set_setting');
+
+  sockets[0].emit('message', {
+    data: JSON.stringify({ type: MessageType.Reply, id: 1, result: true }),
+  });
+  assert.equal(await pending, true);
+});
+
+test('WSRouter refuses to replay a sent call when at-most-once FULL_SYNC is unavailable', async () => {
+  const sockets: MockWebSocket[] = [];
+  const router = new WSRouter({
+    createSocket: () => {
+      const ws = new MockWebSocket();
+      sockets.push(ws);
+      return ws;
+    },
+  });
+
+  const conn = router.connect('tok-old', true);
+  sockets[0].emit('open', {});
+  await conn;
+
+  const pending = router.call<[string, number], boolean>('loader/set_setting', 'demo.key', 1);
+  assert.equal(JSON.parse(sockets[0].sent.at(-1) ?? '{}').type, MessageType.Call);
+
+  const conn2 = router.connect('tok-new', false);
+  sockets[1].emit('open', {});
+  await conn2;
+
+  await assert.rejects(pending, (err: unknown) => {
+    assert.ok(err instanceof IndeterminateOutcomeError);
+    assert.match(err.message, /may already have been applied/i);
+    return true;
+  });
+  const frames = sockets[1].sent.map((raw) => JSON.parse(raw));
+  assert.deepEqual(frames[0].messages, []);
+  assert.equal(
+    frames.some((frame) => frame.type === MessageType.Call),
+    false,
+  );
 });
 
 test('WSRouter rejects calls that exceed callTimeoutMs and stops replaying them', async () => {

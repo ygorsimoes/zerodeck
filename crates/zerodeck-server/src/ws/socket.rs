@@ -15,9 +15,10 @@ use zerodeck_protocol::{WsCallPayload, WsClientMessage, WsServerMessage};
 
 use crate::state::AppState;
 use crate::ws::dispatch::dispatch_call;
+use crate::ws::dispatch::is_replay_safe;
 use crate::ws::dispatch::serialize_plugin_summaries;
 use crate::ws::errors::ws_error;
-use crate::ws_sync::SyncScope;
+use crate::ws_sync::{SyncReplayMode, SyncScope};
 
 async fn recv_plugin_event(rx: &mut Option<broadcast::Receiver<PluginEvent>>) -> WsServerMessage {
     let Some(receiver) = rx.as_mut() else {
@@ -199,8 +200,8 @@ fn handle_ws_text(
     outbox: &mpsc::Sender<WsServerMessage>,
 ) -> Vec<WsServerMessage> {
     let mut rejections = Vec::new();
-    let mut admit = |call: WsCallPayload| match limiter.try_admit() {
-        Some(guard) => spawn_ws_call(state, scope, limiter, guard, call, outbox),
+    let mut admit = |call: WsCallPayload, mode: SyncReplayMode| match limiter.try_admit() {
+        Some(guard) => spawn_ws_call(state, scope, limiter, guard, call, mode, outbox),
         None => rejections.push(ws_error(
             call.id,
             "TooManyPendingCalls",
@@ -209,7 +210,7 @@ fn handle_ws_text(
         )),
     };
     match WsClientMessage::from_json_str(text) {
-        Ok(WsClientMessage::Call(call)) => admit(call),
+        Ok(WsClientMessage::Call(call)) => admit(call, SyncReplayMode::Fresh),
         Ok(WsClientMessage::ReceivedResponse { id }) => {
             debug!(call_id = id, "client acknowledged response");
             state.ws_sync_cache().evict_id(scope, id);
@@ -217,7 +218,8 @@ fn handle_ws_text(
         Ok(WsClientMessage::FullSync { messages }) => {
             debug!(count = messages.len(), "replaying FULL_SYNC calls");
             for call in messages {
-                admit(call);
+                let safe_to_execute = is_replay_safe(&call.route);
+                admit(call, SyncReplayMode::Replay { safe_to_execute });
             }
         }
         Err(err) => {
@@ -247,6 +249,7 @@ fn spawn_ws_call(
     limiter: &CallLimiter,
     pending: PendingGuard,
     call: WsCallPayload,
+    mode: SyncReplayMode,
     outbox: &mpsc::Sender<WsServerMessage>,
 ) {
     let state = state.clone();
@@ -260,9 +263,20 @@ fn spawn_ws_call(
         let Ok(_permit) = permits.acquire_owned().await else {
             return;
         };
-        let reply = cache
-            .execute(scope, call, |c| dispatch_call(state.clone(), c))
-            .await;
+        let reply = match mode {
+            SyncReplayMode::Fresh => {
+                cache
+                    .execute(scope, call, |c| dispatch_call(state.clone(), c))
+                    .await
+            }
+            SyncReplayMode::Replay { safe_to_execute } => {
+                cache
+                    .execute_replay(scope, call, safe_to_execute, |c| {
+                        dispatch_call(state.clone(), c)
+                    })
+                    .await
+            }
+        };
         let _ = outbox.send(reply).await;
     });
 }

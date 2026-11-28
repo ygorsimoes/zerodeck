@@ -5,7 +5,10 @@ This document defines the public wire, IPC, HTTP, and filesystem contracts requi
 ## 1. HTTP & WebSocket Server (`127.0.0.1:1337`)
 
 ### Authentication & CORS
-- `GET /auth/token` returns the daemon's ephemeral CSRF token (`text/plain`).
+- `GET /auth/token` returns the daemon's ephemeral CSRF token (`text/plain`) plus
+  `X-ZeroDeck-Capabilities: full-sync-at-most-once` and a matching
+  `Access-Control-Expose-Headers`, so the Steam-origin frontend can negotiate safe replay before
+  reconnecting.
 - Protected HTTP endpoints require header `X-Decky-Auth: <token>` (or `?auth=<token>` on `/ws` and `/fetch`).
 - `GET /readyz` requires `X-Decky-Auth` and returns `{"version", "build_id", "python_host_ready"}` without filesystem paths. It is the local activation readiness contract for the loader generation itself; unrelated plugin failures do not gate it. `GET /healthz` remains an unauthenticated liveness probe.
 - CORS origin allowlist: `https://steamloopback.host` with `allow_credentials = true`.
@@ -78,10 +81,25 @@ Server-to-client `EVENT` (`type: 5`) frames:
 If a plugin worker crashes or stops while a call is in flight (or is in `BackingOff`/`StartupTimeout`), the server responds with `DISCARD` (`2`) for that call ID.
 
 `FULL_SYNC` and `RECEIVED_RESPONSE` semantics (`WsSyncCache`, default capacity `256`, TTL `300 s`):
-- Inbound `CALL (0)` and `FULL_SYNC (4)` replays are keyed by `(session, call.id, call.route, canonical_args_json)`.
+- Every inbound call is keyed by `(session, call.id, call.route, canonical_args_json)`.
 - `session` comes from the optional `session` query parameter of the `/ws` upgrade (the frontend sends one `crypto.randomUUID()` per page load, stable across reconnects). It must be 1-64 characters of `[A-Za-z0-9-]`; any other value is rejected with `400 Bad Request` (after the auth check). Connections that omit it share one legacy namespace. This keeps a new page load, whose call ids restart at 1, from receiving another session's cached reply.
-- If an identical call is already in flight, the replay joins the active execution and receives its single result without spawning duplicate work.
-- If an identical call has completed and has not yet been acknowledged, the cached `REPLY`/`ERROR`/`DISCARD` frame is returned immediately without re-executing the call.
+- A `CALL (0)` is a new request: when no cache entry exists it executes. An explicit `CALL` is never
+  converted into a replay.
+- A `FULL_SYNC (4)` entry is a replay of a call the client already wrote to an earlier connection.
+  If an identical call is in flight, the replay joins that execution and receives its single result
+  without spawning duplicate work. If it completed and was not acknowledged, the cached
+  `REPLY`/`ERROR`/`DISCARD` frame is returned immediately without re-executing the call.
+- If the daemon has no recorded outcome (restart, TTL expiry, capacity eviction, or a
+  `RECEIVED_RESPONSE` acknowledgment), a replay executes only when its route is in the
+  side-effect-free allowlist: `utilities/ping`, `utilities/filepicker`, `loader/get_plugins`, and
+  `loader/get_settings`. Every other route, including all plugin methods, is treated as potentially
+  mutating and answered with `ERROR (-1)` named `IndeterminateCallOutcome`, whose message says the
+  call may already have been applied. That error is not cached, so an explicit `CALL` with the same
+  id can still execute as a new request.
+- The frontend negotiates `full-sync-at-most-once` from `/auth/token` before replaying. Calls created
+  while the socket was down were never sent and go out as `CALL`, not as `FULL_SYNC`. When a daemon
+  does not advertise the capability, the frontend rejects locally the sent calls whose connection
+  dropped with `IndeterminateOutcomeError` instead of replaying them.
 - `RECEIVED_RESPONSE (3)` evicts completed cached entries matching `id` within the connection's session only.
 - Each inbound `CALL` and replayed call runs in its own spawned task so slow plugin calls never starve WebSocket keepalive `pong` handling.
 

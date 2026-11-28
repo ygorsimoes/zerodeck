@@ -22,6 +22,19 @@ pub enum SyncScope {
 /// Composite deduplication key `(scope, call.id, call.route, canonical_args_json)`.
 pub type WsSyncKey = (SyncScope, u64, String, String);
 
+/// Name of the error frame returned when a `FULL_SYNC` replay cannot be answered safely.
+pub const INDETERMINATE_CALL_OUTCOME: &str = "IndeterminateCallOutcome";
+
+/// How a call reached [`WsSyncCache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncReplayMode {
+    /// A fresh `CALL` frame: a distinct request that executes when the cache has no entry.
+    Fresh,
+    /// A `FULL_SYNC` replay of a call the client already sent. When the daemon has no recorded
+    /// outcome, only routes explicitly known to be side-effect free may execute again.
+    Replay { safe_to_execute: bool },
+}
+
 const MAX_SESSION_LEN: usize = 64;
 
 /// Parses the optional `session` query parameter: absent selects [`SyncScope::Legacy`]; present
@@ -74,6 +87,7 @@ enum BeginOutcome<'a> {
     Completed(WsServerMessage),
     Wait(watch::Receiver<Option<WsServerMessage>>),
     Leader(LeaderGuard<'a>),
+    Indeterminate,
 }
 
 struct LeaderGuard<'a> {
@@ -114,6 +128,8 @@ impl WsSyncCache {
 
     /// Executes `call` once for its `(scope, id, route, canonical_args)` key, joining an active
     /// in-flight run or returning a cached unacknowledged frame when present.
+    ///
+    /// A `CALL` is a new request: when the cache has no entry, the call runs.
     pub async fn execute<F, Fut>(
         self: Arc<Self>,
         scope: SyncScope,
@@ -124,10 +140,45 @@ impl WsSyncCache {
         F: FnOnce(WsCallPayload) -> Fut,
         Fut: Future<Output = WsServerMessage>,
     {
+        self.execute_with(scope, call, SyncReplayMode::Fresh, run)
+            .await
+    }
+
+    /// Answers a `FULL_SYNC` replay without ever running a potentially mutating call twice.
+    ///
+    /// A recorded in-flight or completed outcome is reused. Without a record, a call is executed
+    /// again only when `safe_to_execute` marks its route as side-effect free; otherwise the client
+    /// receives an `IndeterminateCallOutcome` error because the call may already have been applied.
+    pub async fn execute_replay<F, Fut>(
+        self: Arc<Self>,
+        scope: SyncScope,
+        call: WsCallPayload,
+        safe_to_execute: bool,
+        run: F,
+    ) -> WsServerMessage
+    where
+        F: FnOnce(WsCallPayload) -> Fut,
+        Fut: Future<Output = WsServerMessage>,
+    {
+        self.execute_with(scope, call, SyncReplayMode::Replay { safe_to_execute }, run)
+            .await
+    }
+
+    async fn execute_with<F, Fut>(
+        self: Arc<Self>,
+        scope: SyncScope,
+        call: WsCallPayload,
+        mode: SyncReplayMode,
+        run: F,
+    ) -> WsServerMessage
+    where
+        F: FnOnce(WsCallPayload) -> Fut,
+        Fut: Future<Output = WsServerMessage>,
+    {
         let call_id = call.id;
         let key = canonical_key(scope, &call);
 
-        match self.begin(key) {
+        match self.begin(key, mode) {
             BeginOutcome::Completed(frame) => frame,
             BeginOutcome::Wait(mut rx) => {
                 if let Some(frame) = rx.borrow().clone() {
@@ -145,6 +196,17 @@ impl WsSyncCache {
                 guard.finish(frame.clone());
                 frame
             }
+            BeginOutcome::Indeterminate => WsServerMessage::Error {
+                id: call_id,
+                error: zerodeck_protocol::WsErrorDetail {
+                    name: INDETERMINATE_CALL_OUTCOME.to_owned(),
+                    error: "FULL_SYNC replay was not executed because this daemon has no \
+                            recorded outcome; the call may already have been applied. Refresh \
+                            state before retrying."
+                        .to_owned(),
+                    traceback: None,
+                },
+            },
         }
     }
 
@@ -157,7 +219,7 @@ impl WsSyncCache {
         });
     }
 
-    fn begin(&self, key: WsSyncKey) -> BeginOutcome<'_> {
+    fn begin(&self, key: WsSyncKey, mode: SyncReplayMode) -> BeginOutcome<'_> {
         let mut state = lock_unpoisoned(&self.inner);
         self.prune_expired(&mut state, Instant::now());
 
@@ -170,6 +232,15 @@ impl WsSyncCache {
                     return BeginOutcome::Wait(tx.subscribe());
                 }
             }
+        }
+
+        if matches!(
+            mode,
+            SyncReplayMode::Replay {
+                safe_to_execute: false
+            }
+        ) {
+            return BeginOutcome::Indeterminate;
         }
 
         let (tx, _rx) = watch::channel(None);
@@ -542,6 +613,49 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         run_counting(&cache, SyncScope::Legacy, 1, &runs).await;
         run_counting(&cache, SyncScope::Legacy, 1, &runs).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unrecorded_unsafe_replay_is_refused_without_running_the_call() {
+        let cache = Arc::new(WsSyncCache::new(8, Duration::from_secs(60)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let frame = Arc::clone(&cache)
+            .execute_replay(SyncScope::Legacy, call_payload(5), false, {
+                let runs = Arc::clone(&runs);
+                move |c| async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    reply_frame(c.id, "ran")
+                }
+            })
+            .await;
+
+        match frame {
+            WsServerMessage::Error { id, error } => {
+                assert_eq!(id, 5);
+                assert_eq!(error.name, "IndeterminateCallOutcome");
+            }
+            other => panic!("expected an indeterminate outcome error, got {other:?}"),
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unrecorded_safe_replay_executes_once_and_caches_the_reply() {
+        let cache = Arc::new(WsSyncCache::new(8, Duration::from_secs(60)));
+        let runs = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let frame = Arc::clone(&cache)
+                .execute_replay(SyncScope::Legacy, call_payload(6), true, {
+                    let runs = Arc::clone(&runs);
+                    move |c| async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        reply_frame(c.id, "fresh")
+                    }
+                })
+                .await;
+            assert_eq!(frame, reply_frame(6, "fresh"));
+        }
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 

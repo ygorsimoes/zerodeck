@@ -415,6 +415,35 @@ mod tests {
         handle.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn one_hundred_context_changes_do_not_accumulate_attempts() {
+        let driver = Arc::new(FakeDriver::default());
+        driver.set_targets(vec![tab("0")]);
+        let supervisor = supervisor(fast_timing());
+        let handle = spawn_supervisor(driver.clone(), Arc::clone(&supervisor));
+
+        let first = wait_for(&supervisor, |s| s.state == "bootstrapping").await;
+        supervisor
+            .confirm(&confirmation(&first, true))
+            .expect("confirm initial");
+
+        for index in 1..=100 {
+            let expected = index.to_string();
+            driver.set_targets(vec![tab(&expected)]);
+            let status = wait_for(&supervisor, |s| {
+                s.state == "bootstrapping" && s.context.as_deref() == Some(expected.as_str())
+            })
+            .await;
+            supervisor
+                .confirm(&confirmation(&status, true))
+                .expect("confirm context");
+            assert_eq!(supervisor.status().state, "active");
+        }
+
+        assert_eq!(driver.injection_count(), 101);
+        handle.shutdown().await;
+    }
+
     #[test]
     fn bootstrap_script_reuses_an_existing_loader_and_carries_the_attempt() {
         let supervisor = supervisor(CefTiming::default());

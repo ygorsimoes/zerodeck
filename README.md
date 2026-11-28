@@ -64,22 +64,21 @@ plugin contracts, rebuilt from scratch as a native daemon.
 
 | Metric | `zerodeckd` |
 |---|---|
-| Release binary | **8.4 MiB** |
-| Time from launch to first `/healthz` reply | **~13 ms** |
-| Memory at idle (RSS) | **~8 MB** |
+| Release binary | **9.5 MiB** |
+| Time from launch to first `/healthz` reply | **62 ms p95** |
+| Memory at idle (RSS) | **9.4 MiB** |
 
-Measured on an Apple M4 (macOS, arm64) with a release build and an empty plugin directory;
-median of five runs. Steam Deck numbers and a side-by-side with Decky Loader on the same device
-are coming with [Phase 4](#roadmap).
+Measured with `ZERODECK_NATIVE=1 just perf` on macOS arm64 (release build, empty plugin directory;
+the script reports p95 over 20 runs). Steam Deck numbers and a side-by-side with Decky Loader on the
+same device require the hardware qualification tracked in
+[`deploy/update/QUALIFICATION.md`](deploy/update/QUALIFICATION.md). The engineering budgets and
+method are in [`docs/architecture/performance-budget.md`](docs/architecture/performance-budget.md).
 
 Reproduce it yourself with a native release build (outside Docker, so no VM or container overhead
 is measured):
 
 ```bash
-cargo build --release
-ls -lh target/release/zerodeckd
-time (./target/release/zerodeckd & until curl -sf http://127.0.0.1:1337/healthz; do :; done)
-ps -o rss= -p "$(pgrep -n zerodeckd)"   # KiB
+ZERODECK_NATIVE=1 just perf
 ```
 
 ## Quick start
@@ -216,7 +215,9 @@ must not be able to grant themselves root.
 > 🚧 **Implemented; real Steam Deck qualification is still being recorded.** The managed installer
 > and updater are covered by unit, fault-injection, packaging and VM tests (a KVM VM runs in CI),
 > but SteamOS-specific behavior is only confirmed on hardware, tracked in
-> [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md).
+> [`deploy/update/COMPATIBILITY.md`](deploy/update/COMPATIBILITY.md). Testing does not require a
+> device; Stable for Steam Deck requires that evidence for the same managed digest
+> ([qualification policy](deploy/update/QUALIFICATION.md)).
 
 - **Install:** a verified `bootstrap.sh` installs `zerodeckd` as a managed systemd service that uses
   your existing `~/homebrew/plugins`.

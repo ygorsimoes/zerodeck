@@ -215,7 +215,6 @@ down:
 [group('runtime')]
 logs:
     docker compose logs -f zerodeckd
-
 # Start the runtime image, wait until healthy, probe /healthz from the host, stop it
 [group('runtime')]
 smoke *flags="--build":
@@ -238,6 +237,11 @@ smoke *flags="--build":
 dist tag image="zerodeck:runtime":
     just _dist all "{{ tag }}" "{{ image }}"
 
+# Measure release startup, idle RSS/CPU and binary size against the documented budgets.
+# Run with ZERODECK_NATIVE=1 for host-representative numbers.
+[group('runtime')]
+perf:
+    just _perf
 # Package only the managed generation archive (archive root: release.json, bin, python, frontend)
 [group('runtime')]
 dist-managed tag image="zerodeck:runtime":
@@ -275,6 +279,11 @@ verify-managed-image image archive:
 [private]
 _dist mode tag image:
     bash deploy/update/package-release.sh "{{ mode }}" "{{ tag }}" "{{ image }}" dist
+
+[private]
+_perf:
+    cargo build --release --locked -p zerodeckd
+    bash deploy/perf/measure.sh target/release/zerodeckd
 
 [private]
 _test-release-package archive:

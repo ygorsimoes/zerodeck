@@ -148,7 +148,9 @@ Signing is automatic and lives only in `.github/workflows/channels.yml`:
   a draft is never signed.
 
 The qualification VM runs generic Linux with systemd. SteamOS survival and Game Mode compatibility
-are recorded independently in [COMPATIBILITY.md](COMPATIBILITY.md).
+are recorded independently in [COMPATIBILITY.md](COMPATIBILITY.md). Testing does not require a
+device; Stable for Steam Deck requires the hardware evidence for the same managed digest. The full
+policy is in [QUALIFICATION.md](QUALIFICATION.md).
 
 What this protects: a compromised download host cannot substitute bytes (digest and length are
 signed), nobody can replay an older channel, and a push to the `channels` branch alone cannot forge
@@ -297,6 +299,29 @@ rechecks the persisted selection channel, the signed release channel, the instal
 `min_updater` under the exclusive lock; Stable refuses a Testing selection, a downgrade, a reused
 version with a different digest, or a release that requires a newer controller.
 
+## Safe uninstall
+
+ZeroDeck never owns `/home/deck/homebrew` or Decky's files. The supported removal sequence keeps
+plugin data and generations for inspection:
+
+```bash
+sudo systemctl disable --now zerodeck.service zerodeck-check.timer zerodeck-recovery.service
+sudo systemctl stop zerodeck-apply.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/zerodeck.service \
+  /etc/systemd/system/zerodeck-apply.service \
+  /etc/systemd/system/zerodeck-recovery.service \
+  /etc/systemd/system/zerodeck-check.service \
+  /etc/systemd/system/zerodeck-check.timer
+sudo rm -rf /etc/zerodeck
+sudo rm -f /etc/atomic-update.conf.d/zerodeck.conf
+sudo systemctl daemon-reload
+sudo mv /home/.zerodeck "/home/.zerodeck.removed-$(date +%s)"
+```
+
+Review `zerodeckctl status` and the retained generation before deleting the moved directory. To
+reinstall, use the verified `bootstrap.sh` flow; do not recreate `/etc/zerodeck` or the units by
+hand. Deleting the moved directory is the only destructive step and is intentionally manual.
+
 ## Verification
 
 - **VM crash gate:** CI job `vm` boots the packaged release in a KVM VM (pinned Arch Linux cloud
@@ -312,7 +337,8 @@ version with a different digest, or a release that requires a newer controller.
   `deploy/update/tests/sign-channel.sh`. See [`tests/README.md`](tests/README.md).
 - **Steam Deck:** [`COMPATIBILITY.md`](COMPATIBILITY.md) lists what can only be observed on
   hardware (SteamOS-update survival, plugin inventory, resource use). Fill it in as you run them;
-  unexecuted items stay **PENDING**. It informs you but does not gate publication.
+  unexecuted items stay **PENDING**. It does not gate Testing or publication; it gates the Stable
+  Steam Deck claim, as defined in [`QUALIFICATION.md`](QUALIFICATION.md).
 - **Retry:** `deploy/update/tests/publish.sh` injects an upload failure, confirms the draft remains
   unpublished and that a retry never changes a published digest.
 - **Expiry and freeze:** an expired or replayed (lower `sequence`) channel document makes
